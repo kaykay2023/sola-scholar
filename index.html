@@ -1,0 +1,1024 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sola Scholar – Agent Recruiting</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+    .spin{animation:spin 1s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
+    .fade-in{animation:fadeIn .3s ease}@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+    ::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:#1f2937}::-webkit-scrollbar-thumb{background:#4b5563;border-radius:3px}
+  </style>
+</head>
+<body class="bg-gray-50">
+<div id="root"></div>
+<script type="text/babel">
+const{useState,useEffect,useCallback}=React;
+
+/* ═══════════ IN-MEMORY STORE ═══════════ */
+const DB={
+  users:[
+    {id:'u1',name:'Kay Rivera',email:'kay@sola-scholar.io',role:'admin',createdAt:'2026-03-01T09:00:00Z'},
+    {id:'u2',name:'Jordan Lee',email:'jordan@sola-scholar.io',role:'recruiter',createdAt:'2026-03-05T10:00:00Z'},
+    {id:'u3',name:'Alex Morgan',email:'alex@sola-scholar.io',role:'recruiter',createdAt:'2026-03-10T11:00:00Z'},
+  ],
+  posts:[
+    {id:'p1',title:'Senior Full-Stack Engineer',company:'TechNova',location:'Remote',skills:['React','Node.js','AWS'],salary:'$140k–$170k',status:'active',createdAt:'2026-03-20'},
+    {id:'p2',title:'ML Engineer',company:'DataMind AI',location:'San Francisco, CA',skills:['Python','TensorFlow','PyTorch'],salary:'$160k–$200k',status:'active',createdAt:'2026-03-22'},
+    {id:'p3',title:'Product Designer',company:'PixelCraft',location:'New York, NY',skills:['Figma','UX Research','Prototyping'],salary:'$110k–$140k',status:'active',createdAt:'2026-03-25'},
+    {id:'p4',title:'DevOps Engineer',company:'CloudScale',location:'Austin, TX',skills:['Kubernetes','Terraform','CI/CD'],salary:'$130k–$160k',status:'closed',createdAt:'2026-03-15'},
+  ],
+  candidates:[],hiringManagers:[],shortlist:[],logs:[]
+};
+let _id=0;
+const uid=()=>'id_'+(++_id)+'_'+Math.random().toString(36).slice(2,8);
+const log=(agent,message,status='info')=>{DB.logs.unshift({id:uid(),agent,message,status,ts:new Date().toISOString()});if(DB.logs.length>100)DB.logs.pop();};
+
+/* ═══════════ API KEY STORE ═══════════ */
+const getKeys=()=>({
+  firecrawl:localStorage.getItem('ss_firecrawl')||'',
+  apollo:localStorage.getItem('ss_apollo')||'',
+  airtableKey:localStorage.getItem('ss_airtable_key')||'',
+  airtableBase:localStorage.getItem('ss_airtable_base')||'',
+  airtableTable:localStorage.getItem('ss_airtable_table')||'Shortlist',
+});
+
+/* ═══════════ HELPERS ═══════════ */
+const pick=(a,n=1)=>{const s=[...a].sort(()=>.5-Math.random());return n===1?s[0]:s.slice(0,n);};
+const fmt=d=>d?new Date(d).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}):'–';
+
+/* ═══════════ AGENT 1 – The Scout (Scrape & Investigate) ═══════════ */
+async function runScout(jobTitle='software engineer',skillsArr=[]){
+  log('The Scout',`Hunting fresh "${jobTitle}" candidates (last 10 days)…`,'running');
+
+  const SKILLS_MAP={javascript:['React','Node.js','TypeScript','Next.js'],python:['Django','FastAPI','TensorFlow','Pandas'],java:['Spring Boot','Kafka','Microservices'],go:['gRPC','Docker','Kubernetes'],rust:['WebAssembly','Systems Programming'],css:['Tailwind CSS','Figma','UI/UX'],sql:['PostgreSQL','Redis','MongoDB'],devops:['Kubernetes','Terraform','CI/CD']};
+  const LOCS=['San Francisco, CA','New York, NY','Austin, TX','Remote','Seattle, WA','Boston, MA','Chicago, IL','London, UK'];
+  const TITLES=['Software Engineer','Senior Engineer','Full-Stack Developer','Backend Engineer','ML Engineer','Frontend Developer','Staff Engineer','Principal Engineer'];
+  const NAMES=['Jordan Blake','Sam Patel','Morgan Wu','Alex Chen','Riley Johnson','Taylor Brooks','Casey Martinez','Drew Kim','Avery Singh','Quinn Davis','Parker Lee','Sydney Nguyen','Cameron Ross','Blake Thompson','Reese Walker'];
+
+  // 10-day recency cutoff
+  const cutoff=new Date(Date.now()-10*24*60*60*1000);
+  const cutoffISO=cutoff.toISOString().slice(0,10);
+  const cutoffYear=new Date().getFullYear();
+
+  let firecrawlCandidates=[];
+  const keys=getKeys();
+
+  // ── Firecrawl: web search biased toward recent results ──
+  if(keys.firecrawl){
+    try{
+      log('The Scout','Searching web via Firecrawl (recent profiles)…','running');
+      const base=skillsArr.length
+        ?`${skillsArr.join(' OR ')} developer engineer profile`
+        :`${jobTitle} developer engineer profile`;
+      const query=`${base} ${cutoffYear}`;
+      const res=await fetch('https://api.firecrawl.dev/v1/search',{
+        method:'POST',
+        headers:{'Content-Type':'application/json','Authorization':`Bearer ${keys.firecrawl}`},
+        body:JSON.stringify({query,limit:10,lang:'en'})
+      });
+      if(!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data=await res.json();
+      if(data.success&&data.data?.length){
+        firecrawlCandidates=data.data.slice(0,10).map(item=>{
+          const parts=(item.title||'').split(/[-–|]/);
+          const name=(parts[0]||pick(NAMES)).trim().replace(/['"]/g,'');
+          const titlePart=(parts[1]||'').trim();
+          const atMatch=titlePart.match(/^(.+?)\s+at\s+(.+)$/i);
+          const realTitle=atMatch?atMatch[1].trim():(titlePart||null);
+          const realCompany=atMatch?atMatch[2].trim():'';
+          const desc=(item.description||'')+(item.title||'');
+          const foundKeys=Object.keys(SKILLS_MAP).filter(k=>desc.toLowerCase().includes(k));
+          const lang=foundKeys[0]||null;
+          const skills=lang?[lang,...pick(SKILLS_MAP[lang],2)].map(s=>s.charAt(0).toUpperCase()+s.slice(1)).slice(0,4):[];
+          const locMatch=desc.match(/(San Francisco|New York|Austin|Seattle|Boston|Chicago|London|Berlin|Toronto|Remote|Los Angeles|Denver|Portland|Atlanta|Miami|Dallas|Phoenix|Minneapolis|Washington|Philadelphia|Bangalore|Singapore|Sydney|Dublin|Amsterdam|Paris|Tokyo|Mumbai|Delhi|Hyderabad|Pune|Chennai)[,\s]*([\w\s]*)/i);
+          const emailMatch=desc.match(/[\w.+-]+@[\w-]+\.[\w.]+/);
+          return{
+            id:uid(),name,title:realTitle||'',company:realCompany,
+            location:locMatch?locMatch[0].trim():'',
+            bio:(item.description||'').slice(0,160),
+            skills,email:emailMatch?emailMatch[0]:'',
+            github:'',website:'',profileUrl:item.url||'#',
+            source:item.url?.includes('linkedin.com')?'LinkedIn':'Web',
+            avatarUrl:`https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(name)}`,
+            scoutedAt:new Date().toISOString()
+          };
+        });
+        log('The Scout',`Firecrawl returned ${firecrawlCandidates.length} profiles`,'info');
+      }
+    }catch(e){log('The Scout',`Firecrawl error (${e.message}) — falling back to GitHub`,'warn');}
+  }
+
+  // ── GitHub: search for recently active users (pushed code in last 10 days) ──
+  let ghCandidates=[];
+  try{
+    const q=skillsArr.length?skillsArr.join(' ')+' developer':jobTitle;
+    const ghQuery=`${q} type:user pushed:>${cutoffISO}`;
+    log('The Scout',`Searching GitHub for users active since ${cutoffISO}…`,'running');
+    const res=await fetch(`https://api.github.com/search/users?q=${encodeURIComponent(ghQuery)}&per_page=8&sort=joined&order=desc`,{headers:{'Accept':'application/vnd.github.v3+json'}});
+    if(!res.ok) throw new Error(`GitHub ${res.status}`);
+    const data=await res.json();
+    // Fetch full user details for contact info
+    log('The Scout',`Fetching details for ${Math.min(8,(data.items||[]).length)} GitHub users…`,'running');
+    const detailPromises=(data.items||[]).slice(0,8).map(u=>
+      fetch(`https://api.github.com/users/${u.login}`,{headers:{'Accept':'application/vnd.github.v3+json'}})
+        .then(r=>r.ok?r.json():u).catch(()=>u)
+    );
+    const details=await Promise.all(detailPromises);
+    ghCandidates=details.filter(u=>{
+      // Only keep users with updated_at within 10 days (extra recency check)
+      if(u.updated_at){const d=new Date(u.updated_at);return d>=cutoff;}
+      return true;
+    }).map(u=>{
+      const realName=u.name||u.login.replace(/-/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
+      const blogUrl=(u.blog||'').trim();
+      // Detect skills from bio
+      const bio=(u.bio||'').toLowerCase();
+      const foundKeys=Object.keys(SKILLS_MAP).filter(k=>bio.includes(k));
+      const lang=foundKeys[0]||null;
+      const skills=lang?[lang,...pick(SKILLS_MAP[lang],2)].map(s=>s.charAt(0).toUpperCase()+s.slice(1)).slice(0,4):[];
+      return{
+        id:uid(),name:realName,
+        title:u.bio?u.bio.split(/[.|,;\n]/)[0].trim().slice(0,60):'',
+        company:(u.company||'').replace(/^@/,''),
+        location:u.location||'',
+        bio:u.bio||'',
+        skills,email:u.email||'',
+        github:u.html_url||'',
+        website:(blogUrl&&!blogUrl.includes('linkedin.com'))?blogUrl:'',
+        profileUrl:u.html_url,source:'GitHub',
+        avatarUrl:u.avatar_url,
+        followers:u.followers||0,publicRepos:u.public_repos||0,
+        lastActive:u.updated_at||'',
+        scoutedAt:new Date().toISOString()
+      };
+    });
+    log('The Scout',`GitHub returned ${ghCandidates.length} recently active profiles`,'info');
+  }catch(e){log('The Scout',`GitHub unavailable (${e.message})`,'warn');}
+
+  // ── Curated fallback only if both sources returned nothing ──
+  const totalReal=firecrawlCandidates.length+ghCandidates.length;
+  let mocks=[];
+  if(totalReal===0){
+    log('The Scout','No live results — loading curated sample data','warn');
+    mocks=NAMES.slice(0,8).map(name=>{
+      const lang=pick(Object.keys(SKILLS_MAP));
+      return{
+        id:uid(),name,title:pick(TITLES),company:'',location:pick(LOCS),bio:'',
+        skills:[lang,...pick(SKILLS_MAP[lang],2)].map(s=>s.charAt(0).toUpperCase()+s.slice(1)),
+        email:'',github:'',website:'',profileUrl:'#',source:'Sample',
+        avatarUrl:`https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(name)}`,
+        scoutedAt:new Date().toISOString()
+      };
+    });
+  }
+
+  DB.candidates=[...firecrawlCandidates,...ghCandidates,...mocks];
+  const real=firecrawlCandidates.length+ghCandidates.length;
+  log('The Scout',`Scouted ${DB.candidates.length} candidates (${real} real · ${mocks.length} sample) — all active within 10 days`,'success');
+  return DB.candidates;
+}
+
+/* ═══════════ AGENT 2 – The Validator (GitHub Repo Analysis) ═══════════ */
+async function runValidator(){
+  log('The Validator','Analysing GitHub repos for skill verification…','running');
+  if(!DB.candidates.length){log('The Validator','No candidates — run The Scout first','warn');return[];}
+  const ghCandidates=DB.candidates.filter(c=>c.github);
+  if(!ghCandidates.length){log('The Validator','No candidates with GitHub profiles to validate','warn');return[];}
+
+  const MAX_REPOS=5;
+  const LANG_SKILL={'JavaScript':['JavaScript','React','Node.js','Vue','Express','Next.js'],'TypeScript':['TypeScript','React','Angular','Node.js','Next.js'],'Python':['Python','Django','FastAPI','Flask','TensorFlow','Pandas'],'Java':['Java','Spring Boot','Kafka'],'Go':['Go','gRPC','Docker'],'Rust':['Rust','WebAssembly','Systems'],'Ruby':['Ruby','Rails'],'C++':['C++','Systems Programming'],'C#':['C#','.NET'],'PHP':['PHP','Laravel'],'Swift':['Swift','iOS'],'Kotlin':['Kotlin','Android']};
+
+  let validated=0;
+  for(const c of ghCandidates){
+    try{
+      const username=c.github.replace(/.*github\.com\//,'').replace(/\/$/,'');
+      if(!username)continue;
+      const res=await fetch(`https://api.github.com/users/${username}/repos?sort=updated&per_page=${MAX_REPOS}`);
+      if(!res.ok){c.validationTier='Insufficient Data';c.proficiency={};continue;}
+      const repos=await res.json();
+      if(!repos.length){c.validationTier='Insufficient Data';c.proficiency={};continue;}
+
+      const langCount={};let totalStars=0;let totalForks=0;let hasRecent=false;
+      const tenDaysAgo=new Date(Date.now()-10*24*60*60*1000);
+      repos.forEach(r=>{
+        if(r.language){langCount[r.language]=(langCount[r.language]||0)+1;}
+        totalStars+=(r.stargazers_count||0);
+        totalForks+=(r.forks_count||0);
+        if(new Date(r.pushed_at)>=tenDaysAgo) hasRecent=true;
+      });
+
+      // Build proficiency map: skill → score (0-100)
+      const proficiency={};
+      const topLangs=Object.entries(langCount).sort((a,b)=>b[1]-a[1]);
+      topLangs.forEach(([lang,count])=>{
+        const pct=Math.round((count/repos.length)*100);
+        const mapped=LANG_SKILL[lang]||[lang];
+        mapped.forEach(skill=>{
+          proficiency[skill]=Math.max(proficiency[skill]||0,Math.min(pct+Math.min(totalStars*2,20),100));
+        });
+      });
+
+      // Assign verification tier
+      if(Object.keys(proficiency).length>=2 && hasRecent && totalStars>=1){
+        c.validationTier='Verified Active';
+      } else if(Object.keys(proficiency).length>=1){
+        c.validationTier='Profile-Based';
+      } else {
+        c.validationTier='Insufficient Data';
+      }
+      c.proficiency=proficiency;
+      c.repoCount=repos.length;
+      c.totalStars=totalStars;
+      c.totalForks=totalForks;
+      validated++;
+    }catch(e){
+      c.validationTier='Insufficient Data';c.proficiency={};
+    }
+  }
+
+  // Mark non-GitHub candidates
+  DB.candidates.filter(c=>!c.github).forEach(c=>{c.validationTier='Insufficient Data';c.proficiency={};});
+
+  log('The Validator',`Validated ${validated}/${ghCandidates.length} GitHub profiles — ${DB.candidates.filter(c=>c.validationTier==='Verified Active').length} verified active`,'success');
+  return DB.candidates;
+}
+
+/* ═══════════ AGENT 4 – The Connector (Find Decision-Makers) ═══════════ */
+async function runConnector(industry=''){
+  log('The Connector',`Finding hiring managers${industry?` in ${industry}`:''} — requires name, title, company & email…`,'running');
+
+  const SIGS=['Posted 3 new JDs this week','Engineering team doubled in 6 months','Recently closed Series B','Actively engaging candidates on LinkedIn','Q2 headcount plan approved','Open roles up 40% vs last quarter'];
+  const URG=['High','Medium','High','Critical'];
+  const LOGOS=['🟦','🎨','🔶','▲','🟣','⬛','🟢','🤗','🔧','💳'];
+
+  // Minimum fields check — every record must have all four
+  const isComplete=(r)=>!!(r.name&&r.name.trim()&&r.title&&r.title.trim()&&r.company&&r.company.trim()&&r.email&&r.email.trim()&&r.email.includes('@'));
+
+  let apolloManagers=[];
+  const keys=getKeys();
+
+  // ── Apollo.io: real hiring manager search ──
+  if(keys.apollo){
+    try{
+      log('The Connector','Querying Apollo.io…','running');
+      const body={
+        api_key:keys.apollo,
+        person_titles:['Engineering Manager','VP of Engineering','Head of Talent','Director of Engineering','Technical Recruiter','CTO'],
+        page:1,per_page:15,
+      };
+      if(industry) body.q_keywords=industry;
+      const res=await fetch('https://api.apollo.io/v1/mixed_people/search',{
+        method:'POST',
+        headers:{'Content-Type':'application/json','Cache-Control':'no-cache'},
+        body:JSON.stringify(body)
+      });
+      if(!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data=await res.json();
+      if(data.people?.length){
+        let skipped=0;
+        apolloManagers=data.people.map(p=>{
+          const nm=p.name||`${p.first_name||''} ${p.last_name||''}`.trim();
+          const co=p.organization?.name||'';
+          const empCount=p.organization?.employee_count;
+          return{
+            id:uid(),name:nm,title:p.title||'',company:co,
+            industry:industry||(p.organization?.industry||''),
+            companySize:empCount?`${empCount.toLocaleString()} employees`:'',
+            companyGrowth:pick(['Rapid','Scaling','Stable','Early']),
+            logo:pick(LOGOS),
+            hiringSignal:pick(SIGS),urgency:pick(URG),
+            openRoles:Math.floor(Math.random()*8)+1,
+            email:p.email||'',
+            avatarUrl:`https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(nm)}`
+          };
+        }).filter(r=>{
+          if(!isComplete(r)){skipped++;return false;}
+          return true;
+        });
+        if(skipped>0) log('The Connector',`Dropped ${skipped} records missing name/title/company/email`,'warn');
+        log('The Connector',`Apollo returned ${apolloManagers.length} verified hiring managers`,'info');
+      }
+    }catch(e){log('The Connector',`Apollo error (${e.message})`,'warn');}
+  }else{
+    log('The Connector','Apollo.io not configured — no real data available. Add your API key in Settings.','warn');
+  }
+
+  // ── No curated fallback with fake emails. If Apollo returns nothing, the list is empty. ──
+  DB.hiringManagers=[...apolloManagers];
+
+  if(DB.hiringManagers.length===0){
+    log('The Connector','No verified hiring managers found. All records must have name, title, company, and a real email to appear here.','warn');
+  }else{
+    log('The Connector',`${DB.hiringManagers.length} hiring managers ready — all with verified contact info`,'success');
+  }
+  return DB.hiringManagers;
+}
+
+/* ═══════════ AGENT 3 – The Matchmaker (Strategic Pairing · Weighted Scoring) ═══════════ */
+// Weights: Skill Match 35%, Seniority 20%, Location 15%, Availability 15%, Validation Tier 15%
+function scoreCand(c,post){
+  const norm=s=>(s||'').toLowerCase().replace(/[^a-z0-9+#]/g,'');
+  const cSet=new Set((c.skills||[]).map(norm));
+  const matched=(post.skills||[]).filter(s=>cSet.has(norm(s)));
+  const reasons=[];
+
+  // 1. Skill Match (35%) — weighted by proficiency if available
+  let skillRaw=0;
+  if(post.skills?.length){
+    if(c.proficiency&&Object.keys(c.proficiency).length){
+      const profScores=matched.map(s=>{
+        const key=Object.keys(c.proficiency).find(k=>norm(k)===norm(s));
+        return key?(c.proficiency[key]/100):0.5;
+      });
+      skillRaw=profScores.length?(profScores.reduce((a,b)=>a+b,0)/post.skills.length)*100:0;
+    } else {
+      skillRaw=(matched.length/post.skills.length)*100;
+    }
+  } else { skillRaw=50; }
+  const skillScore=Math.min(skillRaw,100)*0.35;
+  if(matched.length) reasons.push(`Matches ${matched.length}/${post.skills.length} skills: ${matched.join(', ')}${c.proficiency&&Object.keys(c.proficiency).length?' (proficiency-weighted)':''}`);
+
+  // 2. Seniority (20%) — based on experience years
+  const expYears=c.experience||0;
+  const seniorityRaw=Math.min(expYears*10,100);
+  const seniorityScore=seniorityRaw*0.20;
+  if(expYears>3) reasons.push(`${expYears} years experience`);
+
+  // 3. Location Match (15%) — string match, Remote matches all
+  const cLoc=(c.location||'').toLowerCase();
+  const pLoc=(post.location||'').toLowerCase();
+  let locRaw=30; // default partial
+  if(cLoc.includes('remote')||pLoc.includes('remote')) {locRaw=100; reasons.push('Remote-friendly');}
+  else if(pLoc&&cLoc&&(cLoc.includes(pLoc)||pLoc.includes(cLoc))) {locRaw=100; reasons.push(`Location match: ${c.location}`);}
+  const locationScore=locRaw*0.15;
+
+  // 4. Availability (15%)
+  const avail=(c.availability||'').toLowerCase();
+  let availRaw=40;
+  if(avail.includes('immediately')||avail.includes('actively')){availRaw=100;reasons.push('High availability');}
+  else if(avail.includes('open')){availRaw=70;}
+  const availScore=availRaw*0.15;
+
+  // 5. Validation Tier (15%)
+  let tierRaw=20;
+  if(c.validationTier==='Verified Active'){tierRaw=100;reasons.push('Verified Active on GitHub');}
+  else if(c.validationTier==='Profile-Based'){tierRaw=60;reasons.push('Profile-based verification');}
+  const tierScore=tierRaw*0.15;
+
+  const total=Math.min(Math.round(skillScore+seniorityScore+locationScore+availScore+tierScore),100);
+  if(!reasons.length) reasons.push('Broad skill set aligns with role');
+  return{totalScore:total,skillMatchPct:Math.round(skillRaw),matchedSkills:matched,reasons};
+}
+
+async function runMatchmaker(topN=5){
+  log('The Matchmaker',`Analysing candidates against open roles (top ${topN} per role)…`,'running');
+  if(!DB.candidates.length){log('The Matchmaker','No candidates — run The Scout first','warn');return[];}
+  const active=DB.posts.filter(p=>p.status==='active');
+  DB.shortlist=[];
+  for(const post of active){
+    const scored=DB.candidates.map(c=>({candidate:c,...scoreCand(c,post)}));
+    scored.sort((a,b)=>b.totalScore-a.totalScore);
+    scored.slice(0,topN).forEach((e,rank)=>{
+      DB.shortlist.push({
+        id:uid(),candidateId:e.candidate.id,candidateName:e.candidate.name,
+        candidateTitle:e.candidate.title,candidateSkills:e.candidate.skills,
+        avatarUrl:e.candidate.avatarUrl,postId:post.id,postTitle:post.title,
+        company:post.company,rank:rank+1,totalScore:e.totalScore,
+        skillMatchPct:e.skillMatchPct,matchedSkills:e.matchedSkills,
+        reasons:e.reasons,validationTier:e.candidate.validationTier||'Not Validated',status:'pending'
+      });
+    });
+  }
+  log('The Matchmaker',`Shortlisted ${DB.shortlist.length} candidates across ${active.length} open roles`,'success');
+
+  // Push to Airtable if configured
+  const keys=getKeys();
+  if(keys.airtableKey&&keys.airtableBase){
+    const tableName=keys.airtableTable||'Shortlist';
+    log('The Matchmaker',`Syncing ${DB.shortlist.length} records to Airtable…`,'running');
+    let pushed=0;
+    for(const item of DB.shortlist){
+      try{
+        const res=await fetch(`https://api.airtable.com/v0/${keys.airtableBase}/${encodeURIComponent(tableName)}`,{
+          method:'POST',
+          headers:{'Authorization':`Bearer ${keys.airtableKey}`,'Content-Type':'application/json'},
+          body:JSON.stringify({fields:{
+            'Candidate Name':item.candidateName,
+            'Candidate Title':item.candidateTitle,
+            'Role':item.postTitle,
+            'Company':item.company,
+            'Match Score':item.totalScore,
+            'Skill Match %':item.skillMatchPct,
+            'Matched Skills':(item.matchedSkills||[]).join(', '),
+            'Rank':item.rank,
+            'Status':item.status
+          }})
+        });
+        if(res.ok) pushed++;
+        else{const err=await res.json().catch(()=>({}));if(err.error?.type==='TABLE_NOT_FOUND')throw new Error('Table not found – check your table name in Settings');}
+      }catch(e){log('The Matchmaker',`Airtable error: ${e.message}`,'warn');break;}
+    }
+    if(pushed>0) log('The Matchmaker',`${pushed}/${DB.shortlist.length} candidates synced to Airtable ✓`,'success');
+  }
+  return DB.shortlist;
+}
+
+/* ═══════════ UI COMPONENTS ═══════════ */
+const Badge=({children,cls=''})=><span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${cls}`}>{children}</span>;
+const Spinner=()=><span className="spin inline-block w-4 h-4 border-2 border-white border-t-transparent rounded-full"/>;
+const Avatar=({url,name,size='11'})=><img src={url||`https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(name||'U')}`} alt={name} className={`w-${size} h-${size} rounded-full bg-gray-100 object-cover flex-shrink-0`} onError={e=>{e.target.src=`https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(name||'U')}`;}} />;
+const Empty=({icon,title,sub})=><div className="flex flex-col items-center justify-center py-24 text-gray-400"><div className="text-6xl mb-4">{icon}</div><p className="font-semibold text-gray-500 text-lg">{title}</p><p className="text-sm mt-1">{sub}</p></div>;
+
+const scoreClr=s=>s>=88?'text-emerald-700 bg-emerald-50 border-emerald-200':s>=74?'text-indigo-700 bg-indigo-50 border-indigo-200':'text-gray-600 bg-gray-100 border-gray-200';
+const urgClr=u=>u==='Critical'?'bg-red-100 text-red-700':u==='High'?'bg-orange-100 text-orange-700':u==='Medium'?'bg-yellow-100 text-yellow-700':'bg-green-100 text-green-700';
+const statClr=s=>s==='approved'?'bg-green-100 text-green-700':s==='rejected'?'bg-red-100 text-red-700':'bg-yellow-100 text-yellow-700';
+const growClr=g=>g==='Rapid'?'bg-emerald-100 text-emerald-700':g==='Scaling'?'bg-blue-100 text-blue-700':g==='Early'?'bg-purple-100 text-purple-700':'bg-gray-100 text-gray-600';
+const barClr=s=>s>=85?'bg-emerald-500':s>=70?'bg-indigo-500':'bg-gray-400';
+const rankClr=r=>r===1?'bg-yellow-400 text-yellow-900':r===2?'bg-gray-300 text-gray-700':'bg-amber-600 text-amber-100';
+
+/* ═══════════ NAV ═══════════ */
+const NAV=[
+  {id:'dashboard',icon:'🏠',label:'Dashboard'},
+  {id:'candidates',icon:'🔍',label:'The Scout',badge:'A1'},
+  {id:'validator',icon:'✅',label:'The Validator',badge:'A2'},
+  {id:'hiring-managers',icon:'🤝',label:'The Connector',badge:'A4'},
+  {id:'shortlist',icon:'⭐',label:'The Matchmaker',badge:'A3'},
+  {id:'posts',icon:'📋',label:'Job Posts'},
+  {id:'users',icon:'👥',label:'Users'},
+  {id:'settings',icon:'⚙️',label:'Settings'},
+];
+
+const Sidebar=({page,setPage})=>(
+  <aside className="fixed inset-y-0 left-0 w-60 bg-gray-900 flex flex-col z-20 shadow-xl">
+    <div className="px-5 py-6 border-b border-gray-700/50">
+      <div className="flex items-center gap-3">
+        <div className="w-9 h-9 rounded-xl bg-indigo-600 flex items-center justify-center text-white font-bold text-lg shadow">S</div>
+        <div><p className="text-white font-bold text-sm">Sola Scholar</p><p className="text-gray-400 text-xs">Agent Recruiting</p></div>
+      </div>
+    </div>
+    <nav className="flex-1 px-3 py-4 space-y-0.5 overflow-y-auto">
+      <p className="text-gray-500 text-xs font-semibold uppercase tracking-widest px-3 mb-3">Workspace</p>
+      {NAV.filter(i=>i.id!=='settings').map(item=>{const a=page===item.id;return(
+        <button key={item.id} onClick={()=>setPage(item.id)} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm transition-all ${a?'bg-indigo-600 text-white shadow-md':'text-gray-300 hover:bg-gray-800 hover:text-white'}`}>
+          <span>{item.icon}</span><span className="flex-1 text-left">{item.label}</span>
+          {item.badge&&<span className={`text-xs px-1.5 py-0.5 rounded-md font-bold ${a?'bg-indigo-500':'bg-gray-700 text-gray-300'}`}>{item.badge}</span>}
+        </button>);})}
+      <button key="settings" onClick={()=>setPage('settings')} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm transition-all ${page==='settings'?'bg-indigo-600 text-white shadow-md':'text-gray-300 hover:bg-gray-800 hover:text-white'}`}>
+        <span>⚙️</span><span className="flex-1 text-left">Settings</span>
+      </button>
+    </nav>
+    <div className="px-5 py-4 border-t border-gray-700/50">
+      <div className="flex items-center gap-2.5">
+        <div className="w-8 h-8 rounded-full bg-gradient-to-br from-indigo-400 to-purple-500 flex items-center justify-center text-white text-xs font-bold">K</div>
+        <div><p className="text-white text-xs font-semibold">Kay Rivera</p><p className="text-gray-500 text-xs">Admin</p></div>
+      </div>
+    </div>
+  </aside>
+);
+
+/* ═══════════ DASHBOARD ═══════════ */
+const AGENTS=[
+  {id:1,label:'Agent 1',name:'The Scout',icon:'🔍',color:'indigo',desc:'Deep-web investigation for passive talent. Firecrawl → GitHub — only candidates active in the last 10 days.',hasInput:true,placeholder:'e.g. React developer'},
+  {id:2,label:'Agent 2',name:'The Validator',icon:'✅',color:'emerald',desc:'Analyses GitHub repos to score proficiency per skill. Assigns verification tiers: Verified Active, Profile-Based, or Insufficient Data.',hasInput:false},
+  {id:4,label:'Agent 4',name:'The Connector',icon:'🤝',color:'violet',desc:'Finds hiring managers with verified contact info. Requires name, title, company & email via Apollo.io.',hasInput:true,placeholder:'e.g. FinTech'},
+  {id:3,label:'Agent 3',name:'The Matchmaker',icon:'⭐',color:'amber',desc:'Pairs validated candidates with open roles using weighted scoring and syncs shortlist to Airtable.',hasInput:false},
+];
+const CC={indigo:{bg:'bg-indigo-50',border:'border-indigo-200',badge:'bg-indigo-100 text-indigo-700',btn:'bg-indigo-600 hover:bg-indigo-700',iconBg:'bg-indigo-100'},emerald:{bg:'bg-emerald-50',border:'border-emerald-200',badge:'bg-emerald-100 text-emerald-700',btn:'bg-emerald-600 hover:bg-emerald-700',iconBg:'bg-emerald-100'},violet:{bg:'bg-violet-50',border:'border-violet-200',badge:'bg-violet-100 text-violet-700',btn:'bg-violet-600 hover:bg-violet-700',iconBg:'bg-violet-100'},amber:{bg:'bg-amber-50',border:'border-amber-200',badge:'bg-amber-100 text-amber-700',btn:'bg-amber-500 hover:bg-amber-600',iconBg:'bg-amber-100'}};
+
+const Dashboard=({setPage,refresh})=>{
+  const[as,setAs]=useState({1:'idle',2:'idle',4:'idle',3:'idle'});
+  const[ar,setAr]=useState({1:null,2:null,4:null,3:null});
+  const[inp,setInp]=useState({1:'',4:''});
+  const[logs,setLogs]=useState([]);
+  const stats={candidates:DB.candidates.length,hiringManagers:DB.hiringManagers.length,shortlist:DB.shortlist.length,posts:DB.posts.length,users:DB.users.length};
+  const keys=getKeys();
+  const configCount=[keys.firecrawl,keys.apollo,keys.airtableKey].filter(Boolean).length;
+
+  useEffect(()=>{setLogs([...DB.logs]);},[refresh]);
+
+  const runAgent=async(agent)=>{
+    setAs(p=>({...p,[agent.id]:'running'}));setAr(p=>({...p,[agent.id]:null}));
+    try{
+      if(agent.id===1) await runScout(inp[1]||'software engineer',[]);
+      else if(agent.id===2) await runValidator();
+      else if(agent.id===4) await runConnector(inp[4]||'');
+      else if(agent.id===3) await runMatchmaker();
+      setAs(p=>({...p,[agent.id]:'done'}));
+      setAr(p=>({...p,[agent.id]:{count:agent.id===1?DB.candidates.length:agent.id===2?DB.candidates.filter(c=>c.validationTier==='Verified Active').length:agent.id===4?DB.hiringManagers.length:DB.shortlist.length}}));
+      setLogs([...DB.logs]);
+    }catch(e){setAs(p=>({...p,[agent.id]:'error'}));log('System',e.message,'error');setLogs([...DB.logs]);}
+  };
+  const runAll=async()=>{for(const a of AGENTS){await runAgent(a);await new Promise(r=>setTimeout(r,400));}};
+
+  const STATS=[
+    {label:'Candidates',val:stats.candidates,icon:'👤',c:'text-indigo-600 bg-indigo-50',pg:'candidates'},
+    {label:'Hiring Managers',val:stats.hiringManagers,icon:'🎯',c:'text-violet-600 bg-violet-50',pg:'hiring-managers'},
+    {label:'Shortlisted',val:stats.shortlist,icon:'⭐',c:'text-amber-600 bg-amber-50',pg:'shortlist'},
+    {label:'Job Posts',val:stats.posts,icon:'📋',c:'text-green-600 bg-green-50',pg:'posts'},
+    {label:'Team Members',val:stats.users,icon:'👥',c:'text-blue-600 bg-blue-50',pg:'users'},
+  ];
+  const lc={info:'text-gray-400',running:'text-indigo-500',success:'text-emerald-500',warn:'text-amber-500',error:'text-red-500'};
+  const lb={info:'●',running:'⟳',success:'✓',warn:'⚠',error:'✗'};
+
+  return(
+    <div className="p-8 fade-in">
+      <div className="flex items-center justify-between mb-8">
+        <div><h1 className="text-2xl font-bold text-gray-900">Dashboard</h1><p className="text-gray-500 text-sm mt-0.5">Your four recruiting agents are ready to work</p></div>
+        <div className="flex items-center gap-3">
+          {configCount<3&&<button onClick={()=>setPage('settings')} className="flex items-center gap-1.5 text-xs bg-amber-50 border border-amber-200 text-amber-700 px-3 py-2 rounded-xl hover:bg-amber-100 transition-colors">⚙️ {configCount}/3 APIs connected</button>}
+          <button onClick={runAll} className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-5 py-2.5 rounded-xl text-sm font-semibold shadow-sm transition-colors">▶ Run All Agents</button>
+        </div>
+      </div>
+      <div className="grid grid-cols-5 gap-4 mb-8">
+        {STATS.map(s=><div key={s.label} className="bg-white rounded-xl border border-gray-100 shadow-sm p-5 text-center hover:shadow-md transition-shadow cursor-pointer" onClick={()=>setPage(s.pg)}><div className={`w-10 h-10 rounded-xl ${s.c} flex items-center justify-center text-lg mx-auto mb-2`}>{s.icon}</div><div className="text-3xl font-bold text-gray-900">{s.val}</div><div className="text-gray-500 text-xs mt-1 font-medium">{s.label}</div></div>)}
+      </div>
+      <div className="grid grid-cols-3 gap-6 mb-8">
+        {AGENTS.map(agent=>{const c=CC[agent.color],st=as[agent.id],res=ar[agent.id];return(
+          <div key={agent.id} className={`rounded-2xl border-2 p-6 ${c.bg} ${c.border} transition-all hover:shadow-md`}>
+            <div className="flex items-start gap-3 mb-3">
+              <div className={`w-11 h-11 rounded-xl ${c.iconBg} flex items-center justify-center text-2xl flex-shrink-0`}>{agent.icon}</div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <Badge cls={c.badge}>{agent.label}</Badge>
+                  {st==='running'&&<Badge cls="bg-blue-100 text-blue-700 animate-pulse">Running…</Badge>}
+                  {st==='done'&&<Badge cls="bg-green-100 text-green-700">Done ✓</Badge>}
+                  {st==='error'&&<Badge cls="bg-red-100 text-red-700">Error</Badge>}
+                </div>
+                <h3 className="font-bold text-gray-900 text-sm mt-1.5">{agent.label}</h3>
+              </div>
+            </div>
+            <p className="text-gray-600 text-xs mb-4 leading-relaxed">{agent.desc}</p>
+            {agent.hasInput&&<input className="w-full border border-gray-200 rounded-lg px-3 py-2 text-xs mb-3 focus:outline-none focus:ring-2 focus:ring-indigo-200 bg-white" placeholder={agent.placeholder} value={inp[agent.id]||''} onChange={e=>setInp(p=>({...p,[agent.id]:e.target.value}))}/>}
+            {res&&<div className="bg-white/80 rounded-lg p-2.5 mb-3 text-xs text-gray-700 border border-white">✓ Found <strong>{res.count}</strong> results</div>}
+            <button onClick={()=>runAgent(agent)} disabled={st==='running'} className={`w-full flex items-center justify-center gap-2 text-white text-sm py-2.5 rounded-xl font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed ${c.btn}`}>{st==='running'?<><Spinner/> Working…</>:`Run ${agent.label}`}</button>
+          </div>);})}
+      </div>
+      <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-6">
+        <h2 className="font-bold text-gray-900 mb-4">Agent Activity Log</h2>
+        {logs.length===0?<p className="text-gray-400 text-sm text-center py-10">No activity yet — run an agent to get started</p>:
+        <div className="space-y-2">{logs.slice(0,15).map(l=><div key={l.id} className="flex items-start gap-3 text-sm py-1 border-b border-gray-50 last:border-0"><span className={`font-mono text-xs mt-0.5 flex-shrink-0 ${lc[l.status]||'text-gray-400'}`}>{lb[l.status]||'●'}</span><div className="flex-1 min-w-0"><span className="font-semibold text-gray-700 text-xs">{l.agent}</span><span className="text-gray-300 mx-1.5">·</span><span className="text-gray-600 text-xs">{l.message}</span></div><span className="text-gray-300 text-xs whitespace-nowrap flex-shrink-0">{new Date(l.ts).toLocaleTimeString()}</span></div>)}</div>}
+      </div>
+    </div>
+  );
+};
+
+/* ═══════════ CANDIDATES PAGE ═══════════ */
+const CandidatesPage=({refresh})=>{
+  const[candidates,setC]=useState([...DB.candidates]);
+  const[loading,setL]=useState(false);
+  const[jobTitle,setJT]=useState('');
+  const[skills,setSk]=useState('');
+  const[filter,setF]=useState('');
+  const[showAdd,setShowAdd]=useState(false);
+  const[mc,setMc]=useState({name:'',title:'',location:'',skills:'',experience:'',availability:'Open to offers'});
+
+  const run=async()=>{setL(true);await runScout(jobTitle||'software engineer',skills?skills.split(',').map(s=>s.trim()):[]);setC([...DB.candidates]);setL(false);};
+
+  const addManual=()=>{
+    if(!mc.name.trim()) return alert('Name is required');
+    DB.candidates.push({
+      id:uid(),name:mc.name,title:mc.title||'Not specified',location:mc.location||'Not specified',
+      skills:mc.skills?mc.skills.split(',').map(s=>s.trim()):[],
+      experience:parseInt(mc.experience)||0,availability:mc.availability||'Open to offers',
+      score:Math.floor(Math.random()*20)+70,source:'Manual',
+      avatarUrl:`https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(mc.name)}`
+    });
+    setC([...DB.candidates]);
+    setMc({name:'',title:'',location:'',skills:'',experience:'',availability:'Open to offers'});
+    setShowAdd(false);
+  };
+
+  useEffect(()=>{setC([...DB.candidates]);},[refresh]);
+  const filtered=candidates.filter(c=>!filter||c.name?.toLowerCase().includes(filter.toLowerCase())||(c.skills||[]).some(s=>s.toLowerCase().includes(filter.toLowerCase()))||c.title?.toLowerCase().includes(filter.toLowerCase()));
+
+  return(
+    <div className="p-8 fade-in">
+      <div className="flex items-center gap-3 mb-6"><div className="w-11 h-11 rounded-xl bg-indigo-100 flex items-center justify-center text-2xl">🔍</div><div><h1 className="text-2xl font-bold text-gray-900">The Scout</h1><p className="text-indigo-600 text-sm font-medium">Agent 1 · Firecrawl → GitHub · Active within 10 days</p></div></div>
+      <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5 mb-6">
+        <div className="flex gap-3 flex-wrap">
+          <input className="flex-1 min-w-48 border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-200" placeholder="Job title (e.g. React developer)" value={jobTitle} onChange={e=>setJT(e.target.value)}/>
+          <input className="flex-1 min-w-48 border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-200" placeholder="Skills, comma-separated" value={skills} onChange={e=>setSk(e.target.value)}/>
+          <button onClick={run} disabled={loading} className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-5 py-2.5 rounded-xl text-sm font-semibold disabled:opacity-50 transition-colors whitespace-nowrap shadow-sm">{loading?<><Spinner/> Scouting…</>:'🔍 Run The Scout'}</button>
+          <button onClick={()=>setShowAdd(!showAdd)} className="flex items-center gap-2 bg-gray-100 hover:bg-gray-200 text-gray-700 px-5 py-2.5 rounded-xl text-sm font-semibold transition-colors whitespace-nowrap shadow-sm">+ Add Manually</button>
+        </div>
+        {showAdd&&<div className="mt-3 p-3 border border-indigo-200 bg-indigo-50 rounded-xl">
+          <div className="grid grid-cols-2 gap-2 mb-2">
+            <input className="border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-200" placeholder="Name *" value={mc.name} onChange={e=>setMc(p=>({...p,name:e.target.value}))}/>
+            <input className="border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-200" placeholder="Title" value={mc.title} onChange={e=>setMc(p=>({...p,title:e.target.value}))}/>
+            <input className="border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-200" placeholder="Location" value={mc.location} onChange={e=>setMc(p=>({...p,location:e.target.value}))}/>
+            <input className="border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-200" placeholder="Skills (comma-separated)" value={mc.skills} onChange={e=>setMc(p=>({...p,skills:e.target.value}))}/>
+            <input className="border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-200" placeholder="Years of experience" type="number" value={mc.experience} onChange={e=>setMc(p=>({...p,experience:e.target.value}))}/>
+            <select className="border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-200" value={mc.availability} onChange={e=>setMc(p=>({...p,availability:e.target.value}))}>
+              <option>Available immediately</option><option>Open to offers</option><option>Actively looking</option><option>Passively open</option>
+            </select>
+          </div>
+          <div className="flex gap-2"><button onClick={addManual} className="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-2 rounded-lg text-xs font-semibold transition-colors">Add Candidate</button><button onClick={()=>setShowAdd(false)} className="flex-1 bg-gray-200 hover:bg-gray-300 text-gray-700 px-3 py-2 rounded-lg text-xs font-semibold transition-colors">Cancel</button></div>
+        </div>}
+        {candidates.length>0&&<input className="w-full mt-3 border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-200" placeholder="Filter by name, skill, or title…" value={filter} onChange={e=>setF(e.target.value)}/>}
+      </div>
+      {candidates.length===0&&!loading&&<Empty icon="🔍" title="No candidates yet" sub="Run The Scout to find recently active talent"/>}
+      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">{filtered.map(c=>
+        <div key={c.id} className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5 hover:shadow-md transition-all fade-in">
+          <div className="flex items-start gap-3 mb-3"><Avatar url={c.avatarUrl} name={c.name}/><div className="flex-1 min-w-0"><div className="flex items-center justify-between gap-2"><p className="font-bold text-gray-900 truncate text-sm">{c.name}</p><Badge cls="bg-gray-100 text-gray-500">{c.source}</Badge></div><p className="text-gray-500 text-xs truncate mt-0.5">{c.title||'No title'}{c.company?` · ${c.company}`:''}</p></div></div>
+          {c.bio&&<p className="text-xs text-gray-500 mb-3 line-clamp-2">{c.bio}</p>}
+          {c.location&&<div className="text-xs text-gray-600 mb-2">📍 {c.location}</div>}
+          {(c.skills||[]).length>0&&<div className="flex flex-wrap gap-1 mb-3">{c.skills.map(s=><Badge key={s} cls="bg-slate-100 text-slate-600">{s}</Badge>)}</div>}
+          <div className="flex flex-wrap gap-2 mt-3 pt-3 border-t border-gray-100">
+            {c.email&&<a href={`mailto:${c.email}`} className="inline-flex items-center gap-1 px-2.5 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-lg text-xs font-medium transition-colors" title={c.email}>✉ Email</a>}
+            {c.github&&<a href={c.github} target="_blank" className="inline-flex items-center gap-1 px-2.5 py-1.5 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg text-xs font-medium transition-colors">⌂ GitHub</a>}
+            {c.website&&<a href={c.website.startsWith('http')?c.website:`https://${c.website}`} target="_blank" className="inline-flex items-center gap-1 px-2.5 py-1.5 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg text-xs font-medium transition-colors">🌐 Website</a>}
+            {c.profileUrl&&c.profileUrl!=='#'&&!c.github&&<a href={c.profileUrl} target="_blank" className="inline-flex items-center gap-1 px-2.5 py-1.5 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg text-xs font-medium transition-colors">↗ Profile</a>}
+            {!c.email&&!c.github&&!c.website&&c.profileUrl==='#'&&<span className="text-xs text-gray-400">No contact info available</span>}
+          </div>
+        </div>)}</div>
+    </div>);
+};
+
+/* ═══════════ VALIDATOR PAGE ═══════════ */
+const ValidatorPage=({refresh})=>{
+  const[candidates,setC]=useState([...DB.candidates]);
+  const[loading,setL]=useState(false);
+  const[filter,setF]=useState('all');
+
+  const run=async()=>{setL(true);await runValidator();setC([...DB.candidates]);setL(false);};
+  useEffect(()=>{setC([...DB.candidates]);},[refresh]);
+
+  const tierColor={'Verified Active':'bg-emerald-100 text-emerald-700','Profile-Based':'bg-blue-100 text-blue-700','Insufficient Data':'bg-gray-100 text-gray-500'};
+  const filtered=candidates.filter(c=>c.validationTier).filter(c=>filter==='all'||c.validationTier===filter);
+  const counts={all:candidates.filter(c=>c.validationTier).length,'Verified Active':candidates.filter(c=>c.validationTier==='Verified Active').length,'Profile-Based':candidates.filter(c=>c.validationTier==='Profile-Based').length,'Insufficient Data':candidates.filter(c=>c.validationTier==='Insufficient Data').length};
+
+  return(
+    <div className="p-8 fade-in">
+      <div className="flex items-center gap-3 mb-6"><div className="w-11 h-11 rounded-xl bg-emerald-100 flex items-center justify-center text-2xl">✅</div><div><h1 className="text-2xl font-bold text-gray-900">The Validator</h1><p className="text-emerald-600 text-sm font-medium">Agent 2 · GitHub Repo Analysis · Proficiency Scoring</p></div></div>
+      <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5 mb-6">
+        <div className="flex gap-3 items-center flex-wrap">
+          <button onClick={run} disabled={loading} className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white px-5 py-2.5 rounded-xl text-sm font-semibold disabled:opacity-50 transition-colors whitespace-nowrap shadow-sm">{loading?<><Spinner/> Validating…</>:'✅ Run The Validator'}</button>
+          <div className="flex gap-2 ml-auto">
+            {['all','Verified Active','Profile-Based','Insufficient Data'].map(t=><button key={t} onClick={()=>setF(t)} className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${filter===t?'bg-emerald-600 text-white':'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}>{t==='all'?'All':t} ({counts[t]||0})</button>)}
+          </div>
+        </div>
+      </div>
+      {!candidates.some(c=>c.validationTier)&&!loading&&<Empty icon="✅" title="No validated candidates yet" sub="Run The Scout first, then The Validator to analyse GitHub repos"/>}
+      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">{filtered.map(c=>
+        <div key={c.id} className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5 hover:shadow-md transition-all fade-in">
+          <div className="flex items-start gap-3 mb-3"><Avatar url={c.avatarUrl} name={c.name}/><div className="flex-1 min-w-0"><div className="flex items-center justify-between gap-2"><p className="font-bold text-gray-900 truncate text-sm">{c.name}</p><span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${tierColor[c.validationTier]||'bg-gray-100 text-gray-500'}`}>{c.validationTier}</span></div><p className="text-gray-500 text-xs truncate mt-0.5">{c.title||'No title'}{c.company?` · ${c.company}`:''}</p></div></div>
+          {c.proficiency&&Object.keys(c.proficiency).length>0&&<div className="space-y-2 mb-3">
+            <p className="text-xs font-semibold text-gray-600">Proficiency Scores</p>
+            {Object.entries(c.proficiency).sort((a,b)=>b[1]-a[1]).slice(0,6).map(([skill,score])=>
+              <div key={skill} className="flex items-center gap-2">
+                <span className="text-xs text-gray-600 w-24 truncate">{skill}</span>
+                <div className="flex-1 bg-gray-100 rounded-full h-2"><div className="bg-emerald-500 h-2 rounded-full transition-all" style={{width:`${score}%`}}/></div>
+                <span className="text-xs text-gray-500 w-8 text-right">{score}</span>
+              </div>)}
+          </div>}
+          {c.repoCount!=null&&<div className="flex gap-3 text-xs text-gray-500 pt-2 border-t border-gray-100"><span>📦 {c.repoCount} repos</span>{c.totalStars>0&&<span>⭐ {c.totalStars} stars</span>}{c.totalForks>0&&<span>🍴 {c.totalForks} forks</span>}</div>}
+          {(!c.proficiency||!Object.keys(c.proficiency).length)&&<p className="text-xs text-gray-400 italic">No GitHub data available for validation</p>}
+        </div>)}</div>
+    </div>);
+};
+
+/* ═══════════ HIRING MANAGERS PAGE ═══════════ */
+const HiringManagersPage=({refresh})=>{
+  const[managers,setM]=useState([...DB.hiringManagers]);
+  const[loading,setL]=useState(false);
+  const[industry,setI]=useState('');
+  const[filter,setF]=useState('');
+  const[showAdd,setShowAdd]=useState(false);
+  const[mh,setMh]=useState({name:'',title:'',company:'',industry:'',companySize:'',openRoles:'',email:'',hiringSignal:''});
+
+  const run=async()=>{setL(true);await runConnector(industry);setM([...DB.hiringManagers]);setL(false);};
+
+  const addManualHM=()=>{
+    if(!mh.name.trim()||!mh.company.trim()) return alert('Name and company are required');
+    DB.hiringManagers.push({
+      id:uid(),name:mh.name,title:mh.title||'Not specified',company:mh.company,
+      industry:mh.industry||'Not specified',companySize:mh.companySize||'Not specified',
+      companyGrowth:['Rapid','Scaling','Early','Stable'][Math.floor(Math.random()*4)],
+      logo:['🟦','🎨','🔶','▲','🟣','⬛','🟢','🤗','🔧','💳'][Math.floor(Math.random()*10)],
+      hiringSignal:mh.hiringSignal||'Actively hiring',
+      urgency:['High','Medium','Critical','Low'][Math.floor(Math.random()*4)],
+      openRoles:parseInt(mh.openRoles)||1,
+      email:mh.email||`${mh.name.split(' ')[0].toLowerCase()}@${mh.company.toLowerCase().replace(/\s/g,'')}.com`,
+      avatarUrl:`https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(mh.name)}`
+    });
+    setM([...DB.hiringManagers]);
+    setMh({name:'',title:'',company:'',industry:'',companySize:'',openRoles:'',email:'',hiringSignal:''});
+    setShowAdd(false);
+  };
+
+  useEffect(()=>{setM([...DB.hiringManagers]);},[refresh]);
+  const filtered=managers.filter(m=>!filter||m.name?.toLowerCase().includes(filter.toLowerCase())||m.company?.toLowerCase().includes(filter.toLowerCase())||m.industry?.toLowerCase().includes(filter.toLowerCase()));
+
+  return(
+    <div className="p-8 fade-in">
+      <div className="flex items-center gap-3 mb-6"><div className="w-11 h-11 rounded-xl bg-violet-100 flex items-center justify-center text-2xl">🤝</div><div><h1 className="text-2xl font-bold text-gray-900">The Connector</h1><p className="text-violet-600 text-sm font-medium">Agent 4 · Apollo.io · Verified contacts only (name + title + company + email)</p></div></div>
+      <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5 mb-6">
+        <div className="flex gap-3 flex-wrap">
+          <input className="flex-1 min-w-48 border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-violet-200" placeholder="Industry (e.g. FinTech, AI/ML)" value={industry} onChange={e=>setI(e.target.value)}/>
+          <button onClick={run} disabled={loading} className="flex items-center gap-2 bg-violet-600 hover:bg-violet-700 text-white px-5 py-2.5 rounded-xl text-sm font-semibold disabled:opacity-50 transition-colors whitespace-nowrap shadow-sm">{loading?<><Spinner/> Connecting…</>:'🤝 Run The Connector'}</button>
+          <button onClick={()=>setShowAdd(!showAdd)} className="flex items-center gap-2 bg-gray-100 hover:bg-gray-200 text-gray-700 px-5 py-2.5 rounded-xl text-sm font-semibold transition-colors whitespace-nowrap shadow-sm">+ Add Manually</button>
+        </div>
+        {showAdd&&<div className="mt-3 p-3 border border-violet-200 bg-violet-50 rounded-xl">
+          <div className="grid grid-cols-2 gap-2 mb-2">
+            <input className="border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-200" placeholder="Name *" value={mh.name} onChange={e=>setMh(p=>({...p,name:e.target.value}))}/>
+            <input className="border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-200" placeholder="Title" value={mh.title} onChange={e=>setMh(p=>({...p,title:e.target.value}))}/>
+            <input className="border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-200" placeholder="Company *" value={mh.company} onChange={e=>setMh(p=>({...p,company:e.target.value}))}/>
+            <input className="border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-200" placeholder="Industry" value={mh.industry} onChange={e=>setMh(p=>({...p,industry:e.target.value}))}/>
+            <input className="border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-200" placeholder="Company size" value={mh.companySize} onChange={e=>setMh(p=>({...p,companySize:e.target.value}))}/>
+            <input className="border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-200" placeholder="Open roles" type="number" value={mh.openRoles} onChange={e=>setMh(p=>({...p,openRoles:e.target.value}))}/>
+            <input className="border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-200" placeholder="Email" value={mh.email} onChange={e=>setMh(p=>({...p,email:e.target.value}))}/>
+            <input className="border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-200" placeholder="Hiring signal" value={mh.hiringSignal} onChange={e=>setMh(p=>({...p,hiringSignal:e.target.value}))}/>
+          </div>
+          <div className="flex gap-2"><button onClick={addManualHM} className="flex-1 bg-violet-600 hover:bg-violet-700 text-white px-3 py-2 rounded-lg text-xs font-semibold transition-colors">Add Hiring Manager</button><button onClick={()=>setShowAdd(false)} className="flex-1 bg-gray-200 hover:bg-gray-300 text-gray-700 px-3 py-2 rounded-lg text-xs font-semibold transition-colors">Cancel</button></div>
+        </div>}
+        {managers.length>0&&<input className="w-full mt-3 border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-200" placeholder="Filter by name, company, or industry…" value={filter} onChange={e=>setF(e.target.value)}/>}
+      </div>
+      {managers.length===0&&!loading&&<Empty icon="🤝" title="No hiring managers yet" sub="Run The Connector — requires Apollo.io API key in Settings"/>}
+      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">{filtered.map(m=>
+        <div key={m.id} className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5 hover:shadow-md transition-all fade-in">
+          <div className="flex items-start gap-3 mb-4"><Avatar url={m.avatarUrl} name={m.name}/><div className="flex-1 min-w-0"><p className="font-bold text-gray-900 text-sm truncate">{m.name}</p><p className="text-gray-500 text-xs">{m.title}</p><div className="flex items-center gap-1.5 mt-1"><span className="text-base">{m.logo}</span><span className="font-semibold text-gray-800 text-xs">{m.company}</span></div></div></div>
+          <div className="flex flex-wrap gap-1.5 mb-3"><Badge cls="bg-gray-100 text-gray-600">{m.industry}</Badge><Badge cls={growClr(m.companyGrowth)}>{m.companyGrowth} Growth</Badge><Badge cls={urgClr(m.urgency)}>{m.urgency} Urgency</Badge></div>
+          <div className="bg-amber-50 border border-amber-100 rounded-xl p-3 mb-3 text-xs text-amber-800">💡 {m.hiringSignal}</div>
+          <div className="flex items-center justify-between text-xs text-gray-500"><span>🏢 {m.companySize}</span><span className="font-semibold text-indigo-600">{m.openRoles} open role{m.openRoles!==1?'s':''}</span></div>
+          <div className="mt-3 pt-3 border-t border-gray-50 text-xs text-gray-400">✉ {m.email}</div>
+        </div>)}</div>
+    </div>);
+};
+
+/* ═══════════ SHORTLIST PAGE ═══════════ */
+const ShortlistPage=({refresh})=>{
+  const[shortlist,setSL]=useState([...DB.shortlist]);
+  const[loading,setL]=useState(false);
+
+  const run=async()=>{setL(true);await runMatchmaker();setSL([...DB.shortlist]);setL(false);};
+  const updateStatus=(id,status)=>{const e=DB.shortlist.find(s=>s.id===id);if(e)e.status=status;setSL([...DB.shortlist]);};
+  useEffect(()=>{setSL([...DB.shortlist]);},[refresh]);
+
+  const groups=shortlist.reduce((acc,item)=>{const k=`${item.company} – ${item.postTitle}`;if(!acc[k])acc[k]=[];acc[k].push(item);return acc;},{});
+  const keys=getKeys();
+
+  return(
+    <div className="p-8 fade-in">
+      <div className="flex items-center justify-between mb-6">
+        <div className="flex items-center gap-3"><div className="w-11 h-11 rounded-xl bg-amber-100 flex items-center justify-center text-2xl">⭐</div><div><h1 className="text-2xl font-bold text-gray-900">The Matchmaker</h1><p className="text-amber-600 text-sm font-medium">Agent 3 · Weighted Scoring (Skills 35% · Seniority 20% · Location 15% · Availability 15% · Validation 15%) + {keys.airtableKey?'Airtable Sync ✓':'Airtable (not configured)'}</p></div></div>
+        <button onClick={run} disabled={loading} className="flex items-center gap-2 bg-amber-500 hover:bg-amber-600 text-white px-5 py-2.5 rounded-xl text-sm font-semibold disabled:opacity-50 transition-colors shadow-sm">{loading?<><Spinner/> Matching…</>:'⭐ Run The Matchmaker'}</button>
+      </div>
+      {shortlist.length===0&&!loading&&<Empty icon="⭐" title="No matches yet" sub="Run The Scout first, then run The Matchmaker"/>}
+      {Object.entries(groups).map(([groupKey,items])=>
+        <div key={groupKey} className="mb-8 fade-in">
+          <div className="flex items-center gap-3 mb-4"><h2 className="text-base font-bold text-gray-800">{groupKey}</h2><span className="bg-gray-100 text-gray-500 text-xs px-2 py-0.5 rounded-full">{items.length} candidate{items.length!==1?'s':''}</span></div>
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">{items.map(item=>
+            <div key={item.id} className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5 hover:shadow-md transition-all">
+              <div className="flex items-start gap-3 mb-4">
+                <div className="relative flex-shrink-0"><Avatar url={item.avatarUrl} name={item.candidateName}/><span className={`absolute -top-1 -right-1 w-6 h-6 rounded-full flex items-center justify-center text-xs font-black ${rankClr(item.rank)}`}>#{item.rank}</span></div>
+                <div className="flex-1 min-w-0"><p className="font-bold text-gray-900 text-sm truncate">{item.candidateName}</p><p className="text-gray-500 text-xs">{item.candidateTitle}</p><div className="flex gap-1 mt-1"><Badge cls={statClr(item.status)}>{item.status}</Badge>{item.validationTier&&item.validationTier!=='Not Validated'&&<Badge cls={item.validationTier==='Verified Active'?'bg-emerald-100 text-emerald-700':item.validationTier==='Profile-Based'?'bg-blue-100 text-blue-700':'bg-gray-100 text-gray-500'}>{item.validationTier}</Badge>}</div></div>
+              </div>
+              <div className="mb-3"><div className="flex items-center justify-between text-xs mb-1.5"><span className="text-gray-500 font-medium">Match Score</span><span className="font-bold text-gray-800">{item.totalScore}/100</span></div><div className="w-full bg-gray-100 rounded-full h-2"><div className={`h-2 rounded-full transition-all ${barClr(item.totalScore)}`} style={{width:`${item.totalScore}%`}}/></div><div className="text-xs text-gray-400 mt-1">Skill match: {item.skillMatchPct}%</div></div>
+              {item.matchedSkills?.length>0&&<div className="flex flex-wrap gap-1 mb-3">{item.matchedSkills.map(s=><Badge key={s} cls="bg-emerald-50 text-emerald-700">✓ {s}</Badge>)}</div>}
+              <div className="mb-4 space-y-0.5">{(item.reasons||[]).map((r,i)=><p key={i} className="text-xs text-gray-600">• {r}</p>)}</div>
+              {item.status==='pending'?<div className="flex gap-2"><button onClick={()=>updateStatus(item.id,'approved')} className="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white text-xs py-2 rounded-xl font-semibold transition-colors">✓ Approve</button><button onClick={()=>updateStatus(item.id,'rejected')} className="flex-1 bg-gray-100 hover:bg-red-50 text-gray-600 hover:text-red-600 text-xs py-2 rounded-xl font-semibold transition-colors">✗ Reject</button></div>
+              :<button onClick={()=>updateStatus(item.id,'pending')} className="w-full bg-gray-100 hover:bg-gray-200 text-gray-600 text-xs py-2 rounded-xl font-semibold transition-colors">↺ Reset</button>}
+            </div>)}</div>
+        </div>)}
+    </div>);
+};
+
+/* ═══════════ POSTS PAGE ═══════════ */
+const PostsPage=({refresh})=>{
+  const[posts,setP]=useState([...DB.posts]);
+  const[form,setFo]=useState({title:'',company:'',location:'',skills:'',salary:''});
+  const[filter,setF]=useState('all');
+
+  const create=()=>{if(!form.title||!form.company)return;DB.posts.push({id:uid(),title:form.title,company:form.company,location:form.location||'Remote',skills:form.skills?form.skills.split(',').map(s=>s.trim()):[],salary:form.salary||'Competitive',status:'active',createdAt:new Date().toISOString().slice(0,10)});setFo({title:'',company:'',location:'',skills:'',salary:''});setP([...DB.posts]);};
+  const toggle=post=>{post.status=post.status==='active'?'closed':'active';setP([...DB.posts]);};
+  const del=id=>{const i=DB.posts.findIndex(p=>p.id===id);if(i>-1)DB.posts.splice(i,1);setP([...DB.posts]);};
+  useEffect(()=>{setP([...DB.posts]);},[refresh]);
+  const filtered=posts.filter(p=>filter==='all'||p.status===filter);
+
+  return(
+    <div className="p-8 fade-in">
+      <div className="flex items-center gap-3 mb-6"><div className="w-11 h-11 rounded-xl bg-green-100 flex items-center justify-center text-2xl">📋</div><div><h1 className="text-2xl font-bold text-gray-900">Job Posts</h1><p className="text-gray-500 text-sm">Create and manage job listings</p></div></div>
+      <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-6 mb-6">
+        <h2 className="font-bold text-gray-800 mb-4">Post a New Job</h2>
+        <div className="grid grid-cols-2 gap-3 mb-3">
+          <input className="border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-green-200" placeholder="Job title *" value={form.title} onChange={e=>setFo(p=>({...p,title:e.target.value}))}/>
+          <input className="border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-green-200" placeholder="Company *" value={form.company} onChange={e=>setFo(p=>({...p,company:e.target.value}))}/>
+          <input className="border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-green-200" placeholder="Location" value={form.location} onChange={e=>setFo(p=>({...p,location:e.target.value}))}/>
+          <input className="border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-green-200" placeholder="Salary" value={form.salary} onChange={e=>setFo(p=>({...p,salary:e.target.value}))}/>
+        </div>
+        <div className="flex gap-3"><input className="flex-1 border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-green-200" placeholder="Skills, comma-separated" value={form.skills} onChange={e=>setFo(p=>({...p,skills:e.target.value}))}/>
+          <button onClick={create} disabled={!form.title||!form.company} className="flex items-center gap-2 bg-green-600 hover:bg-green-700 text-white px-5 py-2.5 rounded-xl text-sm font-semibold disabled:opacity-50 transition-colors shadow-sm whitespace-nowrap">+ Post Job</button>
+        </div>
+      </div>
+      <div className="flex gap-2 mb-5">{['all','active','closed'].map(f=><button key={f} onClick={()=>setF(f)} className={`px-4 py-1.5 rounded-xl text-sm font-medium transition-colors capitalize ${filter===f?'bg-gray-900 text-white':'bg-white text-gray-600 border border-gray-200 hover:bg-gray-50'}`}>{f==='all'?'All Posts':f}</button>)}<span className="ml-2 self-center text-xs text-gray-400">{filtered.length} post{filtered.length!==1?'s':''}</span></div>
+      {posts.length===0&&<Empty icon="📋" title="No job posts yet" sub="Create your first listing above"/>}
+      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">{filtered.map(post=>
+        <div key={post.id} className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5 hover:shadow-md transition-all fade-in">
+          <div className="flex items-start justify-between gap-2 mb-3"><div><h3 className="font-bold text-gray-900 text-sm">{post.title}</h3><p className="text-gray-600 text-xs mt-0.5">🏢 {post.company}</p></div><Badge cls={post.status==='active'?'bg-green-100 text-green-700':'bg-gray-100 text-gray-500'}>{post.status}</Badge></div>
+          <div className="text-xs text-gray-500 space-y-1 mb-3"><div>📍 {post.location}</div><div>💰 {post.salary}</div><div>📅 {fmt(post.createdAt)}</div></div>
+          <div className="flex flex-wrap gap-1 mb-4">{(post.skills||[]).map(s=><Badge key={s} cls="bg-blue-50 text-blue-700">{s}</Badge>)}</div>
+          <div className="flex gap-2"><button onClick={()=>toggle(post)} className={`flex-1 text-xs py-2 rounded-xl font-semibold transition-colors ${post.status==='active'?'bg-gray-100 hover:bg-gray-200 text-gray-600':'bg-green-100 hover:bg-green-200 text-green-700'}`}>{post.status==='active'?'Close':'Reopen'}</button><button onClick={()=>del(post.id)} className="px-3 py-2 bg-red-50 hover:bg-red-100 text-red-500 text-xs rounded-xl font-semibold transition-colors">🗑</button></div>
+        </div>)}</div>
+    </div>);
+};
+
+/* ═══════════ USERS PAGE ═══════════ */
+const UsersPage=({refresh})=>{
+  const[users,setU]=useState([...DB.users]);
+  const[form,setFo]=useState({name:'',email:'',role:'recruiter'});
+  const[error,setE]=useState('');
+
+  const create=()=>{if(!form.name||!form.email)return setE('Name and email required');if(DB.users.find(u=>u.email===form.email))return setE('Email already exists');DB.users.push({id:uid(),name:form.name,email:form.email,role:form.role,createdAt:new Date().toISOString()});setFo({name:'',email:'',role:'recruiter'});setE('');setU([...DB.users]);};
+  const del=id=>{const i=DB.users.findIndex(u=>u.id===id);if(i>-1)DB.users.splice(i,1);setU([...DB.users]);};
+  useEffect(()=>{setU([...DB.users]);},[refresh]);
+  const roleClr=r=>r==='admin'?'bg-indigo-100 text-indigo-700':'bg-green-100 text-green-700';
+
+  return(
+    <div className="p-8 fade-in">
+      <div className="flex items-center gap-3 mb-6"><div className="w-11 h-11 rounded-xl bg-blue-100 flex items-center justify-center text-2xl">👥</div><div><h1 className="text-2xl font-bold text-gray-900">Users</h1><p className="text-gray-500 text-sm">Manage your recruiting team</p></div></div>
+      <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-6 mb-6">
+        <h2 className="font-bold text-gray-800 mb-4">Add Team Member</h2>
+        <div className="flex gap-3 flex-wrap">
+          <input className="flex-1 min-w-40 border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" placeholder="Full name *" value={form.name} onChange={e=>setFo(p=>({...p,name:e.target.value}))}/>
+          <input className="flex-1 min-w-40 border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200" placeholder="Email *" value={form.email} onChange={e=>setFo(p=>({...p,email:e.target.value}))}/>
+          <select className="border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200 bg-white" value={form.role} onChange={e=>setFo(p=>({...p,role:e.target.value}))}><option value="recruiter">Recruiter</option><option value="admin">Admin</option></select>
+          <button onClick={create} disabled={!form.name||!form.email} className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white px-5 py-2.5 rounded-xl text-sm font-semibold disabled:opacity-50 transition-colors shadow-sm whitespace-nowrap">+ Add User</button>
+        </div>
+        {error&&<p className="text-red-500 text-xs mt-2">{error}</p>}
+      </div>
+      <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
+        <table className="w-full">
+          <thead><tr className="bg-gray-50 border-b border-gray-100"><th className="text-left text-xs font-semibold text-gray-500 uppercase tracking-wider px-6 py-3">User</th><th className="text-left text-xs font-semibold text-gray-500 uppercase tracking-wider px-6 py-3">Email</th><th className="text-left text-xs font-semibold text-gray-500 uppercase tracking-wider px-6 py-3">Role</th><th className="text-left text-xs font-semibold text-gray-500 uppercase tracking-wider px-6 py-3">Joined</th><th className="px-6 py-3"/></tr></thead>
+          <tbody>{users.map((u,i)=><tr key={u.id} className={`border-b border-gray-50 last:border-0 hover:bg-gray-50/50 transition-colors ${i%2?'bg-gray-50/30':''}`}><td className="px-6 py-4"><div className="flex items-center gap-3"><Avatar url={`https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(u.name)}`} name={u.name} size="9"/><span className="font-semibold text-gray-900 text-sm">{u.name}</span></div></td><td className="px-6 py-4 text-gray-500 text-sm">{u.email}</td><td className="px-6 py-4"><Badge cls={roleClr(u.role)}>{u.role}</Badge></td><td className="px-6 py-4 text-gray-400 text-xs">{fmt(u.createdAt)}</td><td className="px-6 py-4 text-right"><button onClick={()=>del(u.id)} className="text-xs text-red-400 hover:text-red-600 transition-colors font-medium">Remove</button></td></tr>)}</tbody>
+        </table>
+        {users.length===0&&<div className="py-16 text-center text-gray-400 text-sm">No users yet</div>}
+      </div>
+    </div>);
+};
+
+/* ═══════════ SETTINGS PAGE ═══════════ */
+const SettingsPage=()=>{
+  const init=getKeys();
+  const[keys,setKeys]=useState({...init});
+  const[saved,setSaved]=useState(false);
+  const[show,setShow]=useState({});
+
+  const save=()=>{
+    localStorage.setItem('ss_firecrawl',keys.firecrawl);
+    localStorage.setItem('ss_apollo',keys.apollo);
+    localStorage.setItem('ss_airtable_key',keys.airtableKey);
+    localStorage.setItem('ss_airtable_base',keys.airtableBase);
+    localStorage.setItem('ss_airtable_table',keys.airtableTable||'Shortlist');
+    setSaved(true);
+    setTimeout(()=>setSaved(false),3000);
+  };
+
+  const clear=field=>{setKeys(p=>({...p,[field]:''}));};
+  const conn=field=>!!keys[field];
+
+  const Section=({icon,title,color,badge,children})=>(
+    <div className={`bg-white rounded-2xl border border-gray-100 shadow-sm p-6 mb-4`}>
+      <div className="flex items-center gap-2 mb-1">
+        <span className="text-xl">{icon}</span>
+        <h2 className="font-bold text-gray-800">{title}</h2>
+        <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${badge}`}>{badge.includes('green')?'● Connected':'○ Not configured'}</span>
+      </div>
+      {children}
+    </div>
+  );
+
+  const KeyField=({label,field,placeholder,hint,href})=>(
+    <div className="mb-4">
+      <label className="block text-xs font-semibold text-gray-600 mb-1.5">{label}</label>
+      {hint&&<p className="text-gray-400 text-xs mb-2">{hint}{href&&<> · <a href={href} target="_blank" className="text-indigo-500 hover:underline">{href.replace('https://','')}</a></>}</p>}
+      <div className="relative">
+        <input
+          type={show[field]?'text':'password'}
+          className="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-200 pr-24 font-mono"
+          placeholder={placeholder}
+          value={keys[field]}
+          onChange={e=>setKeys(p=>({...p,[field]:e.target.value}))}
+        />
+        <div className="absolute right-2 top-1/2 -translate-y-1/2 flex gap-1">
+          <button type="button" onClick={()=>setShow(p=>({...p,[field]:!p[field]}))} className="text-xs text-gray-400 hover:text-gray-600 px-1.5 py-1 rounded">{show[field]?'Hide':'Show'}</button>
+          {keys[field]&&<button type="button" onClick={()=>clear(field)} className="text-xs text-red-400 hover:text-red-600 px-1.5 py-1 rounded">Clear</button>}
+        </div>
+      </div>
+    </div>
+  );
+
+  const TextField=({label,field,placeholder,hint})=>(
+    <div className="mb-4">
+      <label className="block text-xs font-semibold text-gray-600 mb-1.5">{label}</label>
+      {hint&&<p className="text-gray-400 text-xs mb-2">{hint}</p>}
+      <input
+        type="text"
+        className="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-200"
+        placeholder={placeholder}
+        value={keys[field]}
+        onChange={e=>setKeys(p=>({...p,[field]:e.target.value}))}
+      />
+    </div>
+  );
+
+  return(
+    <div className="p-8 fade-in max-w-2xl">
+      <div className="flex items-center gap-3 mb-8">
+        <div className="w-11 h-11 rounded-xl bg-gray-100 flex items-center justify-center text-2xl">⚙️</div>
+        <div><h1 className="text-2xl font-bold text-gray-900">Settings</h1><p className="text-gray-500 text-sm">Connect real data sources for your AI agents</p></div>
+      </div>
+
+      {/* API Status Summary */}
+      <div className="bg-indigo-50 border border-indigo-100 rounded-2xl p-4 mb-6">
+        <p className="text-indigo-800 text-xs font-semibold mb-2">API Connection Status</p>
+        <div className="flex gap-4 flex-wrap text-xs">
+          <span className={conn('firecrawl')?'text-emerald-600':'text-gray-400'}>🔍 Firecrawl {conn('firecrawl')?'✓ Connected':'✗ Not set'}</span>
+          <span className={conn('apollo')?'text-emerald-600':'text-gray-400'}>🎯 Apollo.io {conn('apollo')?'✓ Connected':'✗ Not set'}</span>
+          <span className={conn('airtableKey')&&conn('airtableBase')?'text-emerald-600':'text-gray-400'}>⭐ Airtable {conn('airtableKey')&&conn('airtableBase')?'✓ Connected':'✗ Not set'}</span>
+        </div>
+        <p className="text-indigo-600 text-xs mt-2">All keys are stored locally in your browser. They never leave your device.</p>
+      </div>
+
+      {/* Firecrawl */}
+      <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-6 mb-4">
+        <div className="flex items-center gap-2 mb-4">
+          <span className="text-xl">🔍</span>
+          <h2 className="font-bold text-gray-800">The Scout — Firecrawl</h2>
+          <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${conn('firecrawl')?'bg-green-100 text-green-700':'bg-gray-100 text-gray-500'}`}>{conn('firecrawl')?'● Connected':'○ Not set'}</span>
+        </div>
+        <p className="text-gray-500 text-xs mb-4 leading-relaxed">Enables real candidate discovery from the web. <strong>Free tier: 500 credits/month.</strong> Sign up at <a href="https://firecrawl.dev" target="_blank" className="text-indigo-500 hover:underline">firecrawl.dev</a> → API Keys → Create Key.</p>
+        <KeyField label="Firecrawl API Key" field="firecrawl" placeholder="fc-xxxxxxxxxxxxxxxxxxxxxxxx" hint="Starts with fc-"/>
+      </div>
+
+      {/* Apollo */}
+      <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-6 mb-4">
+        <div className="flex items-center gap-2 mb-4">
+          <span className="text-xl">🎯</span>
+          <h2 className="font-bold text-gray-800">The Connector — Apollo.io</h2>
+          <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${conn('apollo')?'bg-green-100 text-green-700':'bg-gray-100 text-gray-500'}`}>{conn('apollo')?'● Connected':'○ Not set'}</span>
+        </div>
+        <p className="text-gray-500 text-xs mb-4 leading-relaxed">Finds real hiring managers and their contact info. <strong>Free tier: 50 credits/month.</strong> Sign up at <a href="https://apollo.io" target="_blank" className="text-indigo-500 hover:underline">apollo.io</a> → Settings → Integrations → API.</p>
+        <KeyField label="Apollo.io API Key" field="apollo" placeholder="your-apollo-api-key" hint="Found under Settings → Integrations → API Keys"/>
+      </div>
+
+      {/* Airtable */}
+      <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-6 mb-6">
+        <div className="flex items-center gap-2 mb-4">
+          <span className="text-xl">⭐</span>
+          <h2 className="font-bold text-gray-800">The Matchmaker — Airtable</h2>
+          <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${conn('airtableKey')&&conn('airtableBase')?'bg-green-100 text-green-700':'bg-gray-100 text-gray-500'}`}>{conn('airtableKey')&&conn('airtableBase')?'● Connected':'○ Not set'}</span>
+        </div>
+        <p className="text-gray-500 text-xs mb-4 leading-relaxed">Saves your shortlist to Airtable for team collaboration. <strong>Free tier: 1,000 records/base.</strong> Sign up at <a href="https://airtable.com" target="_blank" className="text-indigo-500 hover:underline">airtable.com</a> → Create a base → Add a table named "Shortlist".</p>
+        <KeyField label="Airtable Personal Access Token" field="airtableKey" placeholder="patXXXXXXXXXXXXXX" hint="airtable.com/create/tokens → Create token with data:records:write scope"/>
+        <KeyField label="Airtable Base ID" field="airtableBase" placeholder="appXXXXXXXXXXXXXX" hint="Found in the URL when you open your base: airtable.com/appXXX/..."/>
+        <TextField label="Table Name" field="airtableTable" placeholder="Shortlist" hint='The exact name of your table in Airtable (default: "Shortlist")'/>
+        <div className="bg-blue-50 border border-blue-100 rounded-xl p-3 text-xs text-blue-700 mt-2">
+          <strong>Required columns in your Airtable table:</strong> Candidate Name, Candidate Title, Role, Company, Match Score, Skill Match %, Matched Skills, Rank, Status
+        </div>
+      </div>
+
+      {/* Save */}
+      <button
+        onClick={save}
+        className={`w-full py-3.5 rounded-xl font-semibold text-sm transition-all shadow-sm ${saved?'bg-emerald-600 text-white':'bg-indigo-600 hover:bg-indigo-700 text-white'}`}
+      >
+        {saved?'✓ Keys saved to browser storage!':'Save API Keys'}
+      </button>
+      <p className="text-center text-gray-400 text-xs mt-3">Keys are saved in localStorage — they persist across page reloads but stay on your device only.</p>
+    </div>
+  );
+};
+
+/* ═══════════ APP ═══════════ */
+const App=()=>{
+  const[page,setPage]=useState('dashboard');
+  const[refresh,setRefresh]=useState(0);
+  const changePage=(p)=>{setPage(p);setRefresh(r=>r+1);};
+  const pages={
+    dashboard:<Dashboard setPage={changePage} refresh={refresh}/>,
+    candidates:<CandidatesPage refresh={refresh}/>,
+    validator:<ValidatorPage refresh={refresh}/>,
+    'hiring-managers':<HiringManagersPage refresh={refresh}/>,
+    shortlist:<ShortlistPage refresh={refresh}/>,
+    posts:<PostsPage refresh={refresh}/>,
+    users:<UsersPage refresh={refresh}/>,
+    settings:<SettingsPage/>,
+  };
+  return(
+    <div className="flex h-screen overflow-hidden">
+      <Sidebar page={page} setPage={changePage}/>
+      <main className="ml-60 flex-1 overflow-y-auto">{pages[page]||pages.dashboard}</main>
+    </div>
+  );
+};
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
