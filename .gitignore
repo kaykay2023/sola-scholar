@@ -1,0 +1,40 @@
+# Secrets & credentials — NEVER commit any of these
+.env
+.env.*
+*.env
+secrets*
+credentials*
+*.key
+*.pem
+*.p12
+*.pfx
+service-account*.json
+firebase-adminsdk*.json
+google-credentials*.json
+
+# Local dev artifacts (the app is a single static file; nothing else should ship)
+node_modules/
+package.json
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+dist/
+build/
+.cache/
+.parcel-cache/
+.next/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Logs / scratch
+*.log
+.tmp/
+tmp/
+scratch/
+*.bak
