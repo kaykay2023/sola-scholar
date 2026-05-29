@@ -45,3 +45,4 @@ Thumbs.db
 tmp/
 scratch/
 *.bak
+.predeploy.out
