@@ -1,0 +1,87 @@
+{
+  "_comment": "Editable saved role templates for the Sola Scholar pipeline. Add/edit roles here; the server loads this file at startup and exposes it at GET /api/role-templates. No code changes needed to add a role. 'scoringProfileId' links to config/scoring-profiles.json (structure only — does NOT change score math while scoring-profiles.enabled is false).",
+  "version": 1,
+  "templates": [
+    {
+      "id": "ms-sentinel-soc-analyst",
+      "title": "Microsoft Sentinel SOC Analyst",
+      "requiredSkills": ["Microsoft Sentinel", "KQL", "SIEM", "SOC", "Incident Response", "Azure Security"],
+      "niceToHaveSkills": ["Threat Detection", "Defender", "MITRE ATT&CK", "Phishing Investigation", "Alert Triage"],
+      "defaultLocation": "Remote",
+      "defaultSeniority": "Mid",
+      "scoringProfileId": "ms-sentinel-soc-analyst"
+    },
+    {
+      "id": "ms-sentinel-detection-analyst",
+      "title": "Microsoft Sentinel Detection Analyst",
+      "requiredSkills": ["Microsoft Sentinel", "KQL", "SIEM", "SOC", "Incident Response", "Threat Detection"],
+      "niceToHaveSkills": ["Detection Engineering", "Analytics Rules", "Defender", "MITRE ATT&CK", "Threat Hunting"],
+      "defaultLocation": "Remote",
+      "defaultSeniority": "Mid",
+      "scoringProfileId": "ms-sentinel-detection-analyst"
+    },
+    {
+      "id": "azure-security-engineer",
+      "title": "Azure Security Engineer",
+      "requiredSkills": ["Azure Security", "Microsoft Sentinel", "KQL", "SIEM", "Cloud Security", "Incident Response"],
+      "niceToHaveSkills": ["Defender for Cloud", "Entra ID", "IAM", "NIST", "Terraform"],
+      "defaultLocation": "Remote or Detroit, Michigan",
+      "defaultSeniority": "Mid",
+      "scoringProfileId": "azure-security-engineer"
+    },
+    {
+      "id": "azure-cloud-security-engineer",
+      "title": "Azure Cloud Security Engineer",
+      "requiredSkills": ["Azure Security", "Defender for Cloud", "Cloud Security", "Microsoft Sentinel", "IAM", "Incident Response"],
+      "niceToHaveSkills": ["KQL", "Entra ID", "Terraform", "Azure Policy", "SOC"],
+      "defaultLocation": "Remote",
+      "defaultSeniority": "Mid to Senior",
+      "scoringProfileId": "azure-cloud-security-engineer"
+    },
+    {
+      "id": "cloud-security-engineer",
+      "title": "Cloud Security Engineer",
+      "requiredSkills": ["Cloud Security", "IAM", "Incident Response", "SIEM", "Vulnerability Management", "Security Monitoring"],
+      "niceToHaveSkills": ["AWS", "Azure", "GCP", "Terraform", "Kubernetes", "CSPM"],
+      "defaultLocation": "Remote",
+      "defaultSeniority": "Mid",
+      "scoringProfileId": "cloud-security-engineer"
+    },
+    {
+      "id": "iam-pam-analyst",
+      "title": "IAM / PAM Analyst",
+      "requiredSkills": ["IAM", "PAM", "Entra ID", "Azure AD", "Access Reviews", "MFA", "RBAC"],
+      "niceToHaveSkills": ["Okta", "CyberArk", "SailPoint", "Conditional Access", "Identity Governance"],
+      "defaultLocation": "Remote",
+      "defaultSeniority": "Mid",
+      "scoringProfileId": "iam-pam-analyst"
+    },
+    {
+      "id": "grc-analyst",
+      "title": "GRC Analyst",
+      "requiredSkills": ["NIST", "ISO 27001", "SOC 2", "Risk Assessment", "Security Controls", "Audit Evidence"],
+      "niceToHaveSkills": ["Vendor Risk", "PCI DSS", "HIPAA", "Policy Writing", "Control Testing"],
+      "defaultLocation": "Remote",
+      "defaultSeniority": "Mid",
+      "scoringProfileId": "grc-analyst"
+    },
+    {
+      "id": "aws-cloud-security-engineer",
+      "title": "AWS Cloud Security Engineer",
+      "requiredSkills": ["AWS IAM", "GuardDuty", "CloudTrail", "AWS Config", "Security Groups", "Cloud Security"],
+      "niceToHaveSkills": ["Terraform", "Kubernetes", "CSPM", "DevSecOps", "SIEM", "Incident Response"],
+      "defaultLocation": "Remote",
+      "defaultSeniority": "Mid to Senior",
+      "scoringProfileId": "aws-cloud-security-engineer"
+    },
+    {
+      "id": "data-analyst-power-bi",
+      "title": "Data Analyst / Power BI Analyst",
+      "requiredSkills": ["SQL", "Power BI", "Excel", "Reporting", "Dashboarding", "Data Visualization"],
+      "niceToHaveSkills": ["Python", "Tableau", "ETL", "Business Analytics"],
+      "defaultLocation": "Remote or Detroit, Michigan",
+      "defaultSeniority": "Junior to Mid",
+      "scoringProfileId": "data-analyst-power-bi"
+    }
+  ]
+}

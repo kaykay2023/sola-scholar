@@ -1,6 +1,7 @@
-# Secrets & credentials — NEVER commit any of these
+# Secrets & credentials — NEVER commit
 .env
 .env.*
+!.env.example
 *.env
 secrets*
 credentials*
@@ -12,10 +13,15 @@ service-account*.json
 firebase-adminsdk*.json
 google-credentials*.json
 
-# Local dev artifacts (the app is a single static file; nothing else should ship)
+# Runtime data
+data/
+data.json
+data.json.tmp
+
+# Node / dev artifacts
 node_modules/
-package.json
-package-lock.json
+# package-lock.json is intentionally TRACKED for reproducible Railway builds.
+# Only ignore lockfiles from package managers this project does not use.
 yarn.lock
 pnpm-lock.yaml
 dist/
@@ -24,9 +30,10 @@ build/
 .parcel-cache/
 .next/
 
-# Editor / OS
+# Editor / OS / dev tools
 .vscode/
 .idea/
+.claude/
 .DS_Store
 Thumbs.db
 *.swp
