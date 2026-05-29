@@ -39,6 +39,26 @@ function Section($t) { Write-Host ""; Write-Host "== $t ==" -ForegroundColor Cya
 function Ok($t)      { Write-Host "  [OK]   $t" -ForegroundColor Green }
 function Warn($t)    { Write-Host "  [WARN] $t" -ForegroundColor Yellow; $warnings.Add($t) }
 function Block($t)   { Write-Host "  [STOP] $t" -ForegroundColor Red;    $blockers.Add($t) }
+function Test-GitTracked($p) {
+    $oldPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & git ls-files --error-unmatch -- $p 2>$null | Out-Null
+        return ($LASTEXITCODE -eq 0)
+    } finally {
+        $ErrorActionPreference = $oldPreference
+    }
+}
+function Test-GitIgnored($p) {
+    $oldPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & git check-ignore -- $p 2>$null | Out-Null
+        return ($LASTEXITCODE -eq 0)
+    } finally {
+        $ErrorActionPreference = $oldPreference
+    }
+}
 
 Write-Host "Sola Scholar - Repo Safety Check" -ForegroundColor White
 Write-Host "Repo: $repoRoot"
@@ -77,8 +97,7 @@ Section "Secret files"
 $secretPaths = @('.env', 'backend/.env', '.env.local', 'backend/.env.local')
 foreach ($p in $secretPaths) {
     $exists  = Test-Path $p
-    git ls-files --error-unmatch $p *> $null
-    $tracked = ($LASTEXITCODE -eq 0)
+    $tracked = Test-GitTracked $p
     if ($exists) { Write-Host "  $p exists: yes" } else { Write-Host "  $p exists: no" }
     if ($tracked) { Block "$p is TRACKED by git (must be ignored)" } else { Ok "$p not tracked" }
 }
@@ -109,8 +128,7 @@ if ($staged) {
 # ---------------------------------------------------------------------------
 Section "Key files"
 function FileState($f) {
-    git ls-files --error-unmatch $f *> $null
-    $tracked = ($LASTEXITCODE -eq 0)
+    $tracked = Test-GitTracked $f
     $dirty = ($porcelain | Where-Object { $_ -match [regex]::Escape($f) })
     if (-not (Test-Path $f)) { return "missing" }
     if (-not $tracked)       { return "UNTRACKED" }
@@ -128,10 +146,10 @@ foreach ($f in 'package.json','package-lock.json','railway.json','backend/server
 # 4. .gitignore sanity
 # ---------------------------------------------------------------------------
 Section ".gitignore sanity"
-git check-ignore .env       *> $null; if ($LASTEXITCODE -eq 0) { Ok ".env is ignored" } else { Block ".env is NOT ignored" }
-git check-ignore backend/.env *> $null; if ($LASTEXITCODE -eq 0) { Ok "backend/.env is ignored" } else { Block "backend/.env is NOT ignored" }
-git check-ignore package-lock.json *> $null; if ($LASTEXITCODE -eq 0) { Warn "package-lock.json is ignored (Node app should track it)" } else { Ok "package-lock.json not ignored" }
-git check-ignore node_modules *> $null; if ($LASTEXITCODE -eq 0) { Ok "node_modules is ignored" } else { Warn "node_modules is NOT ignored" }
+if (Test-GitIgnored '.env') { Ok ".env is ignored" } else { Block ".env is NOT ignored" }
+if (Test-GitIgnored 'backend/.env') { Ok "backend/.env is ignored" } else { Block "backend/.env is NOT ignored" }
+if (Test-GitIgnored 'package-lock.json') { Warn "package-lock.json is ignored (Node app should track it)" } else { Ok "package-lock.json not ignored" }
+if (Test-GitIgnored 'node_modules') { Ok "node_modules is ignored" } else { Warn "node_modules is NOT ignored" }
 
 # .env.example must exist and contain no assigned values
 if (Test-Path '.env.example') {

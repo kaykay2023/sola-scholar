@@ -442,19 +442,20 @@ async function main() {
   // Score sharedCand under each run; expect different scores driven by validation
   const scoreA = scoreCandidateAgainstNeed(sharedCand, need, runA);
   const scoreB = scoreCandidateAgainstNeed(sharedCand, need, runB);
+  assert(scoreA.score === 59,
+    `Needs Review validation does NOT boost numeric score (expected original 59, got ${scoreA.score})`);
+  assert(!(scoreA.reasoning || []).some(r => /Needs human review/.test(r)),
+    `Needs Review is not used as a positive scoring reason (got ${JSON.stringify(scoreA.reasoning)})`);
   assert(scoreB.score > scoreA.score,
     `Same candidate scored higher with runB's stronger validation (runA=${scoreA.score}, runB=${scoreB.score})`);
 
-  // ── 7b. Partial/exact skill matching in scoreCandidateAgainstNeed ──
+  // ── 7b. Exact skill matching in scoreCandidateAgainstNeed ─────────
   //
-  // Fixes the prior bug where PDL-style compound skills like
-  // "azure active directory" or "cloud security" never matched single-token
-  // required skills like "Azure"/"Security" because the scorer only allowed
-  // exact-string equality after normalization. New behavior: contains-either-
-  // direction match, with a 3-char floor on the inclusion side to prevent
-  // false positives from very short tokens.
+  // Scoring math guardrail: a candidate skill must exactly match the required
+  // skill after normalization. Compound skills like "azure active directory"
+  // or "cloud security" must not score as "Azure" or "Security".
   {
-    const partialMatchNeed = createNeed({
+    const exactMatchNeed = createNeed({
       companyId: coA.id,
       title: 'Azure Security Engineer',
       requiredSkills: ['Azure', 'Security', 'KQL', 'Incident Response'],
@@ -462,30 +463,30 @@ async function main() {
       locationType: 'Remote',
       confirmed: true,
     });
-    const partialRun = 'partial_match_' + Date.now().toString(36);
+    const exactRun = 'exact_match_' + Date.now().toString(36);
 
-    // (1) Partial match: compound candidate skills should match shorter required skills
+    // (1) Compound candidate skills do not match shorter required skills.
     const pdlStyleCand = findOrCreateCandidate({
-      name: 'PDL-style Partial',
+      name: 'PDL-style Compound',
       skills: ['azure active directory', 'cloud security', 'incident response'],
-      linkedinUrl: 'https://www.linkedin.com/in/pdl-partial',
+      linkedinUrl: 'https://www.linkedin.com/in/pdl-compound',
       source: 'PDL',
       scoutDecision: 'accepted',
-      pipelineRunId: partialRun,
+      pipelineRunId: exactRun,
     });
-    const partialScore = scoreCandidateAgainstNeed(pdlStyleCand, partialMatchNeed, partialRun);
-    assert(partialScore.matchedSkills.includes('Azure'),
-      `"Azure" matches "azure active directory" via inclusion (got matched=${JSON.stringify(partialScore.matchedSkills)})`);
-    assert(partialScore.matchedSkills.includes('Security'),
-      `"Security" matches "cloud security" via inclusion (got matched=${JSON.stringify(partialScore.matchedSkills)})`);
-    assert(partialScore.matchedSkills.includes('Incident Response'),
-      `"Incident Response" matches "incident response" via exact equality (got matched=${JSON.stringify(partialScore.matchedSkills)})`);
+    const compoundScore = scoreCandidateAgainstNeed(pdlStyleCand, exactMatchNeed, exactRun);
+    assert(!compoundScore.matchedSkills.includes('Azure'),
+      `"Azure" does NOT match "azure active directory" via inclusion (got matched=${JSON.stringify(compoundScore.matchedSkills)})`);
+    assert(!compoundScore.matchedSkills.includes('Security'),
+      `"Security" does NOT match "cloud security" via inclusion (got matched=${JSON.stringify(compoundScore.matchedSkills)})`);
+    assert(compoundScore.matchedSkills.includes('Incident Response'),
+      `"Incident Response" still matches exact normalized skill (got matched=${JSON.stringify(compoundScore.matchedSkills)})`);
 
     // (2) Unrelated required skill stays unmatched and appears in missing list
-    assert(!partialScore.matchedSkills.includes('KQL'),
-      `"KQL" does NOT match unrelated compound skills (got matched=${JSON.stringify(partialScore.matchedSkills)})`);
-    assert(partialScore.missingSkills.includes('KQL'),
-      `"KQL" appears in missingSkills (got missing=${JSON.stringify(partialScore.missingSkills)})`);
+    for (const missingSkill of ['Azure', 'Security', 'KQL']) {
+      assert(compoundScore.missingSkills.includes(missingSkill),
+        `"${missingSkill}" appears in missingSkills (got missing=${JSON.stringify(compoundScore.missingSkills)})`);
+    }
 
     // (3) Exact single-token match still works (pre-existing behavior preserved)
     const exactCand = findOrCreateCandidate({
@@ -494,9 +495,9 @@ async function main() {
       linkedinUrl: 'https://www.linkedin.com/in/exact-token',
       source: 'Manual',
       scoutDecision: 'accepted',
-      pipelineRunId: partialRun,
+      pipelineRunId: exactRun,
     });
-    const exactScore = scoreCandidateAgainstNeed(exactCand, partialMatchNeed, partialRun);
+    const exactScore = scoreCandidateAgainstNeed(exactCand, exactMatchNeed, exactRun);
     assert(exactScore.matchedSkills.includes('Azure'),
       `Exact-match "Azure" === "azure" still matched`);
     assert(exactScore.matchedSkills.includes('KQL'),
@@ -518,11 +519,11 @@ async function main() {
     //     eligible only on the gate (scoutDecision=accepted + valid LinkedIn).
     const lowOverlapCand = findOrCreateCandidate({
       name: 'Low Overlap Verified',
-      skills: ['cloud security'],   // only matches "Security", not Azure/KQL/IR
+      skills: ['cloud security'],   // does not exactly match Security/Azure/KQL/IR
       linkedinUrl: 'https://www.linkedin.com/in/low-overlap',
       source: 'PDL',
       scoutDecision: 'accepted',
-      pipelineRunId: partialRun,
+      pipelineRunId: exactRun,
     });
     assert(isFinalShortlistEligible(lowOverlapCand) === true,
       `Verified-only gate still admits low-skill-overlap PDL candidate with valid LinkedIn URL + accepted decision`);
@@ -531,6 +532,47 @@ async function main() {
     assert(isFinalShortlistEligible(lowOverlapCand) === false,
       `Verified-only gate still rejects review-tagged candidate regardless of skill score`);
     lowOverlapCand.scoutDecision = 'accepted'; // restore for any later checks
+  }
+
+  // ── 7c. Client-report CSV formula hardening ───────────────────────
+  {
+    const csvRun = 'csv_formula_' + Date.now().toString(36);
+    const csvNeed = createNeed({
+      companyId: coA.id,
+      title: 'CSV Formula Guard Role',
+      requiredSkills: ['Azure'],
+      seniority: 'Mid',
+      locationType: 'Remote',
+      confirmed: true,
+      pipelineRunId: csvRun,
+    });
+    findOrCreateCandidate({
+      name: '=Formula Name',
+      currentTitle: '+Formula Title',
+      currentCompany: '-Formula Co',
+      location: '@Formula City',
+      skills: ['Azure'],
+      linkedinUrl: 'https://www.linkedin.com/in/csv-formula-one',
+      source: 'Manual',
+      scoutDecision: 'accepted',
+      pipelineRunId: csvRun,
+    });
+    findOrCreateCandidate({
+      name: '\tTabbed Name',
+      currentTitle: '\rReturn Title',
+      skills: ['Azure'],
+      linkedinUrl: 'https://www.linkedin.com/in/csv-formula-two',
+      source: 'Manual',
+      scoutDecision: 'accepted',
+      pipelineRunId: csvRun,
+    });
+    await runMatchmaker({ needId: csvNeed.id, pipelineRunId: csvRun });
+    const csvReport = await generateClientReport({ needId: csvNeed.id, pipelineRunId: csvRun });
+    const csv = csvReport.report && csvReport.report.csv;
+    for (const guarded of ['"\'=Formula Name"', '"\'+Formula Title"', '"\'-Formula Co"', '"\'@Formula City"', '"\'\tTabbed Name"', '"\'\rReturn Title"']) {
+      assert(csv && csv.includes(guarded),
+        `CSV formula guard prefixes unsafe value ${JSON.stringify(guarded)} (csv=${JSON.stringify(csv)})`);
+    }
   }
 
   // Re-stamp sharedCand under runB and run matchmaker to materialize a runB match record
@@ -2323,11 +2365,11 @@ async function main() {
   assert(err422Log && /Invalid value for person_titles/.test(err422Log.meta.body || ''),
     `Log body shows Apollo's actual error text (got "${err422Log && err422Log.meta && err422Log.meta.body}")`);
 
-  // (b) Redaction — body containing fake api_key=... and a long token should be redacted
+  // (b) Redaction — body containing clearly fake key/password/auth/token-looking
+  // values and a long opaque value should be redacted.
   STUB_APOLLO_HTTP = {
     status: 401,
-    // Simulated leaky body with secret-shaped values
-    body: 'auth failed: api_key=sk_live_AbCdEfGh1234567890XyZ Authorization: Bearer pat_supersecret_thisisaverylongkeyABC1234567890XYZ token=ghp_abcdef1234567890ABCDEF1234567890_padding',
+    body: 'auth failed: api_key=FAKE_API_KEY_FOR_REDACTION password=FAKE_PASSWORD_FOR_REDACTION Authorization=FAKE_AUTHORIZATION_FOR_REDACTION token=FAKE_TOKEN_FOR_REDACTION extra=FAKE_LONG_OPAQUE_VALUE_FOR_REDACTION_ONLY_00000000000000000000',
   };
   const err401Need = createNeed({
     companyId: coApollo.id, title: 'Apollo Err 401 Role',
@@ -2341,12 +2383,16 @@ async function main() {
   assert(err401Log, `Activity log captured Apollo 401`);
   const loggedBody = (err401Log && err401Log.meta && err401Log.meta.body) || '';
   // No api_key, bearer, password, or token VALUES present
-  assert(!/sk_live_AbCdEfGh1234567890XyZ/.test(loggedBody),
+  assert(!/FAKE_API_KEY_FOR_REDACTION/.test(loggedBody),
     `api_key value NOT in log body (got "${loggedBody}")`);
-  assert(!/pat_supersecret_thisisaverylongkeyABC1234567890XYZ/.test(loggedBody),
-    `Bearer token value NOT in log body`);
-  assert(!/ghp_abcdef1234567890ABCDEF1234567890_padding/.test(loggedBody),
+  assert(!/FAKE_PASSWORD_FOR_REDACTION/.test(loggedBody),
+    `password value NOT in log body`);
+  assert(!/FAKE_AUTHORIZATION_FOR_REDACTION/.test(loggedBody),
+    `authorization value NOT in log body`);
+  assert(!/FAKE_TOKEN_FOR_REDACTION/.test(loggedBody),
     `Generic token value NOT in log body`);
+  assert(!/FAKE_LONG_OPAQUE_VALUE_FOR_REDACTION_ONLY_00000000000000000000/.test(loggedBody),
+    `Long opaque value NOT in log body`);
   // Redaction markers present
   assert(/REDACTED/.test(loggedBody),
     `Log body contains <REDACTED…> marker (got "${loggedBody}")`);
@@ -3115,27 +3161,48 @@ async function main() {
   assert(Object.keys(adjDormant).length === 0,
     `refineMatchScoresWithOpenAI dormant when OPENAI_API_KEY missing`);
 
-  // (h) Integration: matchmaker applies LLM adjustments to top-K matches
+  // (h) Integration: OpenAI remains disabled in active match scoring. Even
+  // when configured and returning adjustments, matchmaker scores/order stay
+  // purely heuristic.
   process.env.OPENAI_API_KEY = 'commit-d-openai-key';
-  const llmAdjCand = findOrCreateCandidate({
-    name: 'LLM Adjustment Target',
+  const llmHighCand = findOrCreateCandidate({
+    name: 'LLM Disabled High',
+    title: 'Cloud Security Engineer',
+    skills: ['Azure', 'Sentinel'],
+    linkedinUrl: 'https://www.linkedin.com/in/llm-disabled-high',
+    source: 'Manual', scoutDecision: 'accepted',
+  });
+  const llmLowCand = findOrCreateCandidate({
+    name: 'LLM Disabled Low',
     title: 'Cloud Security Engineer',
     skills: ['Azure'],
-    linkedinUrl: 'https://www.linkedin.com/in/llm-adj-target',
+    linkedinUrl: 'https://www.linkedin.com/in/llm-disabled-low',
     source: 'Manual', scoutDecision: 'accepted',
   });
   const adjNeed = createNeed({
     companyId: coApollo.id, title: 'Cloud Security Engineer',
-    requiredSkills: ['Azure'], seniority: 'Mid', locationType: 'Remote', confirmed: true,
+    requiredSkills: ['Azure', 'Sentinel'], seniority: 'Mid', locationType: 'Remote', confirmed: true,
   });
   const adjRun = 'llm_adj_run_' + Date.now().toString(36);
-  llmAdjCand.pipelineRunId = adjRun;
-  STUB_OPENAI_RESPONSE = JSON.stringify({ adjustments: { [llmAdjCand.id]: 7 } });
-  const mmAdj = await runMatchmaker({ needId: adjNeed.id, pipelineRunId: adjRun });
-  const adjMatch = DB.matches.find(m => m.pipelineRunId === adjRun && m.candidateId === llmAdjCand.id);
-  assert(adjMatch && Array.isArray(adjMatch.reasoning) &&
-    adjMatch.reasoning.some(r => /LLM score adjustment/.test(r)),
-    `Match reasoning includes LLM adjustment note (got reasoning=${JSON.stringify(adjMatch && adjMatch.reasoning)})`);
+  llmHighCand.pipelineRunId = adjRun;
+  llmLowCand.pipelineRunId = adjRun;
+  const highBaseline = scoreCandidateAgainstNeed(llmHighCand, adjNeed, adjRun);
+  const lowBaseline = scoreCandidateAgainstNeed(llmLowCand, adjNeed, adjRun);
+  assert(highBaseline.score > lowBaseline.score,
+    `Fixture baseline has high candidate ahead (high=${highBaseline.score}, low=${lowBaseline.score})`);
+  STUB_OPENAI_RESPONSE = JSON.stringify({ adjustments: { [llmHighCand.id]: -15, [llmLowCand.id]: 15 } });
+  await runMatchmaker({ needId: adjNeed.id, pipelineRunId: adjRun });
+  const highMatch = DB.matches.find(m => m.pipelineRunId === adjRun && m.candidateId === llmHighCand.id);
+  const lowMatch = DB.matches.find(m => m.pipelineRunId === adjRun && m.candidateId === llmLowCand.id);
+  assert(highMatch && highMatch.score === highBaseline.score,
+    `OpenAI adjustment does NOT change high candidate score (expected ${highBaseline.score}, got ${highMatch && highMatch.score})`);
+  assert(lowMatch && lowMatch.score === lowBaseline.score,
+    `OpenAI adjustment does NOT change low candidate score (expected ${lowBaseline.score}, got ${lowMatch && lowMatch.score})`);
+  assert(highMatch && lowMatch && highMatch.rank < lowMatch.rank,
+    `Candidate ordering stays heuristic despite OpenAI adjustment response (highRank=${highMatch && highMatch.rank}, lowRank=${lowMatch && lowMatch.rank})`);
+  assert(highMatch && lowMatch &&
+    !(highMatch.reasoning || []).concat(lowMatch.reasoning || []).some(r => /LLM score adjustment/.test(r)),
+    `Match reasoning has no LLM score adjustment note`);
 
   // Reset
   STUB_OPENAI_RESPONSE = null;
