@@ -23,6 +23,8 @@
 
 .EXAMPLE
   pwsh ./scripts/predeploy-check.ps1
+
+  powershell -ExecutionPolicy Bypass -File ./scripts/predeploy-check.ps1
 #>
 [CmdletBinding()]
 param([switch]$SkipLocalBoot)
@@ -38,7 +40,7 @@ function Block($t)   { Write-Host "  [STOP] $t" -ForegroundColor Red; $blockers.
 
 Write-Host "Sola Scholar - Pre-Deploy Gate" -ForegroundColor White
 Write-Host "Branch: $(git branch --show-current)"
-Write-Host "Target: production (Railway) — DEPLOY REQUIRES HUMAN APPROVAL"
+Write-Host "Target: production (Railway) - DEPLOY REQUIRES HUMAN APPROVAL"
 
 # 1. Repo safety -------------------------------------------------------------
 Section "1. Repo safety"
@@ -71,7 +73,8 @@ if (Test-Path railway.json) {
 # 5. Basic Auth code present -------------------------------------------------
 Section "5. Basic Auth protection"
 $srv = Get-Content backend/server.js -Raw
-if ($srv -match 'function requireAuth' -and $srv -match "app\.use\('/api', requireAuth\)") { Ok "requireAuth middleware wired to /api" }
+$apiAuthCall = 'app.use(''/api'', requireAuth)'
+if ($srv.Contains('function requireAuth') -and $srv.Contains($apiAuthCall)) { Ok "requireAuth middleware wired to /api" }
 else { Block "Basic Auth middleware not found / not wired" }
 if ($srv -match 'INTERNAL_PASSWORD' -and $srv -match 'Refusing to expose API without auth') { Ok "Server refuses to serve API when INTERNAL_PASSWORD blank" }
 else { Block "INTERNAL_PASSWORD safety gate not found" }
@@ -87,7 +90,9 @@ if ($SkipLocalBoot) {
     $env:INTERNAL_PASSWORD = 'predeploy_local_probe'   # ephemeral, never committed
     $env:PORT = '8231'
     $env:DATA_PATH = './data'
-    $proc = Start-Process node -ArgumentList 'backend/server.js' -PassThru -NoNewWindow `
+    $predeployArtifacts = @('.predeploy.out', '.predeploy.err')
+    Remove-Item -LiteralPath $predeployArtifacts -Force -ErrorAction SilentlyContinue
+    $proc = Start-Process node -ArgumentList 'backend/server.js' -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput '.predeploy.out' -RedirectStandardError '.predeploy.err'
     try {
         Start-Sleep -Seconds 2
@@ -101,8 +106,16 @@ if ($SkipLocalBoot) {
     } catch {
         Block "Server failed to boot or /api/health unreachable: $($_.Exception.Message)"
     } finally {
-        if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
-        Remove-Item .predeploy.out, .predeploy.err -ErrorAction SilentlyContinue
+        if ($proc -and -not $proc.HasExited) {
+            Stop-Process -Id $proc.Id -Force
+            $proc.WaitForExit(5000) | Out-Null
+        }
+        foreach ($artifact in $predeployArtifacts) {
+            for ($i = 0; $i -lt 5 -and (Test-Path -LiteralPath $artifact); $i++) {
+                Remove-Item -LiteralPath $artifact -Force -ErrorAction SilentlyContinue
+                if (Test-Path -LiteralPath $artifact) { Start-Sleep -Milliseconds 200 }
+            }
+        }
     }
 }
 

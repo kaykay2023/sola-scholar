@@ -46,3 +46,4 @@ tmp/
 scratch/
 *.bak
 .predeploy.out
+.predeploy.err

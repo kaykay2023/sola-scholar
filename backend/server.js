@@ -2745,27 +2745,11 @@ async function runValidator({ candidateIds = null, pipelineRunId = null } = {}) 
 }
 
 function scoreCandidateAgainstNeed(c, need, pipelineRunId = null) {
-  const lc = s => (s || '').toLowerCase().replace(/[^a-z0-9+#]/g, '');
-  // Normalized partial matching: a required skill counts as matched when any
-  // candidate skill is equal to it, contains it, or is contained by it (after
-  // normalization). Fixes the prior exact-match-only check that ignored
-  // PDL-style compound skills like "azure active directory", "cloud security".
-  // Guard against false positives from very short tokens by requiring length
-  // ≥ 3 on the containing side of any non-exact inclusion match.
-  const cSkills = (c.skills || []).map(lc).filter(s => s.length >= 2);
+  const norm = s => (s || '').toLowerCase().replace(/[^a-z0-9+#]/g, '');
+  const cSkills = new Set((c.skills || []).map(norm));
   const req = (need.requiredSkills || []);
-  const skillMatches = needSkill => {
-    const k = lc(needSkill);
-    if (k.length < 2) return false;
-    return cSkills.some(cs => {
-      if (cs === k) return true;
-      if (k.length >= 3 && cs.includes(k)) return true;
-      if (cs.length >= 3 && k.includes(cs)) return true;
-      return false;
-    });
-  };
-  const matched = req.filter(skillMatches);
-  const missing = req.filter(s => !skillMatches(s));
+  const matched = req.filter(s => cSkills.has(norm(s)));
+  const missing = req.filter(s => !cSkills.has(norm(s)));
   const reasons = [];
 
   // Run-scoped: only use validation evidence from the current pipeline run.
@@ -2774,7 +2758,7 @@ function scoreCandidateAgainstNeed(c, need, pipelineRunId = null) {
   if (req.length) {
     if (v?.proficiency && Object.keys(v.proficiency).length) {
       const profScores = matched.map(s => {
-        const key = Object.keys(v.proficiency).find(k => lc(k) === lc(s));
+        const key = Object.keys(v.proficiency).find(k => norm(k) === norm(s));
         return key ? v.proficiency[key] / 100 : 0.5;
       });
       skillRaw = profScores.length ? (profScores.reduce((a, b) => a + b, 0) / req.length) * 100 : 0;
@@ -2813,7 +2797,6 @@ function scoreCandidateAgainstNeed(c, need, pipelineRunId = null) {
   let valRaw = 20;
   if (v?.tier === 'Verified Active') { valRaw = 100; reasons.push('Verified Active on GitHub'); }
   else if (v?.tier === 'Profile-Based') { valRaw = 60; reasons.push('Profile-based verification'); }
-  else if (v?.tier === 'Needs Review') { valRaw = 45; reasons.push('Needs human review — partial evidence'); }
   const valScore = valRaw * 0.15;
 
   const total = Math.min(Math.round(skillScore + senScore + locScore + availScore + valScore), 100);
@@ -2875,28 +2858,6 @@ async function runMatchmaker({ needId, pipelineRunId = null } = {}) {
 
   const scored = pool.map(c => ({ c, ...scoreCandidateAgainstNeed(c, need, pipelineRunId) }));
   scored.sort((a, b) => b.score - a.score);
-
-  // OpenAI score refinement — single batched call against top-K. Adjusts each
-  // matched candidate's score by ±OPENAI_SCORE_MAX_DELTA. Heuristic remains
-  // the baseline; LLM only nudges. Failure-safe: any LLM error → empty map →
-  // heuristic stands. Re-sort + recompute tier after adjustment.
-  let llmAdjustments = {};
-  try { llmAdjustments = await refineMatchScoresWithOpenAI(scored, need); }
-  catch { llmAdjustments = {}; }
-  if (Object.keys(llmAdjustments).length) {
-    for (const entry of scored) {
-      const adj = llmAdjustments[entry.c.id];
-      if (Number.isFinite(adj) && adj !== 0) {
-        entry.heuristicScore = entry.score;
-        entry.llmAdjustment = adj;
-        entry.score = Math.max(0, Math.min(100, Math.round(entry.score + adj)));
-        entry.tier = tierFromScore(entry.score);
-        entry.reasoning = [...(entry.reasoning || []), `LLM score adjustment: ${adj >= 0 ? '+' : ''}${adj}`];
-      }
-    }
-    scored.sort((a, b) => b.score - a.score);
-    await logActivity('Matchmaker', `OpenAI refined ${Object.keys(llmAdjustments).length} top-K scores`, 'info', { source: 'openai', count: Object.keys(llmAdjustments).length });
-  }
 
   scored.forEach((entry, i) => {
     createOrUpdateMatch({
@@ -3097,7 +3058,11 @@ Sola Scholar
 `;
 
   // CSV
-  const esc = v => '"' + String(v ?? '').replace(/"/g, '""') + '"';
+  const esc = v => {
+    let s = String(v ?? '');
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+    return '"' + s.replace(/"/g, '""') + '"';
+  };
   const csvRows = [
     ['Rank','Name','Title','Company','Location','Match Score','Tier','Matched Skills','Missing Skills','Validation','Why Fits','Next Step','GitHub','LinkedIn'].map(esc).join(','),
     ...candidates.map((c, i) => [i+1, c.name, c.currentTitle, c.currentCompany, c.location, c.score, c.displayLabel || c.tier, c.matchedSkills.join(';'), c.missingSkills.join(';'), c.validationTier, c.whyFits, c.recommendedNextStep, c.links.github, c.links.linkedin].map(esc).join(',')),
