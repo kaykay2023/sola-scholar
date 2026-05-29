@@ -1,0 +1,30 @@
+{
+  "name": "sola-scholar",
+  "version": "1.0.0",
+  "description": "Sola Scholar — In-house AI recruiting intelligence for cybersecurity and cloud hiring (V1, internal only).",
+  "private": true,
+  "main": "backend/server.js",
+  "scripts": {
+    "start": "node backend/server.js",
+    "dev": "node backend/server.js",
+    "test": "node test/smoke.cjs && node test/behavior.cjs && node test/audit.cjs && node test/pipeline.cjs",
+    "test:static":     "node test/smoke.cjs",
+    "test:behavioral": "node test/behavior.cjs",
+    "test:audit":      "node test/audit.cjs",
+    "test:pipeline":   "node test/pipeline.cjs"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  },
+  "optionalDependencies": {
+    "dotenv": "^16.4.7"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.25.0",
+    "@babel/preset-env": "^7.25.0",
+    "@babel/preset-react": "^7.25.0"
+  }
+}

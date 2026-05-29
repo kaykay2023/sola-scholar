@@ -1,0 +1,96 @@
+{
+  "_comment": "ROLE-SPECIFIC SCORING PROFILE STRUCTURE — PREPARED, NOT ACTIVE. This file defines per-role scoring intent so it can later be wired into the matchmaker WITHOUT a rewrite. While 'enabled' is false the server only EXPOSES these profiles for reference; it does NOT use them in score math. The current strict scoring in backend/server.js (matchDisplayLabel / runMatchmaker) is unchanged. Do NOT flip 'enabled' to true without an explicit reviewed decision: doing so would change candidate scores and must be validated against the strict-scoring guardrails (no inflation, missing skills stay visible, Needs Review preserved, no single cert overpowering missing hands-on evidence).",
+  "version": 1,
+  "enabled": false,
+  "guardrails": {
+    "noScoreInflation": true,
+    "keepMissingSkillsVisible": true,
+    "keepNeedsReviewVisible": true,
+    "keepMatchedSkillsVisible": true,
+    "singleCertCannotOverpowerMissingHandsOnEvidence": true,
+    "preserveScoreTransparency": true
+  },
+  "profiles": [
+    {
+      "id": "ms-sentinel-soc-analyst",
+      "roleTitle": "Microsoft Sentinel SOC Analyst",
+      "criticalSkills": ["Microsoft Sentinel", "KQL", "SIEM", "SOC", "Incident Response"],
+      "supportingSkills": ["Azure Security", "Threat Detection", "Defender", "MITRE ATT&CK", "Alert Triage"],
+      "handsOnEvidenceSignals": ["analytics rules authored", "incident queue ownership", "KQL hunting queries", "SOC shift experience"],
+      "certSignals": ["SC-200", "AZ-500", "Security+"],
+      "notes": "SOC operations focus. Certs support but never substitute for hands-on Sentinel/SOC evidence."
+    },
+    {
+      "id": "ms-sentinel-detection-analyst",
+      "roleTitle": "Microsoft Sentinel Detection Analyst",
+      "criticalSkills": ["Microsoft Sentinel", "KQL", "Threat Detection", "Incident Response", "SIEM"],
+      "supportingSkills": ["Detection Engineering", "Analytics Rules", "Defender", "MITRE ATT&CK", "Threat Hunting"],
+      "handsOnEvidenceSignals": ["detection rules built", "false-positive tuning", "threat hunting campaigns", "ATT&CK mapping"],
+      "certSignals": ["SC-200", "GCDA", "GCIA"],
+      "notes": "Detection engineering focus. Weight authored detections / hunting evidence over generic SOC tickets."
+    },
+    {
+      "id": "azure-security-engineer",
+      "roleTitle": "Azure Security Engineer",
+      "criticalSkills": ["Azure Security", "Microsoft Sentinel", "Cloud Security", "Incident Response", "KQL"],
+      "supportingSkills": ["Defender for Cloud", "Entra ID", "IAM", "NIST", "Terraform"],
+      "handsOnEvidenceSignals": ["Azure tenant hardening", "Defender for Cloud deployment", "IaC security", "Sentinel onboarding"],
+      "certSignals": ["AZ-500", "SC-100", "SC-200"],
+      "notes": "Broad Azure security engineering. Balance build/IaC evidence with detection evidence."
+    },
+    {
+      "id": "azure-cloud-security-engineer",
+      "roleTitle": "Azure Cloud Security Engineer",
+      "criticalSkills": ["Azure Security", "Defender for Cloud", "Cloud Security", "IAM", "Incident Response"],
+      "supportingSkills": ["Microsoft Sentinel", "KQL", "Entra ID", "Terraform", "Azure Policy", "SOC"],
+      "handsOnEvidenceSignals": ["CSPM remediation", "Azure Policy authoring", "landing-zone security", "identity hardening"],
+      "certSignals": ["AZ-500", "SC-100"],
+      "notes": "Cloud-platform security posture focus on Azure. Posture/CSPM evidence weighted."
+    },
+    {
+      "id": "cloud-security-engineer",
+      "roleTitle": "Cloud Security Engineer",
+      "criticalSkills": ["Cloud Security", "IAM", "Incident Response", "SIEM", "Vulnerability Management"],
+      "supportingSkills": ["AWS", "Azure", "GCP", "Terraform", "Kubernetes", "CSPM", "Security Monitoring"],
+      "handsOnEvidenceSignals": ["multi-cloud security", "vuln management program", "IaC guardrails", "container security"],
+      "certSignals": ["CCSP", "AZ-500", "AWS Security Specialty"],
+      "notes": "Cloud-agnostic. Do not penalize a strong AWS-only or Azure-only candidate for lacking the other, but keep missing critical skills visible."
+    },
+    {
+      "id": "iam-pam-analyst",
+      "roleTitle": "IAM / PAM Analyst",
+      "criticalSkills": ["IAM", "PAM", "Access Reviews", "MFA", "RBAC"],
+      "supportingSkills": ["Entra ID", "Azure AD", "Okta", "CyberArk", "SailPoint", "Conditional Access", "Identity Governance"],
+      "handsOnEvidenceSignals": ["access certification campaigns", "PAM vault administration", "joiner-mover-leaver automation", "conditional access policy design"],
+      "certSignals": ["SC-300", "CyberArk Defender", "Okta Certified"],
+      "notes": "Identity focus. Tool breadth (Okta/CyberArk/SailPoint) is supporting, not a hard requirement."
+    },
+    {
+      "id": "grc-analyst",
+      "roleTitle": "GRC Analyst",
+      "criticalSkills": ["NIST", "ISO 27001", "SOC 2", "Risk Assessment", "Security Controls", "Audit Evidence"],
+      "supportingSkills": ["Vendor Risk", "PCI DSS", "HIPAA", "Policy Writing", "Control Testing"],
+      "handsOnEvidenceSignals": ["audit evidence collection", "control testing", "risk register ownership", "framework mapping"],
+      "certSignals": ["CISA", "CRISC", "ISO 27001 Lead Auditor"],
+      "notes": "Governance/risk/compliance. Hands-on audit/control-testing evidence weighted over tooling."
+    },
+    {
+      "id": "aws-cloud-security-engineer",
+      "roleTitle": "AWS Cloud Security Engineer",
+      "criticalSkills": ["AWS IAM", "GuardDuty", "CloudTrail", "AWS Config", "Cloud Security"],
+      "supportingSkills": ["Security Groups", "Terraform", "Kubernetes", "CSPM", "DevSecOps", "SIEM", "Incident Response"],
+      "handsOnEvidenceSignals": ["AWS account hardening", "GuardDuty/Config rules", "least-privilege IAM design", "DevSecOps pipelines"],
+      "certSignals": ["AWS Security Specialty", "AWS Solutions Architect"],
+      "notes": "AWS-native security focus. AWS-service evidence weighted; Azure-only signals are supporting."
+    },
+    {
+      "id": "data-analyst-power-bi",
+      "roleTitle": "Data Analyst / Power BI Analyst",
+      "criticalSkills": ["SQL", "Power BI", "Reporting", "Dashboarding", "Data Visualization"],
+      "supportingSkills": ["Excel", "Python", "Tableau", "ETL", "Business Analytics"],
+      "handsOnEvidenceSignals": ["published dashboards", "data models", "stakeholder reporting", "ETL pipelines"],
+      "certSignals": ["PL-300", "Tableau Desktop Specialist"],
+      "notes": "Non-security analytics role. Cybersecurity-evidence label logic does NOT apply here."
+    }
+  ]
+}
