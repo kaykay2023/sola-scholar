@@ -214,6 +214,8 @@ const {
   isUsableGitHubProfileUrl, hasUsableProfileLink, isVisibleMatch,
   isVerifiedGitHubProfile, isFinalShortlistEligible,
   scoreSourcedPage, buildApolloCandidateAttempts, buildFirecrawlProfileQueries,
+  buildCandidateSearchExpansion, buildRankedTitleVariants, buildLocationTiers,
+  extractProfileKeywordSignals, collectCandidateProfileLinks,
   isGitLabUserProfileUrl, isHuggingFaceProfileUrl, isKaggleProfileUrl,
   isStackOverflowUserUrl, isCredlyProfileUrl, isTryHackMeProfileUrl,
   isHackTheBoxProfileUrl, isWellfoundProfileUrl, isTrustedCandidateProfileUrl,
@@ -3203,6 +3205,181 @@ async function main() {
   assert(highMatch && lowMatch &&
     !(highMatch.reasoning || []).concat(lowMatch.reasoning || []).some(r => /LLM score adjustment/.test(r)),
     `Match reasoning has no LLM score adjustment note`);
+
+  // ── 20b. Candidate-pool expansion metadata stays metadata-only ───────
+  const sentinelVariants = buildRankedTitleVariants('Microsoft Sentinel SOC Analyst');
+  assert(sentinelVariants.some(v => v.title === 'Microsoft Sentinel SOC Analyst' && v.specificity_weight === 1.0 && v.variant_type === 'exact_tool_role'),
+    `Variant expansion includes high-specificity Sentinel SOC Analyst`);
+  assert(sentinelVariants.some(v => v.title === 'SOC Analyst' && v.variant_type === 'medium_specificity'),
+    `Variant expansion includes medium-specificity SOC Analyst`);
+  assert(sentinelVariants.some(v => v.title === 'Cybersecurity Analyst' && v.specificity_weight === 0.45 && v.variant_type === 'wide_net'),
+    `Variant expansion includes wide-net Cybersecurity Analyst`);
+  assert(!sentinelVariants.some(v => /^KQL$/i.test(v.title) || /^Kusto$/i.test(v.title)),
+    `KQL/Kusto are NOT title variants`);
+
+  const expansionPlan = buildCandidateSearchExpansion({
+    title: 'Microsoft Sentinel SOC Analyst',
+    requiredSkills: ['Microsoft Sentinel', 'KQL', 'SIEM'],
+    location: 'Detroit',
+  }, { enabled: true });
+  assert(expansionPlan.profileKeywords.includes('KQL') && expansionPlan.profileKeywords.includes('Kusto'),
+    `KQL/Kusto are profile keywords`);
+  assert(expansionPlan.locationTiers.some(t => t.label === 'Detroit hybrid') &&
+    expansionPlan.locationTiers.some(t => t.label === 'Remote US'),
+    `Location tiers include Detroit hybrid and Remote US`);
+
+  const metaNeed = createNeed({
+    companyId: coApollo.id,
+    title: 'Microsoft Sentinel SOC Analyst',
+    requiredSkills: ['Microsoft Sentinel', 'KQL', 'SIEM'],
+    seniority: 'Mid',
+    locationType: 'Remote',
+    confirmed: true,
+  });
+  const metaRun = 'exp_meta_run_' + Date.now().toString(36);
+  const wideMeta = {
+    providersFound: ['apollo'],
+    searchVariantsFound: ['Cybersecurity Analyst'],
+    searchVariantMeta: [{ title: 'Cybersecurity Analyst', specificity_weight: 0.45, variant_type: 'wide_net' }],
+    locationTiersMatched: ['Remote US'],
+    locationTierMeta: [{ key: 'remote-us', label: 'Remote US', proximity_tier: 'Remote US', proximity_rank: 4 }],
+    profileKeywordSignals: [],
+  };
+  const noEvidenceWide = findOrCreateCandidate({
+    name: 'Wide Net No Evidence',
+    title: 'Cybersecurity Analyst',
+    company: 'WideCo',
+    location: 'Remote US',
+    skills: ['Customer Support'],
+    linkedinUrl: 'https://www.linkedin.com/in/wide-net-no-evidence',
+    source: 'Manual',
+    scoutDecision: 'accepted',
+    pipelineRunId: metaRun,
+    ...wideMeta,
+  });
+  const noEvidencePlain = findOrCreateCandidate({
+    name: 'Wide Net Plain',
+    title: 'Cybersecurity Analyst',
+    company: 'PlainCo',
+    location: 'Remote US',
+    skills: ['Customer Support'],
+    linkedinUrl: 'https://www.linkedin.com/in/wide-net-plain',
+    source: 'Manual',
+    scoutDecision: 'accepted',
+    pipelineRunId: metaRun,
+  });
+  const noEvidenceMetaScore = scoreCandidateAgainstNeed(noEvidenceWide, metaNeed, metaRun);
+  const noEvidencePlainScore = scoreCandidateAgainstNeed(noEvidencePlain, metaNeed, metaRun);
+  assert(noEvidenceMetaScore.score === noEvidencePlainScore.score,
+    `specificity_weight/search metadata does NOT change score (${noEvidenceMetaScore.score} vs ${noEvidencePlainScore.score})`);
+  assert(noEvidenceMetaScore.matchedSkills.length === 0 && noEvidenceMetaScore.missingSkills.includes('Microsoft Sentinel') && noEvidenceMetaScore.missingSkills.includes('KQL'),
+    `Wide-net candidate without profile evidence fails cleanly and keeps missing skills`);
+
+  const exactEvidence = findOrCreateCandidate({
+    name: 'Exact Sentinel Evidence',
+    title: 'Microsoft Sentinel SOC Analyst',
+    company: 'ExactCo',
+    location: 'Remote US',
+    skills: ['Microsoft Sentinel', 'KQL', 'SIEM'],
+    linkedinUrl: 'https://www.linkedin.com/in/exact-sentinel-evidence',
+    source: 'Manual',
+    scoutDecision: 'accepted',
+    pipelineRunId: metaRun,
+    providersFound: ['apollo'],
+    searchVariantsFound: ['Microsoft Sentinel SOC Analyst'],
+    searchVariantMeta: [{ title: 'Microsoft Sentinel SOC Analyst', specificity_weight: 1.0, variant_type: 'exact_tool_role' }],
+  });
+  const linklessWide = findOrCreateCandidate({
+    name: 'Linkless Wide Net',
+    title: 'Cybersecurity Analyst',
+    company: 'LinklessCo',
+    location: 'Remote US',
+    skills: ['Microsoft Sentinel', 'KQL', 'SIEM'],
+    source: 'Manual',
+    scoutDecision: 'accepted',
+    pipelineRunId: metaRun,
+    ...wideMeta,
+  });
+  assert(!isFinalShortlistEligible(linklessWide),
+    `Verified-only filtering still excludes expansion candidate without usable profile link`);
+  await runMatchmaker({ needId: metaNeed.id, pipelineRunId: metaRun });
+  const exactMatch = DB.matches.find(m => m.pipelineRunId === metaRun && m.candidateId === exactEvidence.id);
+  const wideMatch = DB.matches.find(m => m.pipelineRunId === metaRun && m.candidateId === noEvidenceWide.id);
+  assert(exactMatch && wideMatch && exactMatch.rank < wideMatch.rank,
+    `specificity_weight does NOT override score/order (exactRank=${exactMatch && exactMatch.rank}, wideRank=${wideMatch && wideMatch.rank})`);
+
+  const dupA = findOrCreateCandidate({ name: 'Same Name Only', source: 'Manual', scoutDecision: 'review' });
+  const dupB = findOrCreateCandidate({ name: 'Same Name Only', source: 'Manual', scoutDecision: 'review' });
+  assert(dupA.id !== dupB.id,
+    `Dedupe does not collapse candidates by name alone`);
+
+  const multiMetaA = findOrCreateCandidate({
+    name: 'Multi Source Meta',
+    company: 'MetaCo',
+    linkedinUrl: 'https://www.linkedin.com/in/multi-source-meta',
+    source: 'Apollo',
+    scoutDecision: 'accepted',
+    providersFound: ['apollo'],
+    searchVariantsFound: ['Microsoft Sentinel Analyst'],
+    searchVariantMeta: [{ title: 'Microsoft Sentinel Analyst', specificity_weight: 1.0, variant_type: 'exact_tool_role' }],
+    locationTiersMatched: ['Michigan hybrid'],
+    locationTierMeta: [{ key: 'michigan-hybrid', label: 'Michigan hybrid', proximity_tier: 'Michigan hybrid', proximity_rank: 2 }],
+  });
+  const multiMetaB = findOrCreateCandidate({
+    name: 'Multi Source Meta',
+    company: 'MetaCo',
+    linkedinUrl: 'https://www.linkedin.com/in/multi-source-meta',
+    source: 'Firecrawl',
+    scoutDecision: 'accepted',
+    providersFound: ['firecrawl'],
+    searchVariantsFound: ['SIEM Analyst'],
+    searchVariantMeta: [{ title: 'SIEM Analyst', specificity_weight: 0.7, variant_type: 'medium_specificity' }],
+    locationTiersMatched: ['Remote US'],
+    locationTierMeta: [{ key: 'remote-us', label: 'Remote US', proximity_tier: 'Remote US', proximity_rank: 4 }],
+  });
+  assert(multiMetaA.id === multiMetaB.id &&
+    multiMetaB.providersFound.includes('apollo') && multiMetaB.providersFound.includes('firecrawl') &&
+    multiMetaB.searchVariantsFound.includes('Microsoft Sentinel Analyst') && multiMetaB.searchVariantsFound.includes('SIEM Analyst') &&
+    multiMetaB.locationTiersMatched.includes('Michigan hybrid') && multiMetaB.locationTiersMatched.includes('Remote US'),
+    `Candidate stores all variants/providers/location tiers across deduped touches`);
+
+  const links = collectCandidateProfileLinks({
+    linkedinUrl: 'https://www.linkedin.com/in/profile-link-test',
+    github: 'https://github.com/profile-link-test',
+    sourceUrl: 'https://profiles.example.net/person',
+    portfolioUrl: 'https://portfolio.example.net/person',
+    resumeUrl: 'https://resume.example.net/person.pdf',
+  });
+  assert(links.linkedin && links.github && links.source && links.portfolio && links.resume,
+    `Profile link collector preserves LinkedIn/GitHub/source/portfolio/resume links`);
+
+  const prevFirecrawlExpansionKey = process.env.FIRECRAWL_API_KEY;
+  process.env.FIRECRAWL_API_KEY = 'test-firecrawl-key';
+  STUB_FIRECRAWL_ITEMS = [
+    { title: 'Private Junior Analyst — SOC Analyst at Acme', url: 'https://www.linkedin.com/in/private-junior-analyst', description: 'Private profile login required. Junior SOC analyst with SIEM exposure.' },
+  ];
+  STUB_GH_SEARCH_USERS = { items: [] };
+  const warningNeed = createNeed({
+    companyId: coApollo.id,
+    title: 'Microsoft Sentinel SOC Analyst',
+    requiredSkills: ['Microsoft Sentinel', 'KQL', 'SIEM'],
+    seniority: 'Mid',
+    locationType: 'Remote',
+    confirmed: true,
+  });
+  const warningRun = 'warning_run_' + Date.now().toString(36);
+  await runScout({ needId: warningNeed.id, pipelineRunId: warningRun, expandCandidatePool: true });
+  const warningCand = DB.candidates.find(c => c.pipelineRunId === warningRun && /Private Junior Analyst/.test(c.name || ''));
+  assert(warningCand && warningCand.privateProfileWarning === 'Private profile — manual verification required',
+    `Private-profile warning added without auto-rejecting`);
+  assert(warningCand && warningCand.entry_level_warning === 'Entry-level profile — not enough experience evidence for mid-level role',
+    `Entry-level warning prepared for mid-level role`);
+  assert(warningCand && warningCand.profileKeywordSignals.includes('SIEM'),
+    `Profile keyword signals come from profile text`);
+  STUB_FIRECRAWL_ITEMS = null;
+  STUB_GH_SEARCH_USERS = null;
+  if (prevFirecrawlExpansionKey === undefined) delete process.env.FIRECRAWL_API_KEY;
+  else process.env.FIRECRAWL_API_KEY = prevFirecrawlExpansionKey;
 
   // Reset
   STUB_OPENAI_RESPONSE = null;

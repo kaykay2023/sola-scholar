@@ -201,16 +201,307 @@ const norm = {
 };
 
 function candidateDedupeKey(c) {
-  const li = norm.linkedin(c.linkedinUrl || c.profileUrl || '');
+  const profile = c.profileUrl || c.sourceProfile || c.sourceUrl || c.portfolioUrl || c.resumeUrl || '';
+  const li = norm.linkedin(c.linkedinUrl || c.linkedin || profile || '');
   if (li) return 'li:' + li;
-  const gh = norm.github(c.github || '');
+  const gh = norm.github(c.github || c.githubUrl || profile || '');
   if (gh) return 'gh:' + gh;
   const em = norm.email(c.email || '');
   if (em) return 'em:' + em;
   const nm = norm.name(c.name || '');
   const co = norm.name(c.currentCompany || c.company || '');
-  if (nm) return 'nc:' + nm + '|' + co;
+  if (nm && co) return 'nc:' + nm + '|' + co;
+  const loc = norm.name(c.location || '');
+  const src = norm.url(profile || '');
+  if (nm && loc && src) return 'nls:' + nm + '|' + loc + '|' + src;
   return 'rand:' + uid();
+}
+
+const SENTINEL_PROFILE_KEYWORDS = [
+  'KQL',
+  'Kusto',
+  'Microsoft Sentinel',
+  'Sentinel analytics rules',
+  'SIEM',
+  'SOC',
+  'Incident Response',
+  'Threat Detection',
+  'Threat Hunting',
+  'Defender',
+  'Log Analytics',
+];
+
+function normalizeSet(values) {
+  return Array.from(new Set((Array.isArray(values) ? values : [])
+    .map(v => String(v == null ? '' : v).trim())
+    .filter(Boolean)));
+}
+
+function mergeUniqueStrings(a = [], b = []) {
+  return normalizeSet([...(Array.isArray(a) ? a : []), ...(Array.isArray(b) ? b : [])]);
+}
+
+function mergeUniqueObjects(a = [], b = [], keyFn = item => JSON.stringify(item)) {
+  const out = [];
+  const seen = new Set();
+  for (const item of [...(Array.isArray(a) ? a : []), ...(Array.isArray(b) ? b : [])]) {
+    if (!item || typeof item !== 'object') continue;
+    const key = keyFn(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
+function candidateProfileText(c = {}) {
+  return [
+    c.name,
+    c.currentTitle || c.title,
+    c.currentCompany || c.company,
+    c.location,
+    c.summary,
+    c.bio,
+    ...(Array.isArray(c.skills) ? c.skills : []),
+    ...(Array.isArray(c.experienceSignals) ? c.experienceSignals : []),
+  ].join(' ');
+}
+
+function extractProfileKeywordSignals(input) {
+  const text = typeof input === 'string' ? input : candidateProfileText(input);
+  const low = String(text || '').toLowerCase();
+  return SENTINEL_PROFILE_KEYWORDS.filter(k => low.includes(k.toLowerCase()));
+}
+
+function looksPrivateProfile(c = {}) {
+  const text = [
+    c.summary,
+    c.scoutReason,
+    c.sourceType,
+    c.sourceUrl,
+    c.profileUrl,
+    c.sourceProfile,
+  ].join(' ').toLowerCase();
+  return /\b(private|restricted|inaccessible|login required|sign in required|not public|unavailable)\b/.test(text);
+}
+
+function usableHttpUrl(url) {
+  const s = String(url || '').trim();
+  if (!/^https?:\/\//i.test(s)) return '';
+  if (/^(https?:\/\/)?(example\.com|localhost|127\.0\.0\.1)\b/i.test(s)) return '';
+  if (/\b(fake|placeholder|dummy|test-only)\b/i.test(s)) return '';
+  return s;
+}
+
+function collectCandidateProfileLinks(c = {}) {
+  const links = {
+    linkedin: isLinkedInProfileUrl(c.linkedinUrl || c.linkedin || c.profileUrl || '') ? (c.linkedinUrl || c.linkedin || c.profileUrl || '') : '',
+    github: isUsableGitHubProfileUrl(c.github || c.githubUrl || '') ? (c.github || c.githubUrl || '') : '',
+    source: usableHttpUrl(c.sourceProfile || c.profileUrl || c.sourceUrl || ''),
+    portfolio: usableHttpUrl(c.portfolioUrl || ''),
+    resume: usableHttpUrl(c.resumeUrl || ''),
+  };
+  if (links.source && (links.source === links.linkedin || links.source === links.github || links.source === links.portfolio || links.source === links.resume)) {
+    links.source = '';
+  }
+  return links;
+}
+
+function seniorityReviewMetadata(c = {}, need = {}) {
+  const roleSeniority = String(need.seniority || '').toLowerCase();
+  const text = candidateProfileText(c).toLowerCase();
+  const entrySignals = [
+    'entry level', 'entry-level', 'junior', 'intern', 'internship',
+    'student', 'new grad', 'recent graduate', 'bootcamp',
+  ];
+  const seniorSignals = [
+    'senior', 'lead', 'principal', 'staff', 'architect', 'manager',
+    'director', '10 years', '8 years', '7 years', '6 years', '5 years',
+  ];
+  const entryHit = entrySignals.find(s => text.includes(s));
+  const seniorHit = seniorSignals.find(s => text.includes(s));
+  const midPlus = ['mid', 'senior', 'staff', 'principal', 'director'].includes(roleSeniority);
+  return {
+    seniority_signal: seniorHit || entryHit || '',
+    experience_level_guess: seniorHit ? 'experienced' : entryHit ? 'entry_level' : 'unknown',
+    work_experience_evidence: seniorHit || entryHit || '',
+    entry_level_warning: midPlus && entryHit && !seniorHit
+      ? 'Entry-level profile — not enough experience evidence for mid-level role'
+      : '',
+  };
+}
+
+function buildRankedTitleVariants(role = '') {
+  const raw = String(role || '').trim();
+  const low = raw.toLowerCase();
+  const sentinelRole = /sentinel|soc|siem|detection|threat|incident response/i.test(low);
+  const variants = [];
+  const add = (title, specificity_weight, variant_type) => {
+    if (!title) return;
+    const key = title.toLowerCase();
+    if (variants.some(v => v.title.toLowerCase() === key)) return;
+    variants.push({ title, specificity_weight, variant_type });
+  };
+  if (raw) add(raw, 1.0, sentinelRole ? 'exact_tool_role' : 'input_role');
+  if (sentinelRole) {
+    [
+      'Microsoft Sentinel SOC Analyst',
+      'Microsoft Sentinel Analyst',
+      'Microsoft Sentinel Detection Analyst',
+      'SIEM Detection Analyst',
+    ].forEach(t => add(t, 1.0, 'exact_tool_role'));
+    [
+      'SOC Analyst',
+      'Security Operations Analyst',
+      'SIEM Analyst',
+      'Detection Analyst',
+      'Threat Detection Analyst',
+      'Incident Response Analyst',
+    ].forEach(t => add(t, 0.7, 'medium_specificity'));
+    [
+      'Cybersecurity Analyst',
+      'Azure Security Analyst',
+    ].forEach(t => add(t, 0.45, 'wide_net'));
+  } else {
+    for (const t of expandRoleToTitles(raw)) {
+      add(t, t.toLowerCase() === low ? 1.0 : 0.65, t.toLowerCase() === low ? 'input_role' : 'related_role');
+    }
+  }
+  return variants;
+}
+
+function buildLocationTiers(need = {}) {
+  const custom = String(need.location || '').trim();
+  const tiers = [];
+  const add = (key, label, rank, searchLocation) => {
+    if (!tiers.some(t => t.key === key)) {
+      tiers.push({ key, label, proximity_tier: label, proximity_rank: rank, searchLocation });
+    }
+  };
+  if (custom && !/^remote$/i.test(custom)) add('role-location', `${custom} hybrid`, 1, custom);
+  add('detroit-hybrid', 'Detroit hybrid', 1, 'Detroit, Michigan');
+  add('michigan-hybrid', 'Michigan hybrid', 2, 'Michigan');
+  add('midwest-hybrid', 'Midwest hybrid', 3, 'Midwest');
+  add('remote-us', 'Remote US', 4, 'United States');
+  return tiers;
+}
+
+function inferLocationTier(location = '', tiers = buildLocationTiers()) {
+  const low = String(location || '').toLowerCase();
+  if (!low) return null;
+  const match = tiers.find(t => {
+    const loc = String(t.searchLocation || '').toLowerCase();
+    const label = String(t.label || '').toLowerCase();
+    if (t.key === 'remote-us') return /\bremote\b|united states|\busa\b|\bus\b/.test(low);
+    if (t.key === 'midwest-hybrid') return /midwest|michigan|ohio|illinois|indiana|wisconsin|minnesota|detroit|chicago|cleveland|columbus|milwaukee|minneapolis/.test(low);
+    return (loc && low.includes(loc)) || (label && low.includes(label.replace(/\s*hybrid\s*/g, '').trim()));
+  });
+  return match || null;
+}
+
+function buildCandidateSearchExpansion(need = {}, { enabled = false } = {}) {
+  const titleVariants = buildRankedTitleVariants(need.title || '');
+  const locationTiers = buildLocationTiers(need);
+  const profileKeywords = /sentinel|soc|siem|detection|threat|incident response|defender|kql|kusto/i.test([
+    need.title,
+    ...(Array.isArray(need.requiredSkills) ? need.requiredSkills : []),
+  ].join(' '))
+    ? SENTINEL_PROFILE_KEYWORDS.slice()
+    : normalizeSet(need.requiredSkills || []).slice(0, 8);
+  return {
+    enabled: !!enabled,
+    titleVariants,
+    profileKeywords,
+    locationTiers,
+  };
+}
+
+function sourceMetadata({ provider, sourceLabel = '', query = '', variantMetas = [], locationTier = null, profileText = '', expansionEnabled = false } = {}) {
+  const cleanVariants = (Array.isArray(variantMetas) ? variantMetas : [])
+    .filter(v => v && v.title)
+    .map(v => ({
+      title: String(v.title),
+      specificity_weight: Number.isFinite(Number(v.specificity_weight)) ? Number(v.specificity_weight) : null,
+      variant_type: String(v.variant_type || ''),
+    }));
+  return {
+    providersFound: provider ? [provider] : [],
+    searchVariantsFound: cleanVariants.map(v => v.title),
+    searchVariantMeta: cleanVariants,
+    locationTiersMatched: locationTier ? [locationTier.label || locationTier.proximity_tier || locationTier.key] : [],
+    locationTierMeta: locationTier ? [{
+      key: locationTier.key || '',
+      label: locationTier.label || locationTier.proximity_tier || '',
+      proximity_tier: locationTier.proximity_tier || locationTier.label || '',
+      proximity_rank: Number.isFinite(Number(locationTier.proximity_rank)) ? Number(locationTier.proximity_rank) : null,
+    }] : [],
+    sourceSearches: [{
+      provider: provider || '',
+      sourceLabel,
+      query,
+      variants: cleanVariants.map(v => v.title),
+      variantTypes: normalizeSet(cleanVariants.map(v => v.variant_type)),
+      locationTier: locationTier ? (locationTier.label || locationTier.proximity_tier || '') : '',
+      specificityWeights: cleanVariants.map(v => v.specificity_weight).filter(v => v !== null),
+      expansionEnabled: !!expansionEnabled,
+    }].filter(s => s.provider || s.query || s.variants.length || s.locationTier),
+    profileKeywordSignals: extractProfileKeywordSignals(profileText),
+  };
+}
+
+function mergeCandidateSourceMetadata(c, input = {}) {
+  c.providersFound = mergeUniqueStrings(c.providersFound, input.providersFound || (input.source ? [input.source] : []));
+  c.searchVariantsFound = mergeUniqueStrings(c.searchVariantsFound, input.searchVariantsFound);
+  c.locationTiersMatched = mergeUniqueStrings(c.locationTiersMatched, input.locationTiersMatched);
+  c.profileKeywordSignals = mergeUniqueStrings(
+    c.profileKeywordSignals,
+    mergeUniqueStrings(input.profileKeywordSignals, extractProfileKeywordSignals(input.profileText || candidateProfileText(c))),
+  );
+  c.searchVariantMeta = mergeUniqueObjects(c.searchVariantMeta, input.searchVariantMeta, v => String(v.title || '').toLowerCase());
+  c.locationTierMeta = mergeUniqueObjects(c.locationTierMeta, input.locationTierMeta, v => String(v.key || v.label || '').toLowerCase());
+  c.sourceSearches = mergeUniqueObjects(c.sourceSearches, input.sourceSearches, s => JSON.stringify({
+    provider: s.provider || '',
+    sourceLabel: s.sourceLabel || '',
+    query: s.query || '',
+    locationTier: s.locationTier || '',
+    variants: s.variants || [],
+  }));
+  const tightest = (c.locationTierMeta || [])
+    .filter(t => Number.isFinite(Number(t.proximity_rank)))
+    .sort((a, b) => Number(a.proximity_rank) - Number(b.proximity_rank))[0];
+  if (tightest) {
+    c.proximity_tier = tightest.proximity_tier || tightest.label || '';
+    c.proximity_rank = Number(tightest.proximity_rank);
+  } else if (input.proximity_tier) {
+    c.proximity_tier = input.proximity_tier;
+    c.proximity_rank = Number.isFinite(Number(input.proximity_rank)) ? Number(input.proximity_rank) : c.proximity_rank || null;
+  }
+  if (input.privateProfileWarning && !c.privateProfileWarning) c.privateProfileWarning = input.privateProfileWarning;
+  if (input.entry_level_warning && !c.entry_level_warning) c.entry_level_warning = input.entry_level_warning;
+  for (const f of ['seniority_signal','experience_level_guess','work_experience_evidence','reviewStatus']) {
+    if (input[f] && !c[f]) c[f] = input[f];
+  }
+  return c;
+}
+
+function applyReviewMetadata(c, need = {}, meta = {}) {
+  if (!c) return c;
+  const locationTier = meta.locationTier || inferLocationTier(c.location || '', buildLocationTiers(need));
+  const seniority = seniorityReviewMetadata(c, need);
+  const privateProfileWarning = looksPrivateProfile(c)
+    ? 'Private profile — manual verification required'
+    : '';
+  mergeCandidateSourceMetadata(c, {
+    ...meta,
+    ...(locationTier ? sourceMetadata({ locationTier }).locationTierMeta.length ? {
+      locationTiersMatched: [locationTier.label || locationTier.proximity_tier || locationTier.key],
+      locationTierMeta: sourceMetadata({ locationTier }).locationTierMeta,
+    } : {} : {}),
+    privateProfileWarning,
+    reviewStatus: privateProfileWarning ? 'Needs Manual Review' : c.reviewStatus || '',
+    ...seniority,
+  });
+  return c;
 }
 
 /* ── Repository helpers (CRUD + dedupe) ───────────────────────────── */
@@ -279,8 +570,11 @@ function findOrCreateCandidate(input) {
   const key = candidateDedupeKey(input);
   let c = DB.candidates.find(x => x.dedupeKey === key);
   if (c) {
-    const fields = ['name','currentTitle','currentCompany','location','github','linkedinUrl','portfolioUrl','resumeUrl','email','phone','summary','avatarUrl','sourceUrl','sourceType','scoutDecision','scoutReason','sourceDomain','sourceChannel','scoutScore','scoutScoreReasons','scoutSourceLabel','scoutQuery','experienceScore','experienceSignals'];
+    const fields = ['name','currentTitle','currentCompany','location','github','linkedinUrl','portfolioUrl','resumeUrl','profileUrl','sourceProfile','email','phone','summary','avatarUrl','sourceUrl','sourceType','scoutDecision','scoutReason','sourceDomain','sourceChannel','scoutScore','scoutScoreReasons','scoutSourceLabel','scoutQuery','experienceScore','experienceSignals','privateProfileWarning','seniority_signal','experience_level_guess','work_experience_evidence','entry_level_warning','reviewStatus'];
     for (const f of fields) if (input[f] && !c[f]) c[f] = input[f];
+    if (input.linkedin && !c.linkedinUrl) c.linkedinUrl = input.linkedin;
+    if (input.githubUrl && !c.github) c.github = input.githubUrl;
+    if (input.profileUrl && !c.sourceProfile) c.sourceProfile = input.profileUrl;
     if (Array.isArray(input.skills) && input.skills.length) {
       c.skills = Array.from(new Set([...(c.skills||[]), ...input.skills]));
     }
@@ -301,10 +595,12 @@ function findOrCreateCandidate(input) {
       currentCompany: input.currentCompany || input.company || '',
       location: input.location || '',
       skills: Array.isArray(input.skills) ? input.skills : [],
-      github: input.github || '',
-      linkedinUrl: input.linkedinUrl || (input.profileUrl && input.profileUrl.includes('linkedin.com') ? input.profileUrl : ''),
+      github: input.github || input.githubUrl || '',
+      linkedinUrl: input.linkedinUrl || input.linkedin || (input.profileUrl && input.profileUrl.includes('linkedin.com') ? input.profileUrl : ''),
       portfolioUrl: input.portfolioUrl || input.website || '',
       resumeUrl: input.resumeUrl || '',
+      profileUrl: input.profileUrl || '',
+      sourceProfile: input.sourceProfile || input.profileUrl || '',
       summary: input.summary || input.bio || '',
       email: input.email || '',
       phone: input.phone || '',
@@ -321,6 +617,21 @@ function findOrCreateCandidate(input) {
       scoutQuery: input.scoutQuery || '',
       experienceScore: Number.isFinite(input.experienceScore) ? input.experienceScore : null,
       experienceSignals: Array.isArray(input.experienceSignals) ? input.experienceSignals : [],
+      providersFound: [],
+      searchVariantsFound: [],
+      searchVariantMeta: [],
+      locationTiersMatched: [],
+      locationTierMeta: [],
+      sourceSearches: [],
+      profileKeywordSignals: [],
+      proximity_tier: '',
+      proximity_rank: null,
+      privateProfileWarning: input.privateProfileWarning || '',
+      seniority_signal: input.seniority_signal || '',
+      experience_level_guess: input.experience_level_guess || '',
+      work_experience_evidence: input.work_experience_evidence || '',
+      entry_level_warning: input.entry_level_warning || '',
+      reviewStatus: input.reviewStatus || '',
       avatarUrl: input.avatarUrl || `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(input.name || 'U')}`,
       dedupeKey: key,
       pipelineRunId: input.pipelineRunId || null,
@@ -334,6 +645,7 @@ function findOrCreateCandidate(input) {
     };
     DB.candidates.push(c);
   }
+  mergeCandidateSourceMetadata(c, input);
   // Always re-compute identity verification on every touch so the candidate
   // record stays consistent with its current URL fields.
   refreshIdentityVerification(c);
@@ -710,7 +1022,7 @@ function uniqStrings(items, limit = Infinity) {
   return out;
 }
 
-function buildApolloCandidateAttempts(need) {
+function buildApolloCandidateAttempts(need, { expandCandidatePool = false } = {}) {
   const role = need?.title || '';
   const skills = uniqStrings(need?.requiredSkills || [], 5);
   const primarySkill = skills[0] || '';
@@ -719,7 +1031,8 @@ function buildApolloCandidateAttempts(need) {
   const roleOnly = role ? [role] : expandedTitles.slice(0, 1);
   const broadTitles = uniqStrings([...expandedTitles, ...BROAD_SECURITY_TITLES], 20);
   const locations = need?.location && !/^remote$/i.test(need.location) ? [need.location] : [];
-  const attempts = [
+  const expansion = buildCandidateSearchExpansion(need, { enabled: expandCandidatePool });
+  let attempts = [
     { label: 'focused-title-primary-skill', titles: expandedTitles, keywords: primarySkill, locations },
     { label: 'focused-title-top-skills', titles: expandedTitles, keywords: topSkills, locations },
     { label: 'focused-title-only', titles: expandedTitles, keywords: '', locations },
@@ -727,6 +1040,39 @@ function buildApolloCandidateAttempts(need) {
     { label: 'expanded-related-titles', titles: broadTitles, keywords: primarySkill, locations: [] },
     { label: 'expanded-related-title-only', titles: broadTitles, keywords: '', locations: [] },
   ];
+  attempts = attempts.map(a => ({
+    ...a,
+    searchVariantMeta: (a.titles || []).map(t => {
+      const exact = expansion.titleVariants.find(v => v.title.toLowerCase() === String(t).toLowerCase());
+      return exact || { title: t, specificity_weight: 0.65, variant_type: t === role ? 'input_role' : 'related_role' };
+    }),
+    locationTier: locations.length ? buildLocationTiers(need)[0] : null,
+    expandCandidatePool: false,
+  }));
+  if (expandCandidatePool) {
+    const byType = type => expansion.titleVariants.filter(v => v.variant_type === type);
+    const groups = [
+      { label: 'expanded-high-specificity', variants: byType('exact_tool_role').concat(byType('input_role')), keywords: expansion.profileKeywords.slice(0, 3).join(' ') },
+      { label: 'expanded-medium-specificity', variants: byType('medium_specificity').concat(byType('related_role')).slice(0, 10), keywords: expansion.profileKeywords.slice(0, 3).join(' ') },
+      { label: 'expanded-wide-net', variants: byType('wide_net').slice(0, 6), keywords: expansion.profileKeywords.slice(0, 2).join(' ') },
+    ];
+    attempts = [];
+    for (const tier of expansion.locationTiers) {
+      for (const g of groups) {
+        const variants = g.variants.length ? g.variants : expansion.titleVariants.slice(0, 1);
+        if (!variants.length) continue;
+        attempts.push({
+          label: `${g.label}:${tier.key}`,
+          titles: variants.map(v => v.title),
+          keywords: g.keywords,
+          locations: tier.searchLocation ? [tier.searchLocation] : [],
+          searchVariantMeta: variants,
+          locationTier: tier,
+          expandCandidatePool: true,
+        });
+      }
+    }
+  }
   const seen = new Set();
   return attempts.filter(a => {
     const titles = normalizeApolloTitles(a.titles);
@@ -743,7 +1089,7 @@ function quoteTerm(value) {
   return `"${String(value || '').replace(/"/g, '').trim()}"`;
 }
 
-function buildFirecrawlProfileQueries(need) {
+function buildFirecrawlProfileQueries(need, { expandCandidatePool = false } = {}) {
   const role = need?.title || 'security analyst';
   const skills = uniqStrings(need?.requiredSkills || [], 6);
   const skillA = skills[0] || 'cybersecurity';
@@ -779,7 +1125,27 @@ function buildFirecrawlProfileQueries(need) {
     { source: 'generic-resume-open-to-work', query: '"security analyst" "open to work" resume', limit: 10 },
   ];
   const seen = new Set();
-  return [...dynamic, ...fixed].filter(q => {
+  let queries = [...dynamic, ...fixed];
+  if (expandCandidatePool) {
+    const expansion = buildCandidateSearchExpansion(need, { enabled: true });
+    const expanded = [];
+    for (const tier of expansion.locationTiers) {
+      for (const variant of expansion.titleVariants.slice(0, 12)) {
+        const keywordPart = expansion.profileKeywords.slice(0, 3).map(quoteTerm).join(' ');
+        const locationPart = tier.searchLocation ? quoteTerm(tier.searchLocation) : '';
+        expanded.push({
+          source: `expand:${variant.variant_type}:${tier.key}`,
+          query: `site:linkedin.com/in/ ${quoteTerm(variant.title)} ${locationPart} ${keywordPart}`.trim(),
+          limit: variant.variant_type === 'wide_net' ? 6 : 8,
+          searchVariantMeta: [variant],
+          locationTier: tier,
+          expandCandidatePool: true,
+        });
+      }
+    }
+    queries = expanded.concat(queries.map(q => ({ ...q, expandCandidatePool: false })));
+  }
+  return queries.filter(q => {
     const key = q.query.toLowerCase();
     if (seen.has(key)) return false;
     seen.add(key);
@@ -1916,7 +2282,7 @@ function classifySourceItem({ title = '', url = '', description = '', source = '
   return { sourceType: 'unknown', scoutDecision: 'rejected', scoutReason: 'no candidate-like signal', sourceDomain };
 }
 
-async function runScout({ needId, pipelineRunId = null } = {}) {
+async function runScout({ needId, pipelineRunId = null, expandCandidatePool = false } = {}) {
   const need = DB.hiring_needs.find(n => n.id === needId);
   if (!need) { await logActivity('Scout', 'Need not found', 'error'); return { sourced: 0, candidates: [], sourcedRaw: 0, acceptedCandidates: 0, needsScoutReview: 0, rejectedNonCandidates: 0, rejectedSamples: [] }; }
   if (!need.confirmed) { await logActivity('Scout', 'Need is not confirmed; confirm before sourcing', 'warn'); return { sourced: 0, candidates: [], sourcedRaw: 0, acceptedCandidates: 0, needsScoutReview: 0, rejectedNonCandidates: 0, rejectedSamples: [], reason: 'unconfirmed' }; }
@@ -1925,6 +2291,7 @@ async function runScout({ needId, pipelineRunId = null } = {}) {
   const skillQuery = (need.requiredSkills || []).slice(0, 4).join(' ');
   const cutoff = new Date(Date.now() - 10 * 86400 * 1000);
   const cutoffISO = cutoff.toISOString().slice(0, 10);
+  const expansion = buildCandidateSearchExpansion(need, { enabled: !!expandCandidatePool });
   const accepted = [];
   const review = [];
   const rejected = [];
@@ -1970,7 +2337,7 @@ async function runScout({ needId, pipelineRunId = null } = {}) {
   // Force-accept as candidate_profile — does NOT pass through the heuristic
   // classifier (which is built for noisy Firecrawl results).
   if (isConfigured('apollo')) {
-    for (const attempt of buildApolloCandidateAttempts(need)) {
+    for (const attempt of buildApolloCandidateAttempts(need, { expandCandidatePool })) {
       const ap = await apolloCandidateSearch({
         titles: attempt.titles,
         locations: attempt.locations,
@@ -2056,6 +2423,16 @@ async function runScout({ needId, pipelineRunId = null } = {}) {
         }
         if (!phone) phone = p.mobile_phone || p.corporate_phone || p.work_phone || '';
         phone = String(phone || '').trim();
+        const profileText = [name, p.title || '', orgName, loc, summary].join(' ');
+        const meta = sourceMetadata({
+          provider: 'apollo',
+          sourceLabel: `apollo:${attempt.label}`,
+          query: attempt.keywords || '(title-only)',
+          variantMetas: attempt.searchVariantMeta || [],
+          locationTier: attempt.locationTier || inferLocationTier(loc, expansion.locationTiers),
+          profileText,
+          expansionEnabled: !!attempt.expandCandidatePool,
+        });
 
         const c = findOrCreateCandidate({
           name,
@@ -2076,11 +2453,13 @@ async function runScout({ needId, pipelineRunId = null } = {}) {
           scoutSourceLabel: `apollo:${attempt.label}`,
           scoutQuery: attempt.keywords || '(title-only)',
           pipelineRunId,
+          ...meta,
         });
+        applyReviewMetadata(c, need, meta);
         if (hasRealLinkedIn) recordAccept(c, 'apollo');
         else                 recordReview(c, 'apollo');
       }
-      break;
+      if (!expandCandidatePool) break;
     }
   } else {
     await logActivity('Scout', 'Apollo unavailable (key missing) — skipping Apollo candidate search', 'info', { source: 'apollo', reason: 'APOLLO_API_KEY missing' });
@@ -2094,7 +2473,7 @@ async function runScout({ needId, pipelineRunId = null } = {}) {
     // Order: profile queries first (highest signal) then boards. URL dedupe
     // via seenFirecrawlUrls below prevents double-counting.
     const profileQueries = [
-      ...buildFirecrawlProfileQueries(need),
+      ...buildFirecrawlProfileQueries(need, { expandCandidatePool }),
       ...buildFirecrawlBoardQueries(need),
     ];
     for (const q of profileQueries) {
@@ -2224,6 +2603,23 @@ async function runScout({ needId, pipelineRunId = null } = {}) {
       const cLocation = parsedLocation || '';
       const emailMatch = desc.match(/[\w.+-]+@[\w-]+\.[\w.]+/);
       const isLi = cls.sourceDomain === 'linkedin.com';
+      const profileText = [
+        parsedName,
+        cTitle,
+        cCompany,
+        cLocation,
+        item.description || '',
+        ...(parsedSkillsExtra || []),
+      ].join(' ');
+      const meta = sourceMetadata({
+        provider: 'firecrawl',
+        sourceLabel: q.source,
+        query: q.query,
+        variantMetas: q.searchVariantMeta || [],
+        locationTier: q.locationTier || inferLocationTier(cLocation || item.description || '', expansion.locationTiers),
+        profileText,
+        expansionEnabled: !!q.expandCandidatePool,
+      });
       const c = findOrCreateCandidate({
         name: parsedName, title: cTitle, company: cCompany, location: cLocation,
         summary: (item.description || '').slice(0, 200),
@@ -2242,7 +2638,9 @@ async function runScout({ needId, pipelineRunId = null } = {}) {
         scoutSourceLabel: q.source,
         scoutQuery: q.query,
         pipelineRunId,
+        ...meta,
       });
+      applyReviewMetadata(c, need, meta);
       if (llmParsedFlag) {
         c.enrichedBy = Array.from(new Set([...(c.enrichedBy || []), 'openai-parse']));
       }
@@ -2251,23 +2649,35 @@ async function runScout({ needId, pipelineRunId = null } = {}) {
       }
       // Try prioritized Firecrawl queries in order until candidate-like records
       // are found. Rejected pages are still counted/deduped for diagnostics.
-      if (acceptedBySource.firecrawl + reviewBySource.firecrawl > 0) break;
+      if (!expandCandidatePool && acceptedBySource.firecrawl + reviewBySource.firecrawl > 0) break;
     }
   }
 
   // GitHub user search → every item is a candidate_profile by API contract
-  const ghQueries = uniqStrings([
-    `${skillQuery || need.title} type:user pushed:>${cutoffISO}`,
-    `${need.title} ${skillQuery} type:user`,
-    `cybersecurity security engineer azure sentinel type:user`,
-  ], 3);
+  const ghQueries = expandCandidatePool
+    ? expansion.titleVariants.slice(0, 8).map(v => ({
+        query: `${v.title} ${expansion.profileKeywords.slice(0, 3).join(' ')} type:user pushed:>${cutoffISO}`.trim(),
+        searchVariantMeta: [v],
+        source: `github:expanded:${v.variant_type}`,
+        expandCandidatePool: true,
+      }))
+    : uniqStrings([
+        `${skillQuery || need.title} type:user pushed:>${cutoffISO}`,
+        `${need.title} ${skillQuery} type:user`,
+        `cybersecurity security engineer azure sentinel type:user`,
+      ], 3).map(query => ({ query, searchVariantMeta: [], source: 'github:user-search', expandCandidatePool: false }));
   let ghItems = [];
-  for (const ghQ of ghQueries) {
-    const gh = await githubSearchUsers({ query: ghQ, perPage: 8 });
+  let ghPlan = null;
+  for (const plan of ghQueries) {
+    const gh = await githubSearchUsers({ query: plan.query, perPage: 8 });
     ghItems = (gh.items || []).slice(0, 8);
-    sourceQueryStats.github.push({ query: ghQ, ok: gh.ok, count: ghItems.length, reason: gh.reason || '' });
-    await logActivity('Scout', `GitHub user search: ${ghItems.length} returned`, gh.ok ? 'info' : 'warn', { source: 'github', query: ghQ, count: ghItems.length, reason: gh.reason || '' });
-    if (ghItems.length || !gh.ok) break;
+    sourceQueryStats.github.push({ query: plan.query, ok: gh.ok, count: ghItems.length, reason: gh.reason || '', source: plan.source });
+    await logActivity('Scout', `GitHub user search: ${ghItems.length} returned`, gh.ok ? 'info' : 'warn', { source: 'github', query: plan.query, count: ghItems.length, reason: gh.reason || '' });
+    if (ghItems.length || !gh.ok) {
+      ghPlan = plan;
+      if (!expandCandidatePool) break;
+    }
+    if (ghItems.length && expandCandidatePool) break;
   }
   for (const u of ghItems) {
     sourcedRaw++;
@@ -2287,6 +2697,16 @@ async function runScout({ needId, pipelineRunId = null } = {}) {
     const name = detail.name || u.login.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
     const blog = (detail.blog || '').trim();
     const ghUrl = detail.html_url || `https://github.com/${u.login}`;
+    const profileText = [name, detail.bio || '', detail.company || '', detail.location || ''].join(' ');
+    const meta = sourceMetadata({
+      provider: 'github',
+      sourceLabel: ghPlan?.source || 'github:user-search',
+      query: ghPlan?.query || '',
+      variantMetas: ghPlan?.searchVariantMeta || [],
+      locationTier: inferLocationTier(detail.location || '', expansion.locationTiers),
+      profileText,
+      expansionEnabled: !!ghPlan?.expandCandidatePool,
+    });
     const c = findOrCreateCandidate({
       name,
       title: detail.bio ? detail.bio.split(/[.|,;\n]/)[0].trim().slice(0, 80) : '',
@@ -2305,7 +2725,9 @@ async function runScout({ needId, pipelineRunId = null } = {}) {
       sourceDomain: 'github.com',
       sourceUrl: ghUrl,
       pipelineRunId,
+      ...meta,
     });
+    applyReviewMetadata(c, need, meta);
     recordAccept(c, 'github');
   }
 
@@ -2355,6 +2777,16 @@ async function runScout({ needId, pipelineRunId = null } = {}) {
       const name = detail.name || u.login.replace(/-/g, ' ').replace(/\b\w/g, ch => ch.toUpperCase());
       const blog = (detail.blog || '').trim();
       const ghUrl = detail.html_url || `https://github.com/${u.login}`;
+      const profileText = [name, detail.bio || '', detail.company || '', detail.location || ''].join(' ');
+      const meta = sourceMetadata({
+        provider: 'github',
+        sourceLabel: `github:contrib:${r.owner}/${r.repo}`,
+        query: `${r.owner}/${r.repo}`,
+        variantMetas: [],
+        locationTier: inferLocationTier(detail.location || '', expansion.locationTiers),
+        profileText,
+        expansionEnabled: false,
+      });
       const c = findOrCreateCandidate({
         name,
         title: detail.bio ? detail.bio.split(/[.|,;\n]/)[0].trim().slice(0, 80) : '',
@@ -2375,7 +2807,9 @@ async function runScout({ needId, pipelineRunId = null } = {}) {
         scoutSourceLabel: `github:contrib:${r.owner}/${r.repo}`,
         scoutQuery: `${r.owner}/${r.repo}`,
         pipelineRunId,
+        ...meta,
       });
+      applyReviewMetadata(c, need, meta);
       recordAccept(c, 'github');
     }
   }
@@ -2405,6 +2839,15 @@ async function runScout({ needId, pipelineRunId = null } = {}) {
           seenAdzNames.add(key);
           sourcedRaw++;
           rawResultsBySource.adzuna++;
+          const meta = sourceMetadata({
+            provider: 'adzuna',
+            sourceLabel: 'adzuna:mention',
+            query: `${need.title} ${adzKeywords}`.trim(),
+            variantMetas: [],
+            locationTier: inferLocationTier(r.location && r.location.display_name || '', expansion.locationTiers),
+            profileText: text,
+            expansionEnabled: false,
+          });
           const c = findOrCreateCandidate({
             name: personName,
             title: (r.title || '').slice(0, 80),
@@ -2421,7 +2864,9 @@ async function runScout({ needId, pipelineRunId = null } = {}) {
             scoutSourceLabel: 'adzuna:mention',
             scoutQuery: `${need.title} ${adzKeywords}`.trim(),
             pipelineRunId,
+            ...meta,
           });
+          applyReviewMetadata(c, need, meta);
           recordReview(c, 'adzuna');
         }
       }
@@ -2433,9 +2878,19 @@ async function runScout({ needId, pipelineRunId = null } = {}) {
   if (isConfigured('pdl')) {
     // (a) Proactive Person Search — fetch up to 25 real LinkedIn profiles
     const pdlKeywords = (need.requiredSkills || []).slice(0, 5).join(' ');
+    const pdlPlans = expandCandidatePool
+      ? expansion.titleVariants.slice(0, 8).map(v => ({
+          role: v.title,
+          keywords: expansion.profileKeywords.slice(0, 5).join(' '),
+          sourceLabel: `pdl:expanded:${v.variant_type}`,
+          searchVariantMeta: [v],
+          expandCandidatePool: true,
+        }))
+      : [{ role: need.title || '', keywords: pdlKeywords, sourceLabel: 'pdl:person-search', searchVariantMeta: [], expandCandidatePool: false }];
+    for (const pdlPlan of pdlPlans) {
     const pdlSearch = await pdlPersonSearch({
-      role: need.title || '',
-      keywords: pdlKeywords,
+      role: pdlPlan.role,
+      keywords: pdlPlan.keywords,
       pageSize: 25,
     });
     if (pdlSearch.ok) {
@@ -2458,11 +2913,29 @@ async function runScout({ needId, pipelineRunId = null } = {}) {
         }
         const fullName = (p.full_name || `${p.first_name || ''} ${p.last_name || ''}`.trim() || '').trim();
         const locationParts = [p.location_locality || p.location_name, p.location_region, p.location_country].filter(Boolean);
+        const loc = locationParts.join(', ');
+        const profileText = [
+          fullName,
+          p.job_title || '',
+          p.job_company_name || '',
+          loc,
+          p.summary || '',
+          ...(Array.isArray(p.skills) ? p.skills : []),
+        ].join(' ');
+        const meta = sourceMetadata({
+          provider: 'pdl',
+          sourceLabel: pdlPlan.sourceLabel,
+          query: pdlPlan.keywords || pdlPlan.role,
+          variantMetas: pdlPlan.searchVariantMeta,
+          locationTier: inferLocationTier(loc, expansion.locationTiers),
+          profileText,
+          expansionEnabled: !!pdlPlan.expandCandidatePool,
+        });
         const c = findOrCreateCandidate({
           name: fullName || 'PDL candidate',
           title: p.job_title || '',
           company: p.job_company_name || '',
-          location: locationParts.join(', '),
+          location: loc,
           summary: p.summary || p.job_title || '',
           skills: Array.isArray(p.skills) && p.skills.length
             ? p.skills.map(s => String(s)).filter(Boolean).slice(0, 30)
@@ -2475,14 +2948,20 @@ async function runScout({ needId, pipelineRunId = null } = {}) {
           scoutDecision: 'accepted',
           scoutReason: 'PDL Person Search candidate result',
           sourceDomain: 'linkedin.com',
+          scoutSourceLabel: pdlPlan.sourceLabel,
+          scoutQuery: pdlPlan.keywords || pdlPlan.role,
           pipelineRunId,
+          ...meta,
         });
+        applyReviewMetadata(c, need, meta);
         recordAccept(c, 'pdl');
       }
       await logActivity('Scout', `PDL Person Search: ${(pdlSearch.items || []).length} returned`, (pdlSearch.items || []).length ? 'success' : 'warn', { source: 'pdl', returned: (pdlSearch.items || []).length });
     } else {
       await logActivity('Scout', `PDL Person Search skipped: ${pdlSearch.reason}`, 'warn',
         { source: 'pdl', reason: pdlSearch.reason, status: pdlSearch.status || null, endpoint: pdlSearch.endpoint || null, body: pdlSearch.body || '' });
+    }
+    if (!expandCandidatePool && pdlSearch.ok) break;
     }
 
     // (b) Profile Resolve — rescue Apollo-no-LinkedIn review-pool candidates
@@ -2576,6 +3055,12 @@ async function runScout({ needId, pipelineRunId = null } = {}) {
     rejectedByReason,
     rejectedReasonsBySource,
     sourceQueryStats,
+    expansion: {
+      enabled: !!expandCandidatePool,
+      titleVariants: expansion.titleVariants,
+      profileKeywords: expansion.profileKeywords,
+      locationTiers: expansion.locationTiers,
+    },
     // Explicit per-source aliases (top-level convenience for operators):
     apolloRaw: rawResultsBySource.apollo,
     firecrawlRaw: rawResultsBySource.firecrawl,
@@ -2597,7 +3082,7 @@ async function runScout({ needId, pipelineRunId = null } = {}) {
     'Scout',
     `Sourced ${sourcedRaw} raw (apollo=${rawResultsBySource.apollo} firecrawl=${rawResultsBySource.firecrawl} github=${rawResultsBySource.github}) · ${accepted.length} accepted · ${review.length} review · ${rejected.length} rejected for "${need.title}"`,
     'success',
-    { sourcedRaw, rawResultsBySource, acceptedBySource, reviewBySource, rejectedBySource, sourceQueryStats, accepted: accepted.length, review: review.length, rejected: rejected.length }
+    { sourcedRaw, rawResultsBySource, acceptedBySource, reviewBySource, rejectedBySource, sourceQueryStats, expansion: scoutStatsRecord.expansion, accepted: accepted.length, review: review.length, rejected: rejected.length }
   );
   return {
     sourced: candidates.length,          // backwards-compatible: validator-input count
@@ -2613,6 +3098,7 @@ async function runScout({ needId, pipelineRunId = null } = {}) {
     rejectedByReason,
     rejectedReasonsBySource,
     sourceQueryStats,
+    expansion: scoutStatsRecord.expansion,
     // Explicit per-source aliases for operator diagnostics:
     apolloRaw: rawResultsBySource.apollo,
     firecrawlRaw: rawResultsBySource.firecrawl,
@@ -2978,6 +3464,8 @@ async function generateClientReport({ needId, pipelineRunId = null, scoutStats =
     // is incomplete, the recommended action is manual review, never a direct
     // client submission. This does NOT change the score, label, or ordering.
     const needsManualReview = (v?.tier || '') === 'Needs Review';
+    const links = collectCandidateProfileLinks(c || {});
+    const profileLinkCount = Object.values(links).filter(Boolean).length;
     return {
       name: c?.name || '',
       currentTitle: c?.currentTitle || '',
@@ -2991,13 +3479,29 @@ async function generateClientReport({ needId, pipelineRunId = null, scoutStats =
       missingSkills: m.missingSkills || [],
       validationTier: v?.tier || 'Not Validated',
       needsManualReview,
+      reviewStatus: c?.reviewStatus || (needsManualReview ? 'Needs Manual Review' : ''),
       evidenceNotes: v?.evidenceNotes || '',
       whyFits: (m.reasoning || []).join(' · '),
       reviewReason: m.reviewReason || '',
       recommendedNextStep: needsManualReview
         ? 'Manual review required — confirm evidence before client submission'
         : nextStep(m.tier),
-      links: { github: c?.github || '', linkedin: c?.linkedinUrl || '', portfolio: c?.portfolioUrl || '' },
+      links,
+      hasUsableProfileLink: profileLinkCount > 0,
+      profileLinkWarning: profileLinkCount ? '' : 'No usable profile link — manual review required',
+      sourceVariants: c?.searchVariantsFound || [],
+      searchVariantMeta: c?.searchVariantMeta || [],
+      providersFound: c?.providersFound || [],
+      locationTiersMatched: c?.locationTiersMatched || [],
+      proximity_tier: c?.proximity_tier || '',
+      proximity_rank: c?.proximity_rank || null,
+      profileKeywordSignals: c?.profileKeywordSignals || [],
+      privateProfileWarning: c?.privateProfileWarning || '',
+      seniority_signal: c?.seniority_signal || '',
+      experience_level_guess: c?.experience_level_guess || '',
+      work_experience_evidence: c?.work_experience_evidence || '',
+      entry_level_warning: c?.entry_level_warning || '',
+      sourceProvider: (c?.providersFound || [c?.source || '']).filter(Boolean)[0] || '',
     };
   });
 
@@ -3048,6 +3552,10 @@ ${candidates.map((c, i) => `${i + 1}. ${c.name} — ${c.currentTitle}${c.current
    Strong on: ${c.matchedSkills.join(', ') || '—'}
    Gaps: ${c.missingSkills.join(', ') || 'none'}
    Validation: ${c.validationTier}
+   Source: ${(c.providersFound || []).join(', ') || c.sourceProvider || 'unknown'}${c.proximity_tier ? ` · ${c.proximity_tier}` : ''}
+   Found through: ${(c.sourceVariants || []).slice(0, 3).join(', ') || 'not captured'}
+   Profile links: ${Object.values(c.links || {}).filter(Boolean).join(' | ') || c.profileLinkWarning}
+   Review warnings: ${[c.privateProfileWarning, c.entry_level_warning].filter(Boolean).join(' · ') || 'none'}
    Why fits: ${c.whyFits}
    Next step: ${c.recommendedNextStep}`).join('\n\n')}
 
@@ -3064,8 +3572,8 @@ Sola Scholar
     return '"' + s.replace(/"/g, '""') + '"';
   };
   const csvRows = [
-    ['Rank','Name','Title','Company','Location','Match Score','Tier','Matched Skills','Missing Skills','Validation','Why Fits','Next Step','GitHub','LinkedIn'].map(esc).join(','),
-    ...candidates.map((c, i) => [i+1, c.name, c.currentTitle, c.currentCompany, c.location, c.score, c.displayLabel || c.tier, c.matchedSkills.join(';'), c.missingSkills.join(';'), c.validationTier, c.whyFits, c.recommendedNextStep, c.links.github, c.links.linkedin].map(esc).join(',')),
+    ['Rank','Name','Title','Company','Location','Match Score','Tier','Matched Skills','Missing Skills','Validation','Review Status','Source Variants','Variant Metadata','Proximity Tier','Profile Keywords','Private Profile Warning','Entry-Level Warning','Why Fits','Next Step','GitHub','LinkedIn','Source Profile','Portfolio','Resume'].map(esc).join(','),
+    ...candidates.map((c, i) => [i+1, c.name, c.currentTitle, c.currentCompany, c.location, c.score, c.displayLabel || c.tier, c.matchedSkills.join(';'), c.missingSkills.join(';'), c.validationTier, c.reviewStatus, c.sourceVariants.join(';'), (c.searchVariantMeta || []).map(v => `${v.title}:${v.variant_type}:${v.specificity_weight}`).join(';'), c.proximity_tier, c.profileKeywordSignals.join(';'), c.privateProfileWarning, c.entry_level_warning, c.whyFits, c.recommendedNextStep, c.links.github, c.links.linkedin, c.links.source, c.links.portfolio, c.links.resume].map(esc).join(',')),
   ];
   const csv = csvRows.join('\n');
 
@@ -3090,7 +3598,7 @@ function newPipelineRunId() {
   return 'run_' + Date.now().toString(36) + '_' + crypto.randomBytes(3).toString('hex');
 }
 
-async function runPipeline({ company, role, skills = [], location = '', seniority = 'Mid' }) {
+async function runPipeline({ company, role, skills = [], location = '', seniority = 'Mid', expandCandidatePool = false }) {
   const pipelineRunId = newPipelineRunId();
   console.log(`[pipeline] start runId=${pipelineRunId} role="${role}" company="${company}"`);
   await logActivity('Pipeline', `Pipeline start ${pipelineRunId}: ${role} @ ${company}`, 'running', { pipelineRunId });
@@ -3137,7 +3645,7 @@ async function runPipeline({ company, role, skills = [], location = '', seniorit
   result.steps.push({ step: 'need', needId: need.id });
 
   // 4. Source candidates (scoped by pipelineRunId; scout rejects job posts/blogs/docs)
-  const scout = await runScout({ needId: need.id, pipelineRunId });
+  const scout = await runScout({ needId: need.id, pipelineRunId, expandCandidatePool: !!expandCandidatePool });
   result.steps.push({
     step: 'scout',
     sourcedRaw: scout.sourcedRaw,
@@ -3171,6 +3679,7 @@ async function runPipeline({ company, role, skills = [], location = '', seniorit
     acceptedBySource: scout.acceptedBySource,
     reviewBySource: scout.reviewBySource,
     rejectedByReason: scout.rejectedByReason,
+    expansion: scout.expansion,
   };
   const rep = await generateClientReport({ needId: need.id, pipelineRunId, scoutStats });
   result.steps.push({ step: 'report', reportId: rep.report?.id || null });
@@ -3212,6 +3721,7 @@ async function runPipeline({ company, role, skills = [], location = '', seniorit
     rejectedBySource: scout.rejectedBySource,
     rejectedByReason: scout.rejectedByReason,
     rejectedReasonsBySource: scout.rejectedReasonsBySource,
+    expansion: scout.expansion,
     // Explicit per-source aliases (the fields the operator asked for by name):
     apolloRaw: scout.apolloRaw,
     firecrawlRaw: scout.firecrawlRaw,
@@ -3514,6 +4024,11 @@ module.exports = {
     classifySourceItem,
     scoreSourcedPage,
     buildApolloCandidateAttempts,
+    buildCandidateSearchExpansion,
+    buildRankedTitleVariants,
+    buildLocationTiers,
+    extractProfileKeywordSignals,
+    collectCandidateProfileLinks,
     buildFirecrawlProfileQueries,
     buildFirecrawlBoardQueries,
     githubContributors,
