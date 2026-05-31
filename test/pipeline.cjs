@@ -219,6 +219,8 @@ const {
   isGitLabUserProfileUrl, isHuggingFaceProfileUrl, isKaggleProfileUrl,
   isStackOverflowUserUrl, isCredlyProfileUrl, isTryHackMeProfileUrl,
   isHackTheBoxProfileUrl, isWellfoundProfileUrl, isTrustedCandidateProfileUrl,
+  VISIBILITY_STATE, applySourcingQualityGate, evaluateSourcingQuality,
+  sourcingRejectionStub,
 } = _internals;
 
 // NOTE: do NOT call loadDB() — it reassigns the module-internal `DB` binding
@@ -3380,6 +3382,182 @@ async function main() {
   STUB_GH_SEARCH_USERS = null;
   if (prevFirecrawlExpansionKey === undefined) delete process.env.FIRECRAWL_API_KEY;
   else process.env.FIRECRAWL_API_KEY = prevFirecrawlExpansionKey;
+
+  // ── 20c. Sourcing-quality gate: visibility is pre-scoring metadata ──
+  const isoMonthsAgo = months => new Date(Date.now() - months * 30.4375 * 86400 * 1000).toISOString().slice(0, 10);
+  const qualityNeed = createNeed({
+    companyId: coApollo.id,
+    title: 'SOC Analyst',
+    requiredSkills: ['Microsoft Sentinel', 'KQL', 'SIEM'],
+    seniority: 'Mid',
+    locationType: 'Remote',
+    confirmed: true,
+  });
+  const detectionNeed = createNeed({
+    companyId: coApollo.id,
+    title: 'Detection Engineer',
+    requiredSkills: ['Sigma', 'KQL', 'SIEM'],
+    seniority: 'Mid',
+    locationType: 'Remote',
+    confirmed: true,
+  });
+  const qualityRun = 'quality_gate_' + Date.now().toString(36);
+  const work = (title, months, opts = {}) => ({
+    title,
+    company: opts.company || 'SecurityCo',
+    startDate: isoMonthsAgo(months),
+    endDate: opts.stale ? isoMonthsAgo(72) : undefined,
+    current: !opts.stale,
+    months,
+  });
+  const gateCandidate = (input, need = qualityNeed) => {
+    const c = findOrCreateCandidate({
+      source: 'Manual',
+      scoutDecision: 'accepted',
+      pipelineRunId: qualityRun,
+      linkedinUrl: `https://www.linkedin.com/in/${String(input.name || 'quality').toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
+      ...input,
+    });
+    return applySourcingQualityGate(c, need);
+  };
+
+  const threeMonthSoc = gateCandidate({
+    name: 'Three Month Soc',
+    title: 'SOC Analyst',
+    skills: ['Microsoft Sentinel', 'KQL'],
+    workHistory: [work('SOC Analyst', 3)],
+  });
+  assert(threeMonthSoc.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW &&
+    threeMonthSoc.reason_code === 'SECURITY_EXPERIENCE_UNDER_12_MONTHS',
+    `3-month SOC candidate -> NEEDS_REVIEW (state=${threeMonthSoc.visibility_state}, reason=${threeMonthSoc.reason_code})`);
+
+  const staleSecurity = gateCandidate({
+    name: 'Stale Security Role',
+    title: 'Security Analyst',
+    skills: ['SIEM'],
+    workHistory: [work('Security Analyst', 24, { stale: true })],
+  });
+  assert([VISIBILITY_STATE.NEEDS_REVIEW, VISIBILITY_STATE.HIDDEN].includes(staleSecurity.visibility_state) &&
+    staleSecurity.reason_code === 'STALE_SECURITY_EXPERIENCE',
+    `6-year stale security role -> NEEDS_REVIEW/HIDDEN based on signal (state=${staleSecurity.visibility_state}, reason=${staleSecurity.reason_code})`);
+
+  const bootcampSoc = gateCandidate({
+    name: 'Bootcamp Soc',
+    title: 'SOC Analyst',
+    summary: 'Bootcamp graduate with 2 years SOC Analyst experience.',
+    skills: ['Microsoft Sentinel', 'KQL', 'SIEM'],
+    workHistory: [work('SOC Analyst', 24)],
+  });
+  assert(bootcampSoc.visibility_state === VISIBILITY_STATE.VISIBLE &&
+    bootcampSoc.signals_snapshot.confidence_modifier < 0,
+    `bootcamp + 2-year SOC -> VISIBLE with confidence modifier only (state=${bootcampSoc.visibility_state}, modifier=${bootcampSoc.signals_snapshot.confidence_modifier})`);
+
+  const bootcampNoWork = gateCandidate({
+    name: 'Bootcamp No Work',
+    title: 'Aspiring SOC Analyst',
+    summary: 'Bootcamp student seeking first role.',
+    skills: ['Microsoft Sentinel'],
+    workHistory: [],
+  });
+  assert(bootcampNoWork.visibility_state === VISIBILITY_STATE.HIDDEN &&
+    bootcampNoWork.reason_code === 'NO_SECURITY_WORK_HISTORY',
+    `bootcamp + no security work history -> HIDDEN (state=${bootcampNoWork.visibility_state}, reason=${bootcampNoWork.reason_code})`);
+
+  const partTimeMasters = gateCandidate({
+    name: 'Part Time Masters',
+    title: 'Security Analyst',
+    summary: 'Part-time master’s student and current Security Analyst.',
+    skills: ['SIEM', 'Incident Response'],
+    workHistory: [work('Security Analyst', 18)],
+  });
+  assert(partTimeMasters.visibility_state === VISIBILITY_STATE.VISIBLE,
+    `part-time master's + current Security Analyst -> VISIBLE (state=${partTimeMasters.visibility_state})`);
+
+  const ghDetection = gateCandidate({
+    name: 'Detection Repo Only',
+    title: 'Detection Engineer',
+    skills: ['Sigma', 'KQL'],
+    github: 'https://github.com/detection-repo-only',
+    linkedinUrl: '',
+    sourceUrl: 'https://github.com/detection-repo-only',
+    source: 'GitHub',
+    sourceType: 'candidate_profile',
+    scoutReason: 'Public detection-rules repository with Sigma and Sentinel analytic rules',
+    repositories: [{ name: 'sentinel-detection-rules', description: 'Sigma, YARA, KQL, Sentinel analytic rules' }],
+  }, detectionNeed);
+  assert(ghDetection.visibility_state === VISIBILITY_STATE.VISIBLE &&
+    ghDetection.signals_snapshot.github_work_like_evidence === true,
+    `GitHub-only detection repo can satisfy Detection/SIEM role evidence (state=${ghDetection.visibility_state})`);
+
+  const ghSocOnly = gateCandidate({
+    name: 'Soc GitHub Only',
+    title: 'SOC Analyst',
+    skills: ['KQL'],
+    github: 'https://github.com/soc-github-only',
+    linkedinUrl: '',
+    sourceUrl: 'https://github.com/soc-github-only',
+    source: 'GitHub',
+    sourceType: 'candidate_profile',
+    scoutReason: 'GitHub-only SOC profile with security notes',
+    repositories: [{ name: 'security-labs', description: 'KQL notes and SOC labs' }],
+  }, qualityNeed);
+  assert(ghSocOnly.visibility_state !== VISIBILITY_STATE.VISIBLE &&
+    ghSocOnly.reason_code === 'GITHUB_ONLY_WEAK_FOR_SOC',
+    `GitHub-only SOC candidate does not satisfy mid-level gate alone (state=${ghSocOnly.visibility_state}, reason=${ghSocOnly.reason_code})`);
+
+  const beforeCount = DB.candidates.length;
+  const hiddenReal = gateCandidate({
+    name: 'Hidden Real Candidate',
+    title: 'Aspiring SOC Analyst',
+    summary: 'Aspiring candidate seeking first security role.',
+    skills: ['KQL'],
+  });
+  assert(DB.candidates.length === beforeCount + 1 && hiddenReal.visibility_state !== VISIBILITY_STATE.PURGED,
+    `real candidates are retained, not purged (state=${hiddenReal.visibility_state})`);
+  assert(hiddenReal.recoverable === true && hiddenReal.reason_code && hiddenReal.signals_snapshot,
+    `HIDDEN real candidate retained with reason/snapshot/recoverable`);
+  assert(threeMonthSoc.recoverable === true && threeMonthSoc.reason_code && threeMonthSoc.signals_snapshot,
+    `NEEDS_REVIEW real candidate retained with reason/snapshot/recoverable`);
+
+  const junkStub = sourcingRejectionStub({
+    sourceType: 'job_posting',
+    scoutDecision: 'rejected',
+    scoutReason: 'job board',
+    sourceDomain: 'example.test',
+    sourceUrl: 'https://example.test/jobs/security',
+  });
+  assert(junkStub.visibility_state === VISIBILITY_STATE.PURGED &&
+    junkStub.reason_code === 'PURGED_NON_CANDIDATE' &&
+    junkStub.recoverable === false,
+    `junk records are purged with stub reason (state=${junkStub.visibility_state}, reason=${junkStub.reason_code})`);
+
+  const bootcampScoreBefore = scoreCandidateAgainstNeed(bootcampSoc, qualityNeed, qualityRun).score;
+  applySourcingQualityGate(bootcampSoc, qualityNeed);
+  const bootcampScoreAfter = scoreCandidateAgainstNeed(bootcampSoc, qualityNeed, qualityRun).score;
+  assert(bootcampScoreBefore === bootcampScoreAfter,
+    `sourcing-quality gate does NOT change scoring math (${bootcampScoreBefore} vs ${bootcampScoreAfter})`);
+  const orderingA = gateCandidate({
+    name: 'Ordering Strong Security',
+    title: 'SOC Analyst',
+    skills: ['Microsoft Sentinel', 'KQL', 'SIEM'],
+    workHistory: [work('SOC Analyst', 24)],
+  });
+  const orderingB = gateCandidate({
+    name: 'Ordering Weak Security',
+    title: 'SOC Analyst',
+    skills: ['Microsoft Sentinel'],
+    workHistory: [work('SOC Analyst', 24)],
+  });
+  await runMatchmaker({ needId: qualityNeed.id, pipelineRunId: qualityRun });
+  const orderingMatchA = DB.matches.find(m => m.pipelineRunId === qualityRun && m.candidateId === orderingA.id);
+  const orderingMatchB = DB.matches.find(m => m.pipelineRunId === qualityRun && m.candidateId === orderingB.id);
+  assert(orderingMatchA && orderingMatchB && orderingMatchA.rank < orderingMatchB.rank,
+    `candidate ordering remains score-based after sourcing gate (strong=${orderingMatchA && orderingMatchA.rank}, weak=${orderingMatchB && orderingMatchB.rank})`);
+  assert(isFinalShortlistEligible(threeMonthSoc) === false &&
+    isFinalShortlistEligible(bootcampSoc) === true &&
+    isFinalShortlistEligible(ghDetection) === true &&
+    isFinalShortlistEligible(ghSocOnly) === false,
+    `verified-only filtering preserved with visibility states`);
 
   // Reset
   STUB_OPENAI_RESPONSE = null;
