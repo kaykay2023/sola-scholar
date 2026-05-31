@@ -186,6 +186,65 @@ function matchDisplayHelper(score) {
   return '';
 }
 
+function usableProfileUrl(url) {
+  const s = String(url || '').trim();
+  if (!/^https?:\/\//i.test(s)) return '';
+  if (/\b(example\.com|localhost|127\.0\.0\.1|fake|placeholder|dummy|test-only)\b/i.test(s)) return '';
+  return s;
+}
+function profileLinksForCandidate(c = {}) {
+  const linkedin = usableProfileUrl(c.linkedinUrl || c.linkedin || c.profileUrl || '');
+  const github = usableProfileUrl(c.github || c.githubUrl || '');
+  const source = usableProfileUrl(c.sourceProfile || c.profileUrl || c.sourceUrl || '');
+  const portfolio = usableProfileUrl(c.portfolioUrl || '');
+  const resume = usableProfileUrl(c.resumeUrl || '');
+  const links = [
+    linkedin && { key: 'linkedin', label: 'LinkedIn', url: linkedin },
+    github && { key: 'github', label: 'GitHub', url: github },
+    source && source !== linkedin && source !== github && { key: 'source', label: 'Source profile', url: source },
+    portfolio && portfolio !== source && { key: 'portfolio', label: 'Portfolio', url: portfolio },
+    resume && resume !== source && resume !== portfolio && { key: 'resume', label: 'Resume', url: resume },
+  ].filter(Boolean);
+  return links;
+}
+const ProfileLinks = ({candidate, links}) => {
+  const list = links
+    ? Object.entries(links).map(([key, url]) => url && { key, label: key === 'linkedin' ? 'LinkedIn' : key === 'github' ? 'GitHub' : key === 'source' ? 'Source profile' : key === 'resume' ? 'Resume' : 'Portfolio', url }).filter(Boolean)
+    : profileLinksForCandidate(candidate);
+  if (!list.length) return <p className="text-xs text-amber-700">No usable profile link — manual review required</p>;
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {list.map(l => <a key={`${l.key}-${l.url}`} href={l.url} target="_blank" rel="noopener" className="px-2 py-1 bg-blue-50 hover:bg-blue-100 text-blue-700 rounded-lg text-[11px] font-medium">{l.label}</a>)}
+    </div>
+  );
+};
+function variantSummary(meta = [], fallback = []) {
+  const items = Array.isArray(meta) && meta.length ? meta : (fallback || []).map(title => ({ title }));
+  return items.slice(0, 3).map(v => {
+    const w = Number.isFinite(Number(v.specificity_weight)) ? ` / ${Number(v.specificity_weight).toFixed(2)}` : '';
+    return `${v.title}${v.variant_type ? ` (${v.variant_type}${w})` : ''}`;
+  });
+}
+const ReviewMetadata = ({candidate = {}, reportCandidate = null}) => {
+  const variants = variantSummary(reportCandidate?.searchVariantMeta || candidate.searchVariantMeta, reportCandidate?.sourceVariants || candidate.searchVariantsFound);
+  const providers = reportCandidate?.providersFound || candidate.providersFound || [];
+  const tier = reportCandidate?.proximity_tier || candidate.proximity_tier || '';
+  const keywords = reportCandidate?.profileKeywordSignals || candidate.profileKeywordSignals || [];
+  const privateWarning = reportCandidate?.privateProfileWarning || candidate.privateProfileWarning || '';
+  const entryWarning = reportCandidate?.entry_level_warning || candidate.entry_level_warning || '';
+  if (!variants.length && !providers.length && !tier && !keywords.length && !privateWarning && !entryWarning) return null;
+  return (
+    <div className="text-[11px] text-gray-500 space-y-0.5">
+      {providers.length > 0 && <p><strong>Provider:</strong> {providers.join(', ')}</p>}
+      {variants.length > 0 && <p><strong>Found through:</strong> {variants.join(' · ')}</p>}
+      {tier && <p><strong>Proximity:</strong> {tier}</p>}
+      {keywords.length > 0 && <p><strong>Profile keywords:</strong> {keywords.slice(0, 6).join(', ')}</p>}
+      {privateWarning && <p className="text-amber-700"><strong>Warning:</strong> {privateWarning}</p>}
+      {entryWarning && <p className="text-amber-700"><strong>Experience:</strong> {entryWarning}</p>}
+    </div>
+  );
+};
+
 const statusColor = s => ({
   'researching':'bg-gray-100 text-gray-600', 'contacted':'bg-blue-100 text-blue-700',
   'engaged':'bg-indigo-100 text-indigo-700', 'won':'bg-emerald-100 text-emerald-700',
@@ -384,6 +443,7 @@ const Dashboard = ({state, refresh, setPage}) => {
    ════════════════════════════════════════════════════════════════════ */
 const PipelinePage = ({state, refresh, navigateTo, resetRunView}) => {
   const [form, setForm] = useState({ company: '', role: '', skills: '', location: '', seniority: 'Mid' });
+  const [expandCandidatePool, setExpandCandidatePool] = useState(false);
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState(null);
   const [err, setErr] = useState('');
@@ -421,6 +481,7 @@ const PipelinePage = ({state, refresh, navigateTo, resetRunView}) => {
         skills: form.skills ? form.skills.split(',').map(s=>s.trim()).filter(Boolean) : [],
         location: form.location.trim(),
         seniority: form.seniority,
+        expandCandidatePool,
       };
       const res = await apiPost('/api/pipeline/run', body);
       setResult(res);
@@ -477,6 +538,13 @@ const PipelinePage = ({state, refresh, navigateTo, resetRunView}) => {
             </select>
           </div>
         </div>
+        <label className="flex items-start gap-2 bg-indigo-50 border border-indigo-100 rounded-xl px-3 py-2.5 mb-3 text-xs text-indigo-800">
+          <input type="checkbox" className="mt-0.5" checked={expandCandidatePool} onChange={e=>setExpandCandidatePool(e.target.checked)}/>
+          <span>
+            <span className="font-semibold">Expand candidate pool</span>
+            <span className="block text-indigo-600">Search ranked title variants and location tiers, then keep strict validation and scoring unchanged.</span>
+          </span>
+        </label>
         {err && <p className="text-red-600 text-xs mb-3">{err}</p>}
         <button onClick={run} disabled={running} className="w-full bg-indigo-600 hover:bg-indigo-700 text-white py-3 rounded-xl text-sm font-semibold disabled:opacity-50 flex items-center justify-center gap-2">
           {running ? <><Spinner/> Running pipeline…</> : '⚡ Run Pipeline'}
@@ -721,6 +789,7 @@ const HiringNeedsPage = ({state, refresh, navigateTo, query}) => {
   const [showAdd, setShowAdd] = useState(false);
   const [form, setForm] = useState({title:'', companyName:'', requiredSkills:'', seniority:'Mid', locationType:'Remote', location:'', urgency:'Medium', sourceUrl:'', description:''});
   const [busyId, setBusyId] = useState(null);
+  const [expandCandidatePool, setExpandCandidatePool] = useState(false);
 
   const add = async () => {
     if (!form.title || !form.companyName) return alert('Title and company required');
@@ -739,7 +808,7 @@ const HiringNeedsPage = ({state, refresh, navigateTo, query}) => {
   };
   const scout = async (needId) => {
     setBusyId('scout-' + needId);
-    try { await apiPost('/api/scout/run', { needId }); await refresh(); }
+    try { await apiPost('/api/scout/run', { needId, expandCandidatePool }); await refresh(); }
     catch (e) { alert(e.message); }
     finally { setBusyId(null); }
   };
@@ -780,6 +849,13 @@ const HiringNeedsPage = ({state, refresh, navigateTo, query}) => {
           </div>
           <button onClick={()=>setShowAdd(!showAdd)} className="bg-gray-100 hover:bg-gray-200 text-gray-700 px-5 py-2.5 rounded-xl text-sm font-semibold whitespace-nowrap">+ Add Manually</button>
         </div>
+        <label className="flex items-start gap-2 mt-3 text-xs text-indigo-800 bg-indigo-50 border border-indigo-100 rounded-xl px-3 py-2.5">
+          <input type="checkbox" className="mt-0.5" checked={expandCandidatePool} onChange={e=>setExpandCandidatePool(e.target.checked)}/>
+          <span>
+            <span className="font-semibold">Expand candidate pool</span>
+            <span className="block text-indigo-600">Use ranked variants and location tiers for sourcing metadata; match scoring stays strict.</span>
+          </span>
+        </label>
         {showAdd && (
           <div className="mt-3 p-3 border border-rose-200 bg-rose-50 rounded-xl">
             <div className="grid grid-cols-2 gap-2 mb-2">
@@ -1131,6 +1207,10 @@ const MatchesPage = ({state, refresh, navigateTo, query}) => {
                       {(m.missingSkills||[]).length>0 && (
                         <div className="flex flex-wrap gap-1 mb-2">{m.missingSkills.slice(0,4).map(s => <Badge key={s} cls="bg-red-50 text-red-600">✗ {s}</Badge>)}</div>
                       )}
+                      <div className="mb-3 pt-2 border-t border-gray-100 space-y-2">
+                        <ProfileLinks candidate={c}/>
+                        <ReviewMetadata candidate={c}/>
+                      </div>
                       <div className="mb-3 space-y-0.5">
                         {displayHelper && <p className="text-xs text-amber-700">{displayHelper}</p>}
                         {(m.reasoning||[]).slice(0,3).map((r,i) => <p key={i} className="text-xs text-gray-600">• {r}</p>)}
@@ -1393,16 +1473,16 @@ const ClientReportsPage = ({state, refresh, query}) => {
                     )}
                     <div className="text-xs text-gray-600 mt-1 space-y-0.5">
                       <p><strong>Validation:</strong> {c.validationTier}</p>
+                      {c.reviewStatus && <p><strong>Review status:</strong> {c.reviewStatus}</p>}
                       {displayHelper && <p className="text-amber-700"><strong>Fit note:</strong> {displayHelper}</p>}
                       {c.reviewReason && <p><strong>Review note:</strong> {c.reviewReason}</p>}
                       {c.evidenceNotes && <p><strong>Evidence:</strong> {c.evidenceNotes}</p>}
                       <p><strong>Why fits:</strong> {c.whyFits}</p>
                       <p><strong>Next step:</strong> {c.recommendedNextStep}</p>
                     </div>
-                    <div className="flex gap-1.5 mt-2">
-                      {c.links?.github && <a href={c.links.github} target="_blank" rel="noopener" className="text-[11px] text-blue-600 hover:underline">GitHub</a>}
-                      {c.links?.linkedin && <a href={c.links.linkedin} target="_blank" rel="noopener" className="text-[11px] text-blue-600 hover:underline">LinkedIn</a>}
-                      {c.links?.portfolio && <a href={c.links.portfolio} target="_blank" rel="noopener" className="text-[11px] text-blue-600 hover:underline">Portfolio</a>}
+                    <div className="mt-2 space-y-2">
+                      <ProfileLinks links={c.links}/>
+                      <ReviewMetadata reportCandidate={c}/>
                     </div>
                         </React.Fragment>
                       );
