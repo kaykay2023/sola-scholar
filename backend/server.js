@@ -231,6 +231,15 @@ const SENTINEL_PROFILE_KEYWORDS = [
   'Log Analytics',
 ];
 
+const VISIBILITY_STATE = {
+  PURGED: 'PURGED',
+  VISIBLE: 'VISIBLE',
+  HIDDEN: 'HIDDEN',
+  NEEDS_REVIEW: 'NEEDS_REVIEW',
+};
+
+const THREE_YEARS_MS = 3 * 365 * 24 * 60 * 60 * 1000;
+
 function normalizeSet(values) {
   return Array.from(new Set((Array.isArray(values) ? values : [])
     .map(v => String(v == null ? '' : v).trim())
@@ -504,6 +513,281 @@ function applyReviewMetadata(c, need = {}, meta = {}) {
   return c;
 }
 
+const SECURITY_RELEVANT_RE = /\b(cyber(?:security)?|security|soc|siem|sentinel|detection|threat|incident response|blue team|red team|vulnerability|iam|identity access|defender|kql|kusto|splunk|sigma|yara|cloud security|grc)\b/i;
+const NEGATIVE_CAREER_SIGNAL_RE = /\b(bootcamp|student|career changer|aspiring|seeking first role|entry[-\s]?level|new grad|recent graduate)\b/i;
+const DETECTION_REPO_RE = /\b(detection rules?|analytic rules?|sigma|yara|sentinel|kql|splunk|siem content|detection-as-code|detections? repo|threat hunting)\b/i;
+
+function parseDateValue(value) {
+  if (!value) return null;
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value;
+  const s = String(value).trim();
+  if (!s || /^(present|current|now)$/i.test(s)) return new Date();
+  const d = new Date(s);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function monthsBetween(start, end) {
+  if (!start || !end) return 0;
+  const ms = Math.max(0, end.getTime() - start.getTime());
+  return Math.max(0, Math.round(ms / (30.4375 * 24 * 60 * 60 * 1000)));
+}
+
+function isSecurityRelevantText(...parts) {
+  return SECURITY_RELEVANT_RE.test(parts.filter(Boolean).join(' '));
+}
+
+function isMidLevelNeed(need = {}) {
+  return /^mid(?:[-\s]?level)?$/i.test(String(need.seniority || 'Mid').trim());
+}
+
+function isDetectionOrSiemNeed(need = {}) {
+  return /\b(detection|siem)\b/i.test([
+    need.title,
+    ...(Array.isArray(need.requiredSkills) ? need.requiredSkills : []),
+    ...(Array.isArray(need.tools) ? need.tools : []),
+  ].join(' '));
+}
+
+function isSocNeed(need = {}) {
+  return /\bsoc\b/i.test([
+    need.title,
+    ...(Array.isArray(need.requiredSkills) ? need.requiredSkills : []),
+    ...(Array.isArray(need.tools) ? need.tools : []),
+  ].join(' '));
+}
+
+function candidateTextForGate(c = {}) {
+  return [
+    c.name,
+    c.currentTitle || c.title,
+    c.currentCompany || c.company,
+    c.location,
+    c.summary,
+    c.bio,
+    c.scoutReason,
+    c.sourceUrl,
+    c.github,
+    ...(Array.isArray(c.skills) ? c.skills : []),
+    ...(Array.isArray(c.experienceSignals) ? c.experienceSignals : []),
+    ...(Array.isArray(c.profileKeywordSignals) ? c.profileKeywordSignals : []),
+  ].join(' ');
+}
+
+function collectWorkHistory(c = {}) {
+  const sources = [
+    c.workHistory,
+    c.work_history,
+    c.experience,
+    c.experiences,
+    c.positions,
+    c.employmentHistory,
+    c.employment_history,
+  ];
+  const entries = [];
+  for (const source of sources) {
+    if (!Array.isArray(source)) continue;
+    for (const item of source) {
+      if (!item || typeof item !== 'object') continue;
+      entries.push(item);
+    }
+  }
+  return entries;
+}
+
+function roleText(item = {}) {
+  return [
+    item.title,
+    item.role,
+    item.job_title,
+    item.name,
+    item.company,
+    item.organization,
+    item.description,
+    item.summary,
+  ].filter(Boolean).join(' ');
+}
+
+function durationMonthsForRole(item = {}) {
+  const explicit = Number(item.security_months || item.securityMonths || item.months || item.durationMonths || item.duration_months);
+  if (Number.isFinite(explicit) && explicit > 0) return Math.round(explicit);
+  const start = parseDateValue(item.startDate || item.start_date || item.start || item.from);
+  const end = item.current || item.isCurrent
+    ? new Date()
+    : parseDateValue(item.endDate || item.end_date || item.end || item.to);
+  return monthsBetween(start, end);
+}
+
+function endDateForRole(item = {}) {
+  if (item.current || item.isCurrent) return new Date();
+  return parseDateValue(item.endDate || item.end_date || item.end || item.to || item.lastSeenAt || item.last_seen_at);
+}
+
+function negativeCareerSignals(c = {}) {
+  const text = candidateTextForGate(c).toLowerCase();
+  const signals = ['bootcamp', 'student', 'career changer', 'aspiring', 'seeking first role', 'entry level', 'entry-level']
+    .filter(term => text.includes(term));
+  return normalizeSet(signals);
+}
+
+function textDurationMonths(text = '') {
+  if (!isSecurityRelevantText(text)) return 0;
+  const yearMatch = String(text).match(/\b(\d+(?:\.\d+)?)\+?\s*(?:years?|yrs?)\b/i);
+  if (yearMatch) return Math.round(Number(yearMatch[1]) * 12);
+  const monthMatch = String(text).match(/\b(\d+(?:\.\d+)?)\+?\s*(?:months?|mos?)\b/i);
+  return monthMatch ? Math.round(Number(monthMatch[1])) : 0;
+}
+
+function strongDetectionGithubEvidence(c = {}, need = {}) {
+  if (!isDetectionOrSiemNeed(need)) return false;
+  if (isSocNeed(need) && !/\b(detection|siem)\s+engineer\b/i.test(String(need?.title || ''))) return false;
+  if (!c.github && c.source !== 'GitHub' && !/github\.com/i.test(c.sourceUrl || '')) return false;
+  const repoText = [
+    c.summary,
+    c.scoutReason,
+    c.sourceUrl,
+    c.github,
+    ...(Array.isArray(c.skills) ? c.skills : []),
+    ...(Array.isArray(c.repositories) ? c.repositories.map(r => typeof r === 'string' ? r : [r.name, r.description, r.url].join(' ')) : []),
+    ...(Array.isArray(c.repos) ? c.repos.map(r => typeof r === 'string' ? r : [r.name, r.description, r.url].join(' ')) : []),
+    ...(Array.isArray(c.githubEvidence) ? c.githubEvidence : []),
+    c.githubEvidence && typeof c.githubEvidence === 'object' ? JSON.stringify(c.githubEvidence) : '',
+  ].join(' ');
+  return DETECTION_REPO_RE.test(repoText);
+}
+
+function sourcingSignalsSnapshot(c = {}, need = {}) {
+  let securityMonths = 0;
+  let mostRecentSecurityRoleAt = null;
+  const securityRoles = [];
+
+  for (const item of collectWorkHistory(c)) {
+    const text = roleText(item);
+    const relevant = item.securityRelevant === true || (item.securityRelevant !== false && isSecurityRelevantText(text));
+    if (!relevant) continue;
+    const months = durationMonthsForRole(item);
+    securityMonths += months;
+    const endedAt = endDateForRole(item);
+    if (endedAt && (!mostRecentSecurityRoleAt || endedAt > mostRecentSecurityRoleAt)) {
+      mostRecentSecurityRoleAt = endedAt;
+    }
+    securityRoles.push({
+      title: item.title || item.role || item.job_title || '',
+      company: item.company || item.organization || '',
+      months,
+      endedAt: endedAt ? endedAt.toISOString().slice(0, 10) : '',
+    });
+  }
+
+  const text = candidateTextForGate(c);
+  if (!securityMonths) securityMonths = textDurationMonths(text);
+  const currentSecuritySignal = isSecurityRelevantText(c.currentTitle || c.title || '', c.summary || '', ...(Array.isArray(c.skills) ? c.skills : []));
+  if (!mostRecentSecurityRoleAt && currentSecuritySignal) mostRecentSecurityRoleAt = new Date();
+  const explicitMonths = Number(c.security_months_cumulative || c.securityMonthsCumulative);
+  if (Number.isFinite(explicitMonths) && explicitMonths > securityMonths) securityMonths = Math.round(explicitMonths);
+  const explicitRecent = parseDateValue(c.most_recent_security_role_at || c.mostRecentSecurityRoleAt);
+  if (explicitRecent && (!mostRecentSecurityRoleAt || explicitRecent > mostRecentSecurityRoleAt)) mostRecentSecurityRoleAt = explicitRecent;
+
+  const githubWorkLikeEvidence = strongDetectionGithubEvidence(c, need);
+  if (githubWorkLikeEvidence) {
+    securityMonths = Math.max(securityMonths, 12);
+    if (!mostRecentSecurityRoleAt) mostRecentSecurityRoleAt = parseDateValue(c.githubUpdatedAt || c.updated_at) || new Date();
+  }
+
+  const negativeSignals = negativeCareerSignals(c);
+  const confidenceModifier = Math.max(-0.3, negativeSignals.length * -0.1);
+  const recentEnough = !!mostRecentSecurityRoleAt && (Date.now() - mostRecentSecurityRoleAt.getTime()) <= THREE_YEARS_MS;
+  const hasStructuredWorkHistory = collectWorkHistory(c).length > 0 || Number.isFinite(Number(c.security_months_cumulative || c.securityMonthsCumulative));
+
+  return {
+    security_months_cumulative: securityMonths,
+    most_recent_security_role_at: mostRecentSecurityRoleAt ? mostRecentSecurityRoleAt.toISOString().slice(0, 10) : '',
+    most_recent_security_role_within_3y: recentEnough,
+    security_roles: securityRoles,
+    current_security_signal: currentSecuritySignal,
+    github_work_like_evidence: githubWorkLikeEvidence,
+    github_only_soc_signal: !!(isSocNeed(need) && (c.github || c.source === 'GitHub') && !collectWorkHistory(c).length),
+    negative_terms: negativeSignals,
+    confidence_modifier: confidenceModifier,
+    has_structured_work_history: hasStructuredWorkHistory,
+  };
+}
+
+function isRealCandidateLike(c = {}) {
+  if (['candidate_profile', 'possible_candidate'].includes(c.sourceType)) return true;
+  if (isLinkedInProfileUrl(c.linkedinUrl || c.profileUrl || c.sourceUrl || '')) return true;
+  if (isUsableGitHubProfileUrl(c.github || c.githubUrl || c.sourceUrl || '')) return true;
+  if (c.name && (c.currentTitle || c.title || c.summary || c.currentCompany || c.company)) return true;
+  return false;
+}
+
+function evaluateSourcingQuality(c = {}, need = {}) {
+  const signals = sourcingSignalsSnapshot(c, need);
+  if (c.manualVisibilityApproval || c.visibility_override === VISIBILITY_STATE.VISIBLE) {
+    return { visibility_state: VISIBILITY_STATE.VISIBLE, reason_code: 'MANUAL_REVIEW_APPROVED', signals_snapshot: signals, recoverable: false };
+  }
+  if (!isRealCandidateLike(c)) {
+    return { visibility_state: VISIBILITY_STATE.PURGED, reason_code: 'PURGED_NON_CANDIDATE', signals_snapshot: { sourceType: c.sourceType || 'unknown', sourceDomain: c.sourceDomain || '' }, recoverable: false };
+  }
+
+  const needIsSecurity = isSecurityRelevantText(need.title || '', ...(Array.isArray(need.requiredSkills) ? need.requiredSkills : []), ...(Array.isArray(need.tools) ? need.tools : []));
+  if (!needIsSecurity || !isMidLevelNeed(need)) {
+    return { visibility_state: VISIBILITY_STATE.VISIBLE, reason_code: 'GATE_NOT_APPLICABLE', signals_snapshot: signals, recoverable: false };
+  }
+
+  if (signals.negative_terms.length && !signals.has_structured_work_history && signals.security_months_cumulative === 0) {
+    return { visibility_state: VISIBILITY_STATE.HIDDEN, reason_code: 'NO_SECURITY_WORK_HISTORY', signals_snapshot: signals, recoverable: true };
+  }
+  if (signals.github_only_soc_signal && !signals.security_months_cumulative) {
+    return { visibility_state: VISIBILITY_STATE.HIDDEN, reason_code: 'GITHUB_ONLY_WEAK_FOR_SOC', signals_snapshot: signals, recoverable: true };
+  }
+  if (signals.security_months_cumulative >= 12 && signals.most_recent_security_role_within_3y) {
+    return { visibility_state: VISIBILITY_STATE.VISIBLE, reason_code: 'MID_SECURITY_EXPERIENCE_PASS', signals_snapshot: signals, recoverable: false };
+  }
+  const trustedProviderProfile = ['Apollo', 'PDL', 'LinkedIn'].includes(c.source) && isLinkedInProfileUrl(c.linkedinUrl || c.sourceUrl || '');
+  if (!signals.has_structured_work_history && !signals.github_only_soc_signal && !signals.negative_terms.length && (signals.current_security_signal || trustedProviderProfile)) {
+    return { visibility_state: VISIBILITY_STATE.VISIBLE, reason_code: 'UNSTRUCTURED_PROVIDER_SECURITY_PROFILE', signals_snapshot: signals, recoverable: false };
+  }
+  if (signals.security_months_cumulative >= 12 && !signals.most_recent_security_role_within_3y) {
+    return { visibility_state: VISIBILITY_STATE.NEEDS_REVIEW, reason_code: 'STALE_SECURITY_EXPERIENCE', signals_snapshot: signals, recoverable: true };
+  }
+  if (signals.security_months_cumulative > 0 || signals.current_security_signal) {
+    return { visibility_state: VISIBILITY_STATE.NEEDS_REVIEW, reason_code: 'SECURITY_EXPERIENCE_UNDER_12_MONTHS', signals_snapshot: signals, recoverable: true };
+  }
+  return { visibility_state: VISIBILITY_STATE.HIDDEN, reason_code: 'NO_SECURITY_WORK_HISTORY', signals_snapshot: signals, recoverable: true };
+}
+
+function applySourcingQualityGate(c, need = {}) {
+  if (!c) return c;
+  const result = evaluateSourcingQuality(c, need);
+  c.visibility_state = result.visibility_state;
+  c.reason_code = result.reason_code;
+  c.signals_snapshot = result.signals_snapshot;
+  c.recoverable = !!result.recoverable;
+  c.confidence_modifier = result.signals_snapshot && Number.isFinite(Number(result.signals_snapshot.confidence_modifier))
+    ? Number(result.signals_snapshot.confidence_modifier)
+    : 0;
+  c.security_months_cumulative = result.signals_snapshot?.security_months_cumulative || 0;
+  c.most_recent_security_role_at = result.signals_snapshot?.most_recent_security_role_at || '';
+  if ([VISIBILITY_STATE.HIDDEN, VISIBILITY_STATE.NEEDS_REVIEW, VISIBILITY_STATE.PURGED].includes(result.visibility_state)) {
+    c.scoutDecision = 'review';
+    c.reviewStatus = result.visibility_state;
+  }
+  return c;
+}
+
+function sourcingRejectionStub(entry = {}) {
+  const realish = ['candidate_profile', 'possible_candidate'].includes(entry.sourceType);
+  return {
+    ...entry,
+    visibility_state: realish ? VISIBILITY_STATE.HIDDEN : VISIBILITY_STATE.PURGED,
+    reason_code: realish ? (entry.reason_code || 'REAL_CANDIDATE_RETAINED_FOR_REVIEW') : 'PURGED_NON_CANDIDATE',
+    signals_snapshot: realish
+      ? { sourceType: entry.sourceType || '', sourceDomain: entry.sourceDomain || '', scoutReason: entry.scoutReason || '' }
+      : { sourceType: entry.sourceType || 'unknown', sourceDomain: entry.sourceDomain || '' },
+    recoverable: realish,
+  };
+}
+
 /* ── Repository helpers (CRUD + dedupe) ───────────────────────────── */
 function findOrCreateCompany({ name, domain, industry, size, hqLocation, pipelineRunId }) {
   if (!name) return null;
@@ -570,8 +854,11 @@ function findOrCreateCandidate(input) {
   const key = candidateDedupeKey(input);
   let c = DB.candidates.find(x => x.dedupeKey === key);
   if (c) {
-    const fields = ['name','currentTitle','currentCompany','location','github','linkedinUrl','portfolioUrl','resumeUrl','profileUrl','sourceProfile','email','phone','summary','avatarUrl','sourceUrl','sourceType','scoutDecision','scoutReason','sourceDomain','sourceChannel','scoutScore','scoutScoreReasons','scoutSourceLabel','scoutQuery','experienceScore','experienceSignals','privateProfileWarning','seniority_signal','experience_level_guess','work_experience_evidence','entry_level_warning','reviewStatus'];
+    const fields = ['name','currentTitle','currentCompany','location','github','linkedinUrl','portfolioUrl','resumeUrl','profileUrl','sourceProfile','email','phone','summary','avatarUrl','sourceUrl','sourceType','scoutDecision','scoutReason','sourceDomain','sourceChannel','scoutScore','scoutScoreReasons','scoutSourceLabel','scoutQuery','experienceScore','experienceSignals','privateProfileWarning','seniority_signal','experience_level_guess','work_experience_evidence','entry_level_warning','reviewStatus','visibility_state','reason_code','signals_snapshot','recoverable','confidence_modifier','security_months_cumulative','most_recent_security_role_at'];
     for (const f of fields) if (input[f] && !c[f]) c[f] = input[f];
+    for (const f of ['workHistory','work_history','experience','experiences','positions','employmentHistory','employment_history','repositories','repos','githubEvidence']) {
+      if (input[f] && !c[f]) c[f] = input[f];
+    }
     if (input.linkedin && !c.linkedinUrl) c.linkedinUrl = input.linkedin;
     if (input.githubUrl && !c.github) c.github = input.githubUrl;
     if (input.profileUrl && !c.sourceProfile) c.sourceProfile = input.profileUrl;
@@ -632,6 +919,20 @@ function findOrCreateCandidate(input) {
       work_experience_evidence: input.work_experience_evidence || '',
       entry_level_warning: input.entry_level_warning || '',
       reviewStatus: input.reviewStatus || '',
+      visibility_state: input.visibility_state || '',
+      reason_code: input.reason_code || '',
+      signals_snapshot: input.signals_snapshot || null,
+      recoverable: !!input.recoverable,
+      confidence_modifier: Number.isFinite(Number(input.confidence_modifier)) ? Number(input.confidence_modifier) : 0,
+      security_months_cumulative: Number.isFinite(Number(input.security_months_cumulative)) ? Number(input.security_months_cumulative) : 0,
+      most_recent_security_role_at: input.most_recent_security_role_at || '',
+      workHistory: Array.isArray(input.workHistory) ? input.workHistory : Array.isArray(input.work_history) ? input.work_history : [],
+      experience: Array.isArray(input.experience) ? input.experience : [],
+      positions: Array.isArray(input.positions) ? input.positions : [],
+      employmentHistory: Array.isArray(input.employmentHistory) ? input.employmentHistory : Array.isArray(input.employment_history) ? input.employment_history : [],
+      repositories: Array.isArray(input.repositories) ? input.repositories : [],
+      repos: Array.isArray(input.repos) ? input.repos : [],
+      githubEvidence: input.githubEvidence || null,
       avatarUrl: input.avatarUrl || `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(input.name || 'U')}`,
       dedupeKey: key,
       pipelineRunId: input.pipelineRunId || null,
@@ -2077,6 +2378,7 @@ function refreshIdentityVerification(c) {
 // reserved/system paths.
 function isFinalShortlistEligible(c) {
   if (!c) return false;
+  if (c.visibility_state && c.visibility_state !== VISIBILITY_STATE.VISIBLE) return false;
   if (c.scoutDecision !== 'accepted') return false;
   if (c.identityVerificationStatus !== 'verified') return false;
   if (!c.verifiedProfileUrl) return false;
@@ -2308,6 +2610,13 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
   const rejectedByReason       = {};
   const sourceQueryStats       = { apollo: [], firecrawl: [], github: [] };
   const candById = new Map(); // candidate.id -> first source tag (for dedupe attribution)
+  const recordCandidateByGate = (c, sourceTag) => {
+    applySourcingQualityGate(c, need);
+    if (c.visibility_state === VISIBILITY_STATE.VISIBLE && c.scoutDecision === 'accepted') {
+      return recordAccept(c, sourceTag);
+    }
+    return recordReview(c, sourceTag);
+  };
   const recordAccept = (c, sourceTag) => {
     if (candById.has(c.id)) return false;
     candById.set(c.id, sourceTag);
@@ -2323,9 +2632,9 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
     return true;
   };
   const recordReject = (entry, sourceTag = 'unknown') => {
-    const stamped = { ...entry, source: sourceTag };
+    const stamped = { ...sourcingRejectionStub(entry), source: sourceTag };
     rejected.push(stamped);
-    const key = entry.scoutReason || entry.sourceType || 'unknown';
+    const key = stamped.scoutReason || stamped.sourceType || 'unknown';
     rejectedByReason[key] = (rejectedByReason[key] || 0) + 1;
     if (rejectedBySource[sourceTag] !== undefined) rejectedBySource[sourceTag]++;
     if (!rejectedReasonsBySource[sourceTag]) rejectedReasonsBySource[sourceTag] = {};
@@ -2456,8 +2765,7 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
           ...meta,
         });
         applyReviewMetadata(c, need, meta);
-        if (hasRealLinkedIn) recordAccept(c, 'apollo');
-        else                 recordReview(c, 'apollo');
+        recordCandidateByGate(c, 'apollo');
       }
       if (!expandCandidatePool) break;
     }
@@ -2644,8 +2952,7 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
       if (llmParsedFlag) {
         c.enrichedBy = Array.from(new Set([...(c.enrichedBy || []), 'openai-parse']));
       }
-      if (cls.scoutDecision === 'accepted') recordAccept(c, 'firecrawl');
-      else recordReview(c, 'firecrawl');
+      recordCandidateByGate(c, 'firecrawl');
       }
       // Try prioritized Firecrawl queries in order until candidate-like records
       // are found. Rejected pages are still counted/deduped for diagnostics.
@@ -2728,7 +3035,7 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
       ...meta,
     });
     applyReviewMetadata(c, need, meta);
-    recordAccept(c, 'github');
+    recordCandidateByGate(c, 'github');
   }
 
   // GitHub contributor mining — harvests top contributors of canonical
@@ -2810,7 +3117,7 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
         ...meta,
       });
       applyReviewMetadata(c, need, meta);
-      recordAccept(c, 'github');
+      recordCandidateByGate(c, 'github');
     }
   }
 
@@ -2867,7 +3174,7 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
             ...meta,
           });
           applyReviewMetadata(c, need, meta);
-          recordReview(c, 'adzuna');
+          recordCandidateByGate(c, 'adzuna');
         }
       }
     }
@@ -2954,7 +3261,7 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
           ...meta,
         });
         applyReviewMetadata(c, need, meta);
-        recordAccept(c, 'pdl');
+        recordCandidateByGate(c, 'pdl');
       }
       await logActivity('Scout', `PDL Person Search: ${(pdlSearch.items || []).length} returned`, (pdlSearch.items || []).length ? 'success' : 'warn', { source: 'pdl', returned: (pdlSearch.items || []).length });
     } else {
@@ -2990,6 +3297,7 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
         c.verifiedAt = now();
         c.scoutDecision = 'accepted';
         c.sourceType = 'candidate_profile';
+        applySourcingQualityGate(c, need);
       }
     }));
 
@@ -4060,6 +4368,10 @@ module.exports = {
     isTrustedCandidateProfileUrl,
     computeIdentityVerification,
     refreshIdentityVerification,
+    VISIBILITY_STATE,
+    evaluateSourcingQuality,
+    applySourcingQualityGate,
+    sourcingRejectionStub,
     isFinalShortlistEligible,
     isVisibleMatch,
   },
