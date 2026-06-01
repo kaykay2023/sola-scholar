@@ -225,6 +225,77 @@ function variantSummary(meta = [], fallback = []) {
     return `${v.title}${v.variant_type ? ` (${v.variant_type}${w})` : ''}`;
   });
 }
+const providerLabel = p => ({
+  firecrawl: 'Firecrawl', apollo: 'Apollo', pdl: 'PDL', github: 'GitHub',
+  hunter: 'Hunter', adzuna: 'Adzuna', openai: 'OpenAI', airtable: 'Airtable', clerk: 'Clerk',
+}[String(p || '').toLowerCase()] || String(p || 'Unknown'));
+
+const ProviderProvenance = ({candidate = {}}) => {
+  const discovered = candidate.discovered_by || [];
+  const resolved = candidate.resolved_by || [];
+  const provider = candidate.provider_of_record || '';
+  const resolution = candidate.resolution_status || 'unresolved';
+  const hasProvenance = discovered.length || resolved.length || provider || candidate.location_confidence || candidate.work_history_confidence;
+  if (!hasProvenance) return null;
+  const resolutionLines = [];
+  if (provider === 'firecrawl') resolutionLines.push('Provider of record: Firecrawl scrape — unresolved');
+  else if (provider) resolutionLines.push(`Provider of record: ${providerLabel(provider)}`);
+  if (resolved.map(x => String(x).toLowerCase()).includes('pdl')) resolutionLines.push('Resolved by: PDL');
+  if (resolved.map(x => String(x).toLowerCase()).includes('apollo')) resolutionLines.push('Resolved by: Apollo');
+  if (!resolved.map(x => String(x).toLowerCase()).some(x => x === 'pdl' || x === 'apollo')) resolutionLines.push('Structured resolution: Not confirmed');
+  return (
+    <div className="text-[11px] text-gray-500 space-y-0.5">
+      {discovered.length > 0 && <p><strong>Discovered by:</strong> {discovered.map(providerLabel).join(', ')}</p>}
+      {resolved.length > 0 && <p><strong>Resolved by:</strong> {resolved.map(providerLabel).join(', ')}</p>}
+      <p><strong>Provider of record:</strong> {provider ? providerLabel(provider) : 'Unknown'}</p>
+      <p><strong>Resolution:</strong> {resolution}</p>
+      {candidate.location_confidence && <p><strong>Location confidence:</strong> {candidate.location_confidence}</p>}
+      {candidate.work_history_confidence && <p><strong>Work-history confidence:</strong> {candidate.work_history_confidence}</p>}
+      {resolutionLines.map((line, i) => <p key={i} className="text-gray-600">{line}</p>)}
+    </div>
+  );
+};
+
+const ProviderDiagnosticsTable = ({diagnostics = {}}) => {
+  const rows = Object.entries(diagnostics || {});
+  if (!rows.length) return null;
+  return (
+    <div className="border border-gray-100 rounded-xl overflow-hidden mb-4">
+      <div className="px-3 py-2 bg-gray-50 border-b border-gray-100">
+        <p className="text-xs font-bold text-gray-700 uppercase">Provider Diagnostics</p>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="min-w-full text-[11px]">
+          <thead className="bg-white text-gray-500">
+            <tr>
+              {['Provider','Called?','Returned','Accepted','Visible','Hidden','Needs Review','Error / Skipped reason','Latency'].map(h => (
+                <th key={h} className="px-3 py-2 text-left font-semibold border-b border-gray-100 whitespace-nowrap">{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(([key, d]) => (
+              <tr key={key} className="border-b border-gray-50 last:border-0">
+                <td className="px-3 py-2 font-semibold text-gray-700 whitespace-nowrap">{providerLabel(key)}</td>
+                <td className="px-3 py-2 text-gray-600">{d.was_called ? 'Yes' : 'No'}</td>
+                <td className="px-3 py-2 text-gray-600">{d.returned_count || 0}</td>
+                <td className="px-3 py-2 text-gray-600">{d.accepted_count || 0}</td>
+                <td className="px-3 py-2 text-gray-600">{d.visible_count || 0}</td>
+                <td className="px-3 py-2 text-gray-600">{d.hidden_count || 0}</td>
+                <td className="px-3 py-2 text-gray-600">{(d.needs_review_count || 0) + (d.needs_scout_review_count || 0)}</td>
+                <td className="px-3 py-2 text-gray-600 max-w-xs truncate" title={d.error ? d.sanitized_error_message : d.skip_reason}>
+                  {d.error ? `${d.error_type || 'error'}: ${d.sanitized_error_message || ''}` : (d.was_skipped ? d.skip_reason : '')}
+                </td>
+                <td className="px-3 py-2 text-gray-600 whitespace-nowrap">{d.latency_ms || 0} ms</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+};
+
 const ReviewMetadata = ({candidate = {}, reportCandidate = null}) => {
   const variants = variantSummary(reportCandidate?.searchVariantMeta || candidate.searchVariantMeta, reportCandidate?.sourceVariants || candidate.searchVariantsFound);
   const providers = reportCandidate?.providersFound || candidate.providersFound || [];
@@ -564,6 +635,7 @@ const PipelinePage = ({state, refresh, navigateTo, resetRunView}) => {
               </div>
             ))}
           </div>
+          <ProviderDiagnosticsTable diagnostics={result.providerDiagnostics}/>
           {result.report && (
             <div className="flex gap-2">
               <button onClick={()=>navigateTo('client-reports', { reportId: result.report.id, needId: result.needId, pipelineRunId: result.pipelineRunId })} className="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white py-2.5 rounded-xl text-sm font-semibold">📄 View client report</button>
@@ -1209,6 +1281,7 @@ const MatchesPage = ({state, refresh, navigateTo, query}) => {
                       )}
                       <div className="mb-3 pt-2 border-t border-gray-100 space-y-2">
                         <ProfileLinks candidate={c}/>
+                        <ProviderProvenance candidate={c}/>
                         <ReviewMetadata candidate={c}/>
                       </div>
                       <div className="mb-3 space-y-0.5">
