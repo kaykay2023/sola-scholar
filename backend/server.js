@@ -75,8 +75,16 @@ const PROVIDER_LABELS = {
   apollo: 'Apollo', pdl: 'PDL', github: 'GitHub', firecrawl: 'Firecrawl',
   hunter: 'Hunter', adzuna: 'Adzuna', openai: 'OpenAI', airtable: 'Airtable', clerk: 'Clerk',
 };
+const PROVIDER_KEYS = Object.keys(SERVICES);
 // V1 does not use these providers in the live pipeline path.
 const PROVIDER_NOT_USED_IN_V1 = new Set(['clerk']);
+
+function sanitizeProviderMessage(value = '') {
+  return String(value || '')
+    .replace(/(api[_-]?key|password|secret|token|bearer|authorization|x-api-key)\s*[:=]\s*["']?[A-Za-z0-9_\-.]+["']?/gi, '$1=<REDACTED>')
+    .replace(/\b[A-Za-z0-9_\-]{32,}\b/g, '<REDACTED-LONG-TOKEN>')
+    .slice(0, 300);
+}
 
 function categorizeProviderError(log) {
   const status = log?.meta?.status;
@@ -89,6 +97,107 @@ function categorizeProviderError(log) {
   if (typeof status === 'number' && status >= 500) return 'provider-error';
   if (/timeout|timed out|econn|network/.test(reason)) return 'network-error';
   return 'unknown-error';
+}
+
+function emptyProviderRunDiagnostic(provider) {
+  return {
+    provider_name: provider,
+    was_called: false,
+    was_skipped: false,
+    skip_reason: '',
+    started_at: '',
+    finished_at: '',
+    latency_ms: 0,
+    returned_count: 0,
+    accepted_count: 0,
+    rejected_non_candidate_count: 0,
+    needs_scout_review_count: 0,
+    validated_count: 0,
+    visible_count: 0,
+    hidden_count: 0,
+    needs_review_count: 0,
+    dropped_count: 0,
+    error: false,
+    error_type: '',
+    sanitized_error_message: '',
+    provider_of_record_count: 0,
+    firecrawl_only_count: 0,
+    resolved_by_pdl_count: 0,
+    resolved_by_apollo_count: 0,
+  };
+}
+
+function initProviderRunDiagnostics() {
+  return Object.fromEntries(PROVIDER_KEYS.map(p => [p, emptyProviderRunDiagnostic(p)]));
+}
+
+function providerDiag(diags, provider) {
+  const key = String(provider || '').toLowerCase();
+  if (!diags[key]) diags[key] = emptyProviderRunDiagnostic(key);
+  return diags[key];
+}
+
+function markProviderStarted(diags, provider) {
+  const d = providerDiag(diags, provider);
+  d.was_called = true;
+  d.was_skipped = false;
+  d.skip_reason = '';
+  if (!d.started_at) d.started_at = now();
+  return d;
+}
+
+function markProviderFinished(diags, provider) {
+  const d = providerDiag(diags, provider);
+  d.finished_at = now();
+  if (d.started_at) {
+    const startMs = Date.parse(d.started_at);
+    const endMs = Date.parse(d.finished_at);
+    d.latency_ms = Number.isFinite(startMs) && Number.isFinite(endMs) ? Math.max(0, endMs - startMs) : 0;
+  }
+  return d;
+}
+
+function markProviderSkipped(diags, provider, reason) {
+  const d = providerDiag(diags, provider);
+  if (!d.was_called) d.was_skipped = true;
+  if (!d.skip_reason) d.skip_reason = sanitizeProviderMessage(reason);
+  return d;
+}
+
+function markProviderReturned(diags, provider, count = 0) {
+  const d = providerDiag(diags, provider);
+  const n = Number(count);
+  d.returned_count += Number.isFinite(n) && n > 0 ? Math.round(n) : 0;
+  return d;
+}
+
+function markProviderError(diags, provider, result = {}) {
+  const d = providerDiag(diags, provider);
+  const message = result.reason || result.body || result.message || 'provider error';
+  d.error = true;
+  d.error_type = categorizeProviderError({
+    status: 'error',
+    message,
+    meta: { status: result.status || null, reason: message },
+  });
+  d.sanitized_error_message = sanitizeProviderMessage(message);
+  return d;
+}
+
+function finalizeProviderRunDiagnostics(diags) {
+  for (const provider of PROVIDER_KEYS) {
+    const d = providerDiag(diags, provider);
+    if (!d.was_called && !d.was_skipped) {
+      if (!isConfigured(provider)) {
+        const envs = (SERVICES[provider] && SERVICES[provider].envs) || [];
+        markProviderSkipped(diags, provider, envs.length ? `required env not set (${envs.join(', ')})` : 'provider disabled');
+      } else {
+        markProviderSkipped(diags, provider, 'not invoked in current candidate search path');
+      }
+    }
+    if (d.was_called && !d.finished_at) markProviderFinished(diags, provider);
+  }
+  return diags;
 }
 
 function providerDiagnostics() {
@@ -425,7 +534,96 @@ function buildCandidateSearchExpansion(need = {}, { enabled = false } = {}) {
   };
 }
 
+function normalizeProviderKey(provider = '') {
+  const p = String(provider || '').trim().toLowerCase();
+  if (p === 'linkedin' || p === 'web') return 'firecrawl';
+  if (p === 'people data labs') return 'pdl';
+  if (p === 'github api') return 'github';
+  return p;
+}
+
+function confidenceRank(value = '') {
+  return ({ high: 3, medium: 2, low: 1 }[String(value || '').toLowerCase()] || 0);
+}
+
+function strongerConfidence(a = '', b = '') {
+  return confidenceRank(b) > confidenceRank(a) ? b : a;
+}
+
+function defaultSourceConfidence(provider) {
+  const p = normalizeProviderKey(provider);
+  if (p === 'apollo' || p === 'pdl') return 'high';
+  if (p === 'github') return 'medium';
+  return 'low';
+}
+
+function defaultLocationConfidence(provider, location = '') {
+  const p = normalizeProviderKey(provider);
+  if (!location) return 'low';
+  if (p === 'apollo' || p === 'pdl') return 'high';
+  if (p === 'github') return 'medium';
+  return 'low';
+}
+
+function defaultWorkHistoryConfidence(provider, hasStructuredWork = false) {
+  const p = normalizeProviderKey(provider);
+  if (hasStructuredWork) return 'high';
+  if (p === 'pdl') return 'medium';
+  return 'low';
+}
+
+function providerTraceKey(t = {}) {
+  return JSON.stringify({
+    provider: normalizeProviderKey(t.provider),
+    stage: t.stage || '',
+    sourceLabel: t.sourceLabel || '',
+    skip_reason: t.skip_reason || '',
+  });
+}
+
+function cleanProviderTraceEntry(entry = {}) {
+  const provider = normalizeProviderKey(entry.provider);
+  if (!provider) return null;
+  const out = { provider, stage: String(entry.stage || '') };
+  for (const key of ['returned', 'called']) {
+    if (typeof entry[key] === 'boolean') out[key] = entry[key];
+  }
+  if (entry.confidence) out.confidence = String(entry.confidence);
+  if (entry.sourceLabel) out.sourceLabel = String(entry.sourceLabel).slice(0, 120);
+  if (entry.skip_reason) out.skip_reason = sanitizeProviderMessage(entry.skip_reason);
+  return out;
+}
+
+function providerProvenanceMetadata({ provider, sourceLabel = '', location = '', hasStructuredWork = false } = {}) {
+  const p = normalizeProviderKey(provider);
+  if (!p) return {};
+  const trace = [{
+    provider: p,
+    stage: 'discovery',
+    returned: true,
+    confidence: defaultSourceConfidence(p),
+    sourceLabel,
+  }];
+  if (p === 'firecrawl') {
+    trace.push(
+      { provider: 'pdl', stage: 'resolution', called: false, skip_reason: 'not currently wired for firecrawl resolution' },
+      { provider: 'apollo', stage: 'resolution', called: false, skip_reason: 'not currently wired for firecrawl resolution' },
+    );
+  }
+  return {
+    discovered_by: [p],
+    resolved_by: [],
+    provider_of_record: p,
+    resolution_status: 'unresolved',
+    provider_trace: trace,
+    source_confidence: defaultSourceConfidence(p),
+    location_confidence: defaultLocationConfidence(p, location),
+    work_history_confidence: defaultWorkHistoryConfidence(p, hasStructuredWork),
+  };
+}
+
 function sourceMetadata({ provider, sourceLabel = '', query = '', variantMetas = [], locationTier = null, profileText = '', expansionEnabled = false } = {}) {
+  const p = normalizeProviderKey(provider);
   const cleanVariants = (Array.isArray(variantMetas) ? variantMetas : [])
     .filter(v => v && v.title)
     .map(v => ({
@@ -434,7 +632,7 @@ function sourceMetadata({ provider, sourceLabel = '', query = '', variantMetas =
       variant_type: String(v.variant_type || ''),
     }));
   return {
-    providersFound: provider ? [provider] : [],
+    providersFound: p ? [p] : [],
     searchVariantsFound: cleanVariants.map(v => v.title),
     searchVariantMeta: cleanVariants,
     locationTiersMatched: locationTier ? [locationTier.label || locationTier.proximity_tier || locationTier.key] : [],
@@ -445,7 +643,7 @@ function sourceMetadata({ provider, sourceLabel = '', query = '', variantMetas =
       proximity_rank: Number.isFinite(Number(locationTier.proximity_rank)) ? Number(locationTier.proximity_rank) : null,
     }] : [],
     sourceSearches: [{
-      provider: provider || '',
+      provider: p || '',
       sourceLabel,
       query,
       variants: cleanVariants.map(v => v.title),
@@ -455,6 +653,7 @@ function sourceMetadata({ provider, sourceLabel = '', query = '', variantMetas =
       expansionEnabled: !!expansionEnabled,
     }].filter(s => s.provider || s.query || s.variants.length || s.locationTier),
     profileKeywordSignals: extractProfileKeywordSignals(profileText),
+    ...providerProvenanceMetadata({ provider: p, sourceLabel, location: profileText }),
   };
 }
 
@@ -489,6 +688,50 @@ function mergeCandidateSourceMetadata(c, input = {}) {
   if (input.entry_level_warning && !c.entry_level_warning) c.entry_level_warning = input.entry_level_warning;
   for (const f of ['seniority_signal','experience_level_guess','work_experience_evidence','reviewStatus']) {
     if (input[f] && !c[f]) c[f] = input[f];
+  }
+  return c;
+}
+
+function mergeCandidateProvenance(c, input = {}) {
+  const discovered = normalizeSet(
+    (Array.isArray(input.discovered_by) ? input.discovered_by : [])
+      .map(normalizeProviderKey)
+      .concat((Array.isArray(input.providersFound) ? input.providersFound : []).map(normalizeProviderKey))
+      .filter(Boolean)
+  );
+  c.discovered_by = mergeUniqueStrings(c.discovered_by, discovered).map(normalizeProviderKey).filter(Boolean);
+  c.resolved_by = mergeUniqueStrings(c.resolved_by, (Array.isArray(input.resolved_by) ? input.resolved_by : []).map(normalizeProviderKey).filter(Boolean));
+
+  const inputRecord = normalizeProviderKey(input.provider_of_record || '');
+  if (!c.provider_of_record && inputRecord) c.provider_of_record = inputRecord;
+  if (!c.provider_of_record && c.discovered_by.length) c.provider_of_record = c.discovered_by[0];
+
+  const trace = (Array.isArray(input.provider_trace) ? input.provider_trace : [])
+    .map(cleanProviderTraceEntry)
+    .filter(Boolean);
+  c.provider_trace = mergeUniqueObjects(c.provider_trace, trace, providerTraceKey);
+
+  if (input.resolution_status) c.resolution_status = input.resolution_status;
+  if (!c.resolution_status) c.resolution_status = c.resolved_by.length ? 'resolved' : 'unresolved';
+  if (c.resolved_by.length) c.resolution_status = 'resolved';
+
+  c.source_confidence = strongerConfidence(c.source_confidence || '', input.source_confidence || '');
+  c.location_confidence = strongerConfidence(c.location_confidence || '', input.location_confidence || '');
+  c.work_history_confidence = strongerConfidence(c.work_history_confidence || '', input.work_history_confidence || '');
+  if (!c.source_confidence) c.source_confidence = defaultSourceConfidence(c.provider_of_record);
+  if (!c.location_confidence) c.location_confidence = 'low';
+  if (!c.work_history_confidence) c.work_history_confidence = 'low';
+  return c;
+}
+
+function addCandidateProviderTrace(c, entry = {}) {
+  if (!c) return c;
+  const clean = cleanProviderTraceEntry(entry);
+  if (!clean) return c;
+  c.provider_trace = mergeUniqueObjects(c.provider_trace, [clean], providerTraceKey);
+  if (clean.stage === 'resolution' && clean.returned) {
+    c.resolved_by = mergeUniqueStrings(c.resolved_by, [clean.provider]);
+    c.resolution_status = 'resolved';
   }
   return c;
 }
@@ -854,9 +1097,9 @@ function findOrCreateCandidate(input) {
   const key = candidateDedupeKey(input);
   let c = DB.candidates.find(x => x.dedupeKey === key);
   if (c) {
-    const fields = ['name','currentTitle','currentCompany','location','github','linkedinUrl','portfolioUrl','resumeUrl','profileUrl','sourceProfile','email','phone','summary','avatarUrl','sourceUrl','sourceType','scoutDecision','scoutReason','sourceDomain','sourceChannel','scoutScore','scoutScoreReasons','scoutSourceLabel','scoutQuery','experienceScore','experienceSignals','privateProfileWarning','seniority_signal','experience_level_guess','work_experience_evidence','entry_level_warning','reviewStatus','visibility_state','reason_code','signals_snapshot','recoverable','confidence_modifier','security_months_cumulative','most_recent_security_role_at'];
+    const fields = ['name','currentTitle','currentCompany','location','github','linkedinUrl','portfolioUrl','resumeUrl','profileUrl','sourceProfile','email','phone','summary','avatarUrl','sourceUrl','sourceType','scoutDecision','scoutReason','sourceDomain','sourceChannel','scoutScore','scoutScoreReasons','scoutSourceLabel','scoutQuery','experienceScore','experienceSignals','privateProfileWarning','seniority_signal','experience_level_guess','work_experience_evidence','entry_level_warning','reviewStatus','visibility_state','reason_code','signals_snapshot','recoverable','confidence_modifier','security_months_cumulative','most_recent_security_role_at','provider_of_record','resolution_status','source_confidence','location_confidence','work_history_confidence'];
     for (const f of fields) if (input[f] && !c[f]) c[f] = input[f];
-    for (const f of ['workHistory','work_history','experience','experiences','positions','employmentHistory','employment_history','repositories','repos','githubEvidence']) {
+    for (const f of ['workHistory','work_history','experience','experiences','positions','employmentHistory','employment_history','repositories','repos','githubEvidence','discovered_by','resolved_by','provider_trace']) {
       if (input[f] && !c[f]) c[f] = input[f];
     }
     if (input.linkedin && !c.linkedinUrl) c.linkedinUrl = input.linkedin;
@@ -933,6 +1176,14 @@ function findOrCreateCandidate(input) {
       repositories: Array.isArray(input.repositories) ? input.repositories : [],
       repos: Array.isArray(input.repos) ? input.repos : [],
       githubEvidence: input.githubEvidence || null,
+      discovered_by: Array.isArray(input.discovered_by) ? input.discovered_by.map(normalizeProviderKey).filter(Boolean) : [],
+      resolved_by: Array.isArray(input.resolved_by) ? input.resolved_by.map(normalizeProviderKey).filter(Boolean) : [],
+      provider_of_record: normalizeProviderKey(input.provider_of_record || ''),
+      resolution_status: input.resolution_status || 'unresolved',
+      provider_trace: Array.isArray(input.provider_trace) ? input.provider_trace.map(cleanProviderTraceEntry).filter(Boolean) : [],
+      source_confidence: input.source_confidence || '',
+      location_confidence: input.location_confidence || '',
+      work_history_confidence: input.work_history_confidence || '',
       avatarUrl: input.avatarUrl || `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(input.name || 'U')}`,
       dedupeKey: key,
       pipelineRunId: input.pipelineRunId || null,
@@ -947,6 +1198,7 @@ function findOrCreateCandidate(input) {
     DB.candidates.push(c);
   }
   mergeCandidateSourceMetadata(c, input);
+  mergeCandidateProvenance(c, input);
   // Always re-compute identity verification on every touch so the candidate
   // record stays consistent with its current URL fields.
   refreshIdentityVerification(c);
@@ -2418,6 +2670,36 @@ function isVisibleMatch(m) {
   return isFinalShortlistEligible(c);
 }
 
+function refreshProviderDiagnosticsCounts(diags, { pipelineRunId = null, needId = null } = {}) {
+  if (!diags) return diags;
+  const candidates = DB.candidates.filter(c => !pipelineRunId || c.pipelineRunId === pipelineRunId);
+  const validations = DB.candidate_validations.filter(v => !pipelineRunId || v.pipelineRunId === pipelineRunId);
+  const matches = DB.matches.filter(m =>
+    (!pipelineRunId || m.pipelineRunId === pipelineRunId) &&
+    (!needId || m.needId === needId)
+  );
+  const visibleIds = new Set(matches.filter(isVisibleMatch).map(m => m.candidateId));
+  const droppedIds = new Set(matches.filter(m => m.tier === 'Drop').map(m => m.candidateId));
+  const validatedIds = new Set(validations.map(v => v.candidateId));
+
+  for (const provider of Object.keys(diags)) {
+    const d = providerDiag(diags, provider);
+    const owned = candidates.filter(c => normalizeProviderKey(c.provider_of_record || c.discovered_by?.[0] || '') === provider);
+    d.provider_of_record_count = owned.length;
+    d.validated_count = owned.filter(c => validatedIds.has(c.id)).length;
+    d.visible_count = owned.filter(c => visibleIds.has(c.id)).length;
+    d.hidden_count = owned.filter(c => c.visibility_state === VISIBILITY_STATE.HIDDEN).length;
+    d.needs_review_count = owned.filter(c => c.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW).length;
+    d.dropped_count = owned.filter(c => droppedIds.has(c.id)).length;
+    d.firecrawl_only_count = provider === 'firecrawl'
+      ? owned.filter(c => visibleIds.has(c.id) && !(c.resolved_by || []).length).length
+      : 0;
+    d.resolved_by_pdl_count = owned.filter(c => (c.resolved_by || []).map(normalizeProviderKey).includes('pdl')).length;
+    d.resolved_by_apollo_count = owned.filter(c => (c.resolved_by || []).map(normalizeProviderKey).includes('apollo')).length;
+  }
+  return diags;
+}
+
 // Person-like signals heuristic — used when a root GitHub URL is encountered
 // without API verification. Looks for an individual person rather than a brand,
 // project, or team page. Three independent positive signals:
@@ -2609,6 +2891,7 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
   const rejectedReasonsBySource = { apollo: {}, firecrawl: {}, github: {}, adzuna: {}, pdl: {} };
   const rejectedByReason       = {};
   const sourceQueryStats       = { apollo: [], firecrawl: [], github: [] };
+  const providerDiagnostics    = initProviderRunDiagnostics();
   const candById = new Map(); // candidate.id -> first source tag (for dedupe attribution)
   const recordCandidateByGate = (c, sourceTag) => {
     applySourcingQualityGate(c, need);
@@ -2622,6 +2905,7 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
     candById.set(c.id, sourceTag);
     accepted.push(c);
     acceptedBySource[sourceTag] = (acceptedBySource[sourceTag] || 0) + 1;
+    if (providerDiagnostics[sourceTag]) providerDiagnostics[sourceTag].accepted_count++;
     return true;
   };
   const recordReview = (c, sourceTag) => {
@@ -2629,6 +2913,7 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
     candById.set(c.id, sourceTag);
     review.push(c);
     reviewBySource[sourceTag] = (reviewBySource[sourceTag] || 0) + 1;
+    if (providerDiagnostics[sourceTag]) providerDiagnostics[sourceTag].needs_scout_review_count++;
     return true;
   };
   const recordReject = (entry, sourceTag = 'unknown') => {
@@ -2637,6 +2922,7 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
     const key = stamped.scoutReason || stamped.sourceType || 'unknown';
     rejectedByReason[key] = (rejectedByReason[key] || 0) + 1;
     if (rejectedBySource[sourceTag] !== undefined) rejectedBySource[sourceTag]++;
+    if (providerDiagnostics[sourceTag]) providerDiagnostics[sourceTag].rejected_non_candidate_count++;
     if (!rejectedReasonsBySource[sourceTag]) rejectedReasonsBySource[sourceTag] = {};
     rejectedReasonsBySource[sourceTag][key] = (rejectedReasonsBySource[sourceTag][key] || 0) + 1;
   };
@@ -2646,7 +2932,12 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
   // Force-accept as candidate_profile — does NOT pass through the heuristic
   // classifier (which is built for noisy Firecrawl results).
   if (isConfigured('apollo')) {
-    for (const attempt of buildApolloCandidateAttempts(need, { expandCandidatePool })) {
+    const apolloAttempts = buildApolloCandidateAttempts(need, { expandCandidatePool });
+    if (!apolloAttempts.length) {
+      markProviderSkipped(providerDiagnostics, 'apollo', 'no Apollo candidate titles to search');
+    } else {
+    markProviderStarted(providerDiagnostics, 'apollo');
+    for (const attempt of apolloAttempts) {
       const ap = await apolloCandidateSearch({
         titles: attempt.titles,
         locations: attempt.locations,
@@ -2655,6 +2946,7 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
         page: 1,
       });
       const apolloReturned = (ap.people || []).length;
+      markProviderReturned(providerDiagnostics, 'apollo', apolloReturned);
       sourceQueryStats.apollo.push({
         step: attempt.label,
         titles: attempt.titles,
@@ -2674,6 +2966,7 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
           { source: 'apollo', step: attempt.label, returned: apolloReturned, titles: attempt.titles, locations: attempt.locations, keywords: attempt.keywords },
         );
       } else {
+        markProviderError(providerDiagnostics, 'apollo', ap);
         const bodySnippet = ap.body ? ` body=${ap.body}` : '';
         await logActivity(
           'Scout',
@@ -2769,12 +3062,16 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
       }
       if (!expandCandidatePool) break;
     }
+    markProviderFinished(providerDiagnostics, 'apollo');
+    }
   } else {
+    markProviderSkipped(providerDiagnostics, 'apollo', 'required env not set (APOLLO_API_KEY)');
     await logActivity('Scout', 'Apollo unavailable (key missing) — skipping Apollo candidate search', 'info', { source: 'apollo', reason: 'APOLLO_API_KEY missing' });
   }
 
   let llmParseUsed = 0;
   if (isConfigured('firecrawl')) {
+    markProviderStarted(providerDiagnostics, 'firecrawl');
     const seenFirecrawlUrls = new Set();
     // Combine profile-pattern queries (LinkedIn /in/-focused) with board-
     // targeted queries (Dice / Built In / Wellfound /u/ / security speakers).
@@ -2787,6 +3084,8 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
     for (const q of profileQueries) {
       const fc = await firecrawlSearch(q.query, q.limit || 10);
       const items = fc.items || [];
+      markProviderReturned(providerDiagnostics, 'firecrawl', items.length);
+      if (!fc.ok) markProviderError(providerDiagnostics, 'firecrawl', fc);
       sourceQueryStats.firecrawl.push({ source: q.source, query: q.query, ok: fc.ok, count: items.length, reason: fc.reason || '' });
       await logActivity(
         'Scout',
@@ -2874,9 +3173,11 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
         // Regex parse failed. Try OpenAI candidate parser as fallback —
         // capped to OPENAI_PARSE_MAX_PER_RUN per pipeline to control cost.
         if (llmParseUsed < OPENAI_PARSE_MAX_PER_RUN && isConfigured('openai')) {
+          markProviderStarted(providerDiagnostics, 'openai');
           llmParseUsed++;
           const llm = await openaiParseCandidateItem(item);
           if (llm && llm.name && llm.confidence >= 0.6) {
+            markProviderReturned(providerDiagnostics, 'openai', 1);
             parsedName = llm.name;
             parsedTitle = llm.title;
             parsedCompany = llm.company;
@@ -2958,6 +3259,10 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
       // are found. Rejected pages are still counted/deduped for diagnostics.
       if (!expandCandidatePool && acceptedBySource.firecrawl + reviewBySource.firecrawl > 0) break;
     }
+    markProviderFinished(providerDiagnostics, 'firecrawl');
+    if (providerDiagnostics.openai.was_called) markProviderFinished(providerDiagnostics, 'openai');
+  } else {
+    markProviderSkipped(providerDiagnostics, 'firecrawl', 'required env not set (FIRECRAWL_API_KEY)');
   }
 
   // GitHub user search → every item is a candidate_profile by API contract
@@ -2975,9 +3280,12 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
       ], 3).map(query => ({ query, searchVariantMeta: [], source: 'github:user-search', expandCandidatePool: false }));
   let ghItems = [];
   let ghPlan = null;
+  markProviderStarted(providerDiagnostics, 'github');
   for (const plan of ghQueries) {
     const gh = await githubSearchUsers({ query: plan.query, perPage: 8 });
     ghItems = (gh.items || []).slice(0, 8);
+    markProviderReturned(providerDiagnostics, 'github', ghItems.length);
+    if (!gh.ok) markProviderError(providerDiagnostics, 'github', gh);
     sourceQueryStats.github.push({ query: plan.query, ok: gh.ok, count: ghItems.length, reason: gh.reason || '', source: plan.source });
     await logActivity('Scout', `GitHub user search: ${ghItems.length} returned`, gh.ok ? 'info' : 'warn', { source: 'github', query: plan.query, count: ghItems.length, reason: gh.reason || '' });
     if (ghItems.length || !gh.ok) {
@@ -3048,9 +3356,11 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
   for (const r of minedRepos) {
     const contrib = await githubContributors({ owner: r.owner, repo: r.repo, perPage: 15 });
     if (!contrib.ok) {
+      markProviderError(providerDiagnostics, 'github', { reason: `GitHub contributors HTTP ${contrib.status || 'fail'}`, status: contrib.status || null });
       sourceQueryStats.github.push({ query: `contrib:${r.owner}/${r.repo}`, ok: false, count: 0, reason: `HTTP ${contrib.status || 'fail'}` });
       continue;
     }
+    markProviderReturned(providerDiagnostics, 'github', (contrib.items || []).length);
     sourceQueryStats.github.push({ query: `contrib:${r.owner}/${r.repo}`, ok: true, count: (contrib.items || []).length, reason: '' });
     for (const u of (contrib.items || []).slice(0, 10)) {
       const login = String(u.login || '').toLowerCase();
@@ -3120,14 +3430,18 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
       recordCandidateByGate(c, 'github');
     }
   }
+  markProviderFinished(providerDiagnostics, 'github');
 
   // Adzuna candidate-mention mining — weak signal: job-description text
   // sometimes contains "by NAME", "submitted by NAME", "author: NAME".
   // Extracted names always go to review pool (URL points at job board page,
   // not a candidate profile — verified-only gate stays unchanged).
   if (isConfigured('adzuna')) {
+    markProviderStarted(providerDiagnostics, 'adzuna');
     const adzKeywords = (need.requiredSkills || []).slice(0, 3).join(' ');
     const az = await adzunaSearch({ what: `${need.title} ${adzKeywords}`.trim(), where: '' });
+    markProviderReturned(providerDiagnostics, 'adzuna', (az.results || []).length);
+    if (!az.ok) markProviderError(providerDiagnostics, 'adzuna', az);
     if (az.ok) {
       // Name parts: standard ("John") or Irish/Scottish ("O'Brien").
       // Connector between parts: space or hyphen ("Anne-Marie Lopez").
@@ -3178,11 +3492,15 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
         }
       }
     }
+    markProviderFinished(providerDiagnostics, 'adzuna');
+  } else {
+    markProviderSkipped(providerDiagnostics, 'adzuna', 'required env not set (ADZUNA_APP_ID, ADZUNA_API_KEY)');
   }
 
   // ── PDL (People Data Labs): proactive source + Apollo-rescue + LinkedIn enrich ──
   // Dormant when PDL_API_KEY missing. All calls are failure-safe.
   if (isConfigured('pdl')) {
+    markProviderStarted(providerDiagnostics, 'pdl');
     // (a) Proactive Person Search — fetch up to 25 real LinkedIn profiles
     const pdlKeywords = (need.requiredSkills || []).slice(0, 5).join(' ');
     const pdlPlans = expandCandidatePool
@@ -3200,6 +3518,7 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
       keywords: pdlPlan.keywords,
       pageSize: 25,
     });
+    markProviderReturned(providerDiagnostics, 'pdl', (pdlSearch.items || []).length);
     if (pdlSearch.ok) {
       for (const p of (pdlSearch.items || [])) {
         sourcedRaw++;
@@ -3265,6 +3584,7 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
       }
       await logActivity('Scout', `PDL Person Search: ${(pdlSearch.items || []).length} returned`, (pdlSearch.items || []).length ? 'success' : 'warn', { source: 'pdl', returned: (pdlSearch.items || []).length });
     } else {
+      markProviderError(providerDiagnostics, 'pdl', pdlSearch);
       await logActivity('Scout', `PDL Person Search skipped: ${pdlSearch.reason}`, 'warn',
         { source: 'pdl', reason: pdlSearch.reason, status: pdlSearch.status || null, endpoint: pdlSearch.endpoint || null, body: pdlSearch.body || '' });
     }
@@ -3288,6 +3608,7 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
       const companyName = (c.currentCompany || '').replace(/^@/, '');
       const resolved = await pdlProfileResolve({ firstName, lastName, companyName });
       if (resolved.ok && resolved.linkedinUrl) {
+        markProviderReturned(providerDiagnostics, 'pdl', 1);
         c.linkedinUrl = resolved.linkedinUrl;
         c.sourceUrl = c.sourceUrl || resolved.linkedinUrl;
         c.identityVerificationStatus = 'verified';
@@ -3297,7 +3618,12 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
         c.verifiedAt = now();
         c.scoutDecision = 'accepted';
         c.sourceType = 'candidate_profile';
+        c.resolved_by = mergeUniqueStrings(c.resolved_by, ['pdl']);
+        c.resolution_status = 'resolved';
+        addCandidateProviderTrace(c, { provider: 'pdl', stage: 'resolution', called: true, returned: true, confidence: 'high', sourceLabel: 'pdl:profile-resolve' });
         applySourcingQualityGate(c, need);
+      } else if (!resolved.ok) {
+        markProviderError(providerDiagnostics, 'pdl', resolved);
       }
     }));
 
@@ -3310,6 +3636,7 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
     await Promise.all(enrichable.map(async (c) => {
       const lookup = await pdlProfileLookup({ linkedinUrl: c.linkedinUrl });
       if (lookup.ok && lookup.profile) {
+        markProviderReturned(providerDiagnostics, 'pdl', 1);
         const p = lookup.profile;
         if (Array.isArray(p.skills) && p.skills.length) {
           const newSkills = p.skills.map(s => String(s)).filter(Boolean);
@@ -3321,8 +3648,14 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
         }
         c.enrichedBy = Array.from(new Set([...(c.enrichedBy || []), 'pdl-lookup']));
         c.enrichedAt = now();
+        addCandidateProviderTrace(c, { provider: 'pdl', stage: 'enrichment', called: true, returned: true, confidence: 'medium', sourceLabel: 'pdl:profile-lookup' });
+      } else if (!lookup.ok) {
+        markProviderError(providerDiagnostics, 'pdl', lookup);
       }
     }));
+    markProviderFinished(providerDiagnostics, 'pdl');
+  } else {
+    markProviderSkipped(providerDiagnostics, 'pdl', 'required env not set (PDL_API_KEY)');
   }
 
   // ── Hunter on candidates — fill missing email for accepted records with a
@@ -3333,19 +3666,28 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
     const emailNeeded = accepted
       .filter(c => !c.email && c.name && c.currentCompany)
       .slice(0, 10);
+    if (emailNeeded.length) markProviderStarted(providerDiagnostics, 'hunter');
+    else markProviderSkipped(providerDiagnostics, 'hunter', 'no accepted candidates needing email enrichment');
     await Promise.all(emailNeeded.map(async (c) => {
       const domain = (c.currentCompany || '').toLowerCase().replace(/[^a-z0-9]+/g, '') + '.com';
       const found = await hunterEmailFinder({ domain, fullName: c.name });
       if (found && found.includes('@')) {
+        markProviderReturned(providerDiagnostics, 'hunter', 1);
         c.email = found;
         c.emailVerification = 'hunter';
         c.enrichedBy = Array.from(new Set([...(c.enrichedBy || []), 'hunter']));
         c.enrichedAt = now();
+        addCandidateProviderTrace(c, { provider: 'hunter', stage: 'enrichment', called: true, returned: true, confidence: 'medium', sourceLabel: 'hunter:email-finder' });
       }
     }));
+    if (emailNeeded.length) markProviderFinished(providerDiagnostics, 'hunter');
+  } else {
+    markProviderSkipped(providerDiagnostics, 'hunter', 'required env not set (HUNTER_API_KEY)');
   }
 
   const candidates = [...accepted, ...review];
+  refreshProviderDiagnosticsCounts(providerDiagnostics, { pipelineRunId, needId });
+  finalizeProviderRunDiagnostics(providerDiagnostics);
 
   // Persist scout stats on the need so a later manual /api/client-report/generate
   // call (no scoutStats arg) can still render the "No candidate-like profiles"
@@ -3363,6 +3705,7 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
     rejectedByReason,
     rejectedReasonsBySource,
     sourceQueryStats,
+    providerDiagnostics,
     expansion: {
       enabled: !!expandCandidatePool,
       titleVariants: expansion.titleVariants,
@@ -3390,7 +3733,7 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
     'Scout',
     `Sourced ${sourcedRaw} raw (apollo=${rawResultsBySource.apollo} firecrawl=${rawResultsBySource.firecrawl} github=${rawResultsBySource.github}) · ${accepted.length} accepted · ${review.length} review · ${rejected.length} rejected for "${need.title}"`,
     'success',
-    { sourcedRaw, rawResultsBySource, acceptedBySource, reviewBySource, rejectedBySource, sourceQueryStats, expansion: scoutStatsRecord.expansion, accepted: accepted.length, review: review.length, rejected: rejected.length }
+    { sourcedRaw, rawResultsBySource, acceptedBySource, reviewBySource, rejectedBySource, sourceQueryStats, providerDiagnostics, expansion: scoutStatsRecord.expansion, accepted: accepted.length, review: review.length, rejected: rejected.length }
   );
   return {
     sourced: candidates.length,          // backwards-compatible: validator-input count
@@ -3406,6 +3749,7 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
     rejectedByReason,
     rejectedReasonsBySource,
     sourceQueryStats,
+    providerDiagnostics,
     expansion: scoutStatsRecord.expansion,
     // Explicit per-source aliases for operator diagnostics:
     apolloRaw: rawResultsBySource.apollo,
@@ -3976,6 +4320,7 @@ async function runPipeline({ company, role, skills = [], location = '', seniorit
   // 6. Match only this run's candidates against this run's need
   const mm = await runMatchmaker({ needId: need.id, pipelineRunId });
   result.steps.push({ step: 'match', visible: mm.visible, dropped: mm.dropped });
+  refreshProviderDiagnosticsCounts(scout.providerDiagnostics, { pipelineRunId, needId: need.id });
 
   // 7. Generate client report from this run's matches (with scout context)
   const scoutStats = {
@@ -3987,6 +4332,7 @@ async function runPipeline({ company, role, skills = [], location = '', seniorit
     acceptedBySource: scout.acceptedBySource,
     reviewBySource: scout.reviewBySource,
     rejectedByReason: scout.rejectedByReason,
+    providerDiagnostics: scout.providerDiagnostics,
     expansion: scout.expansion,
   };
   const rep = await generateClientReport({ needId: need.id, pipelineRunId, scoutStats });
@@ -4002,6 +4348,7 @@ async function runPipeline({ company, role, skills = [], location = '', seniorit
     rawResultsBySource: scout.rawResultsBySource,
     acceptedBySource: scout.acceptedBySource,
     rejectedByReason: scout.rejectedByReason,
+    providerDiagnostics: scout.providerDiagnostics,
     sourced: scout.sourced,
     validatorInput: scoutIds.length,
     fullyValidated: val.fullyValidated,
@@ -4029,6 +4376,7 @@ async function runPipeline({ company, role, skills = [], location = '', seniorit
     rejectedBySource: scout.rejectedBySource,
     rejectedByReason: scout.rejectedByReason,
     rejectedReasonsBySource: scout.rejectedReasonsBySource,
+    providerDiagnostics: scout.providerDiagnostics,
     expansion: scout.expansion,
     // Explicit per-source aliases (the fields the operator asked for by name):
     apolloRaw: scout.apolloRaw,
@@ -4372,6 +4720,12 @@ module.exports = {
     evaluateSourcingQuality,
     applySourcingQualityGate,
     sourcingRejectionStub,
+    initProviderRunDiagnostics,
+    finalizeProviderRunDiagnostics,
+    refreshProviderDiagnosticsCounts,
+    sanitizeProviderMessage,
+    providerProvenanceMetadata,
+    addCandidateProviderTrace,
     isFinalShortlistEligible,
     isVisibleMatch,
   },

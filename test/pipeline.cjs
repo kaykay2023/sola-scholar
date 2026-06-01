@@ -3564,6 +3564,156 @@ async function main() {
   if (prevOpenAI === undefined) delete process.env.OPENAI_API_KEY;
   else process.env.OPENAI_API_KEY = prevOpenAI;
 
+  // ── 20d. Provider diagnostics/provenance: observability only ──
+  const prevDiagEnv = {
+    firecrawl: process.env.FIRECRAWL_API_KEY,
+    apollo: process.env.APOLLO_API_KEY,
+    pdl: process.env.PDL_API_KEY,
+    hunter: process.env.HUNTER_API_KEY,
+    adzunaId: process.env.ADZUNA_APP_ID,
+    adzunaKey: process.env.ADZUNA_API_KEY,
+    openai: process.env.OPENAI_API_KEY,
+  };
+  process.env.FIRECRAWL_API_KEY = 'test-firecrawl-key';
+  delete process.env.APOLLO_API_KEY;
+  delete process.env.PDL_API_KEY;
+  delete process.env.HUNTER_API_KEY;
+  delete process.env.ADZUNA_APP_ID;
+  delete process.env.ADZUNA_API_KEY;
+  delete process.env.OPENAI_API_KEY;
+  STUB_FIRECRAWL_ITEMS = [
+    {
+      title: 'Morgan Sentinel — SOC Analyst at Blue Team Co',
+      url: 'https://www.linkedin.com/in/morgan-sentinel-observability',
+      description: 'Michigan SOC Analyst with SIEM, Microsoft Sentinel, KQL, Threat Detection, and Incident Response experience.',
+    },
+  ];
+  STUB_GH_SEARCH_USERS = { items: [] };
+  STUB_GH_CONTRIBUTORS = {};
+  const diagPipeline = await runPipeline({
+    company: 'Provider Diagnostics Co',
+    role: 'SOC Analyst',
+    skills: ['SIEM', 'SOC', 'Incident Response', 'Threat Detection', 'KQL', 'Microsoft Sentinel'],
+    location: 'Michigan hybrid',
+    seniority: 'Mid',
+    expandCandidatePool: true,
+  });
+  assert(diagPipeline.providerDiagnostics && typeof diagPipeline.providerDiagnostics === 'object',
+    `Provider diagnostics are present on a pipeline run`);
+  const diagFields = [
+    'provider_name','was_called','was_skipped','skip_reason','started_at','finished_at','latency_ms',
+    'returned_count','accepted_count','rejected_non_candidate_count','needs_scout_review_count',
+    'validated_count','visible_count','hidden_count','needs_review_count','dropped_count',
+    'error','error_type','sanitized_error_message','provider_of_record_count','firecrawl_only_count',
+    'resolved_by_pdl_count','resolved_by_apollo_count',
+  ];
+  for (const provider of ['firecrawl','apollo','pdl','github','hunter','adzuna','openai','airtable','clerk']) {
+    const d = diagPipeline.providerDiagnostics[provider];
+    assert(d && diagFields.every(f => Object.prototype.hasOwnProperty.call(d, f)),
+      `Provider diagnostics for ${provider} include called/skipped/error/latency/count fields`);
+  }
+  assert(diagPipeline.providerDiagnostics.firecrawl.was_called === true &&
+    diagPipeline.providerDiagnostics.firecrawl.returned_count >= 1,
+    `Firecrawl provider diagnostics show called + returned count`);
+  assert(diagPipeline.providerDiagnostics.apollo.was_skipped === true &&
+    /APOLLO_API_KEY/.test(diagPipeline.providerDiagnostics.apollo.skip_reason || ''),
+    `Apollo skipped state is visible when not configured`);
+  assert(diagPipeline.providerDiagnostics.pdl.was_skipped === true &&
+    /PDL_API_KEY/.test(diagPipeline.providerDiagnostics.pdl.skip_reason || ''),
+    `PDL skipped state is visible when not configured`);
+
+  const diagCandidate = DB.candidates.find(c => c.pipelineRunId === diagPipeline.pipelineRunId && /Morgan Sentinel/.test(c.name || ''));
+  assert(diagCandidate && (diagCandidate.discovered_by || []).includes('firecrawl'),
+    `Firecrawl candidates carry discovered_by`);
+  assert(diagCandidate && diagCandidate.provider_of_record === 'firecrawl',
+    `Firecrawl-only candidates show provider_of_record = firecrawl for now`);
+  assert(diagCandidate && Array.isArray(diagCandidate.provider_trace) &&
+    diagCandidate.provider_trace.some(t => t.provider === 'pdl' && t.called === false && /not currently wired/.test(t.skip_reason || '')),
+    `Firecrawl candidate trace records PDL resolution is not currently wired`);
+  assert(diagCandidate && diagCandidate.source_confidence === 'low' &&
+    diagCandidate.location_confidence === 'low' &&
+    diagCandidate.work_history_confidence === 'low',
+    `Firecrawl-only candidate confidence fields are low`);
+
+  process.env.APOLLO_API_KEY = 'test-apollo-key';
+  STUB_APOLLO_HTTP = {
+    status: 401,
+    body: 'api_key=TEST_FAKE_DIAGNOSTIC_VALUE token=TEST_FAKE_DIAGNOSTIC_TOKEN auth failed',
+  };
+  STUB_FIRECRAWL_ITEMS = [];
+  const diagErrorNeed = createNeed({
+    companyId: coApollo.id,
+    title: 'SOC Analyst',
+    requiredSkills: ['SIEM'],
+    seniority: 'Mid',
+    locationType: 'Remote',
+    confirmed: true,
+  });
+  const diagErrorRun = 'provider_error_' + Date.now().toString(36);
+  const diagErrorScout = await runScout({ needId: diagErrorNeed.id, pipelineRunId: diagErrorRun });
+  assert(diagErrorScout.providerDiagnostics.apollo.error === true &&
+    diagErrorScout.providerDiagnostics.apollo.error_type,
+    `Provider errors are not swallowed silently`);
+  const diagErrorJson = JSON.stringify(diagErrorScout.providerDiagnostics);
+  assert(!diagErrorJson.includes('TEST_FAKE_DIAGNOSTIC_VALUE') &&
+    !diagErrorJson.includes('TEST_FAKE_DIAGNOSTIC_TOKEN'),
+    `Provider errors do not expose secrets`);
+
+  const diagNeed = DB.hiring_needs.find(n => n.id === diagPipeline.needId);
+  const scoreWithoutProv = scoreCandidateAgainstNeed({
+    ...diagCandidate,
+    discovered_by: [],
+    resolved_by: [],
+    provider_of_record: '',
+    provider_trace: [],
+    source_confidence: '',
+    location_confidence: '',
+    work_history_confidence: '',
+  }, diagNeed, diagPipeline.pipelineRunId).score;
+  const scoreWithProv = scoreCandidateAgainstNeed(diagCandidate, diagNeed, diagPipeline.pipelineRunId).score;
+  assert(scoreWithoutProv === scoreWithProv,
+    `Provider diagnostics do not change scoring math (${scoreWithoutProv} vs ${scoreWithProv})`);
+  const orderNeed = diagNeed;
+  const orderBefore = [
+    { id: 'diag-order-strong', name: 'Diag Strong', skills: ['SIEM', 'SOC', 'Incident Response', 'Threat Detection', 'KQL', 'Microsoft Sentinel'], location: 'Michigan' },
+    { id: 'diag-order-weak', name: 'Diag Weak', skills: ['SIEM'], location: 'Michigan' },
+  ].map(c => ({ id: c.id, score: scoreCandidateAgainstNeed(c, orderNeed, diagPipeline.pipelineRunId).score }))
+    .sort((a, b) => b.score - a.score).map(x => x.id).join('|');
+  const orderAfter = [
+    { id: 'diag-order-strong', name: 'Diag Strong', skills: ['SIEM', 'SOC', 'Incident Response', 'Threat Detection', 'KQL', 'Microsoft Sentinel'], location: 'Michigan', discovered_by: ['firecrawl'], provider_of_record: 'firecrawl' },
+    { id: 'diag-order-weak', name: 'Diag Weak', skills: ['SIEM'], location: 'Michigan', discovered_by: ['firecrawl'], provider_of_record: 'firecrawl' },
+  ].map(c => ({ id: c.id, score: scoreCandidateAgainstNeed(c, orderNeed, diagPipeline.pipelineRunId).score }))
+    .sort((a, b) => b.score - a.score).map(x => x.id).join('|');
+  assert(orderBefore === orderAfter,
+    `Provider diagnostics do not change candidate ordering`);
+  assert(isFinalShortlistEligible(diagCandidate) === true,
+    `Provider diagnostics do not change verified-only filtering`);
+
+  const frontendHtml = fs.readFileSync(path.join(__dirname, '..', 'backend', 'public', 'index.html'), 'utf8');
+  assert(/ProviderDiagnosticsTable/.test(frontendHtml) && /Provider Diagnostics/.test(frontendHtml),
+    `Pipeline Result can render provider diagnostics`);
+  assert(/ProviderProvenance/.test(frontendHtml) && /Discovered by:/.test(frontendHtml) && /Provider of record: Firecrawl scrape/.test(frontendHtml),
+    `View Matches can render provider provenance fields`);
+
+  STUB_APOLLO_HTTP = null;
+  STUB_FIRECRAWL_ITEMS = null;
+  STUB_GH_SEARCH_USERS = null;
+  STUB_GH_CONTRIBUTORS = null;
+  if (prevDiagEnv.firecrawl === undefined) delete process.env.FIRECRAWL_API_KEY;
+  else process.env.FIRECRAWL_API_KEY = prevDiagEnv.firecrawl;
+  if (prevDiagEnv.apollo === undefined) delete process.env.APOLLO_API_KEY;
+  else process.env.APOLLO_API_KEY = prevDiagEnv.apollo;
+  if (prevDiagEnv.pdl === undefined) delete process.env.PDL_API_KEY;
+  else process.env.PDL_API_KEY = prevDiagEnv.pdl;
+  if (prevDiagEnv.hunter === undefined) delete process.env.HUNTER_API_KEY;
+  else process.env.HUNTER_API_KEY = prevDiagEnv.hunter;
+  if (prevDiagEnv.adzunaId === undefined) delete process.env.ADZUNA_APP_ID;
+  else process.env.ADZUNA_APP_ID = prevDiagEnv.adzunaId;
+  if (prevDiagEnv.adzunaKey === undefined) delete process.env.ADZUNA_API_KEY;
+  else process.env.ADZUNA_API_KEY = prevDiagEnv.adzunaKey;
+  if (prevDiagEnv.openai === undefined) delete process.env.OPENAI_API_KEY;
+  else process.env.OPENAI_API_KEY = prevDiagEnv.openai;
+
   // ── 21. Raw candidates !== final shortlist ──
   // Same need: count raw candidates in run vs visible matchmaker output.
   const rawInRun = DB.candidates.filter(c => c.pipelineRunId === ghGateRun).length;
