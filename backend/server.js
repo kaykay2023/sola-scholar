@@ -799,6 +799,12 @@ function isSocNeed(need = {}) {
   ].join(' '));
 }
 
+function isGithubPrimaryEvidenceRole(need = {}) {
+  if (!isDetectionOrSiemNeed(need)) return false;
+  if (isSocNeed(need) && !/\b(detection|siem)\s+engineer\b/i.test(String(need?.title || ''))) return false;
+  return true;
+}
+
 function candidateTextForGate(c = {}) {
   return [
     c.name,
@@ -881,8 +887,7 @@ function textDurationMonths(text = '') {
 }
 
 function strongDetectionGithubEvidence(c = {}, need = {}) {
-  if (!isDetectionOrSiemNeed(need)) return false;
-  if (isSocNeed(need) && !/\b(detection|siem)\s+engineer\b/i.test(String(need?.title || ''))) return false;
+  if (!isGithubPrimaryEvidenceRole(need)) return false;
   if (!c.github && c.source !== 'GitHub' && !/github\.com/i.test(c.sourceUrl || '')) return false;
   const repoText = [
     c.summary,
@@ -964,6 +969,50 @@ function isRealCandidateLike(c = {}) {
 }
 
 function evaluateSourcingQuality(c = {}, need = {}) {
+  const result = evaluateSourcingQualityBase(c, need);
+  if (result.visibility_state === VISIBILITY_STATE.VISIBLE &&
+      result.reason_code !== 'MANUAL_REVIEW_APPROVED' &&
+      isFirecrawlOnlyUnresolved(c, need)) {
+    return {
+      visibility_state: VISIBILITY_STATE.NEEDS_REVIEW,
+      reason_code: 'FIRECRAWL_ONLY_UNRESOLVED',
+      signals_snapshot: {
+        ...(result.signals_snapshot || {}),
+        prior_reason_code: result.reason_code,
+        provider_of_record: normalizeProviderKey(c.provider_of_record || ''),
+        resolution_status: c.resolution_status || 'unresolved',
+      },
+      recoverable: true,
+    };
+  }
+  return result;
+}
+
+function isFirecrawlOnlyUnresolved(c = {}, need = {}) {
+  const provider = normalizeProviderKey(c.provider_of_record || '');
+  const discovered = (Array.isArray(c.discovered_by) ? c.discovered_by : [])
+    .map(normalizeProviderKey)
+    .filter(Boolean);
+  const firecrawlOnly = provider === 'firecrawl' ||
+    (discovered.length > 0 && discovered.every(p => p === 'firecrawl'));
+  if (!firecrawlOnly) return false;
+
+  const ghUrls = [c.github, c.sourceUrl, c.portfolioUrl, c.linkedinUrl].filter(Boolean);
+  const githubVerified = c.source === 'GitHub' ||
+    isVerifiedGitHubProfile(c) ||
+    (/GitHub API verified type=User/i.test(c.scoutReason || '') && ghUrls.some(isUsableGitHubProfileUrl));
+  if (!githubVerified) return false;
+  if (githubVerified && isGithubPrimaryEvidenceRole(need)) return false;
+
+  const resolvedByStructuredProvider = (Array.isArray(c.resolved_by) ? c.resolved_by : [])
+    .map(normalizeProviderKey)
+    .some(p => p === 'apollo' || p === 'pdl');
+  if (resolvedByStructuredProvider) return false;
+  if (c.resolution_status === 'resolved') return false;
+  return true;
+}
+
+function evaluateSourcingQualityBase(c = {}, need = {}) {
   const signals = sourcingSignalsSnapshot(c, need);
   if (c.manualVisibilityApproval || c.visibility_override === VISIBILITY_STATE.VISIBLE) {
     return { visibility_state: VISIBILITY_STATE.VISIBLE, reason_code: 'MANUAL_REVIEW_APPROVED', signals_snapshot: signals, recoverable: false };
@@ -4719,6 +4768,8 @@ module.exports = {
     VISIBILITY_STATE,
     evaluateSourcingQuality,
     applySourcingQualityGate,
+    isFirecrawlOnlyUnresolved,
+    isGithubPrimaryEvidenceRole,
     sourcingRejectionStub,
     initProviderRunDiagnostics,
     finalizeProviderRunDiagnostics,
