@@ -93,7 +93,9 @@ function categorizeProviderError(log) {
   if (/plan|restricted|upgrade|subscription|not entitled|forbidden plan/.test(reason)) return 'plan-restricted';
   if (status === 401 || status === 403) return 'auth-rejected';
   if (status === 429 || /rate limit|too many requests/.test(reason)) return 'rate-limited';
+  if (status === 402 || /credit|payment/.test(reason)) return 'plan-restricted';
   if (status === 400 || status === 422 || /invalid|too long|bad request/.test(reason)) return 'bad-request';
+  if (typeof status === 'number' && status >= 400 && status < 500) return 'bad-request';
   if (typeof status === 'number' && status >= 500) return 'provider-error';
   if (/timeout|timed out|econn|network/.test(reason)) return 'network-error';
   return 'unknown-error';
@@ -1935,6 +1937,40 @@ async function pdlProfileLookup({ linkedinUrl } = {}) {
   return { ok: true, profile, likelihood: (data && data.likelihood) || 0 };
 }
 
+function pdlEnrichStatusReason(status) {
+  if (status === 404) return 'PDL_ENRICH_NO_MATCH';
+  if (status === 429) return 'PDL_RATE_LIMITED';
+  if (status === 402) return 'PDL_CREDIT_OR_PAYMENT_BLOCKER';
+  if (typeof status === 'number' && status >= 500) return 'PDL_TEMPORARY_PROVIDER_ERROR';
+  if (typeof status === 'number' && status >= 400) return 'PDL_PROVIDER_REQUEST_REJECTED';
+  return 'PDL_PROVIDER_ERROR';
+}
+
+function pdlHasUsefulResolutionEvidence(rec = {}, linkedinUrl = '') {
+  const location = rec.location || {};
+  const hasLocation = !!(rec.location_country || rec.location_region || rec.location_state ||
+    location.country || location.region || location.state);
+  const hasCurrentJob = !!(rec.job_title || rec.job_company_name || rec.job_company_id ||
+    rec.title || rec.current_title || rec.current_company);
+  const exp = Array.isArray(rec.experience) ? rec.experience
+    : (Array.isArray(rec.experiences) ? rec.experiences : []);
+  const hasDatedExperience = exp.some(e => e && (e.start_date || e.end_date ||
+    e.starts_at || e.ends_at || e.start || e.end));
+  const hasProfileIdentifier = isLinkedInProfileUrl(linkedinUrl) || !!(rec.linkedin_url ||
+    rec.linkedin_username || rec.profile_url);
+  return hasLocation && (hasCurrentJob || hasDatedExperience || hasProfileIdentifier);
+}
+
+function pdlResolveIdentifiersFromName(name = '') {
+  const parts = String(name || '').trim().split(/\s+/).filter(Boolean);
+  const placeholderName = /^(unknown|n\/a|na|none|null|-)$/i;
+  if (parts.length < 2 || placeholderName.test(parts[0]) || placeholderName.test(parts[parts.length - 1]) ||
+    parts[0].toLowerCase() === parts[parts.length - 1].toLowerCase()) {
+    return { ok: false, reason: 'PDL_ENRICH_SKIPPED_INSUFFICIENT_IDENTIFIERS' };
+  }
+  return { ok: true, firstName: parts[0], lastName: parts[parts.length - 1] };
+}
+
 async function pdlProfileResolve({ firstName, lastName, companyName } = {}) {
   if (!isConfigured('pdl')) return { ok: false, reason: 'PDL_API_KEY missing', linkedinUrl: '' };
   if (!firstName || !lastName) return { ok: false, reason: 'first_name + last_name required', linkedinUrl: '' };
@@ -1948,14 +1984,20 @@ async function pdlProfileResolve({ firstName, lastName, companyName } = {}) {
     });
   } catch { return { ok: false, reason: 'PDL fetch error', linkedinUrl: '' }; }
   if (!res.ok) {
-    let raw = ''; try { raw = await res.text(); } catch {}
-    return { ok: false, reason: `PDL HTTP ${res.status}`, status: res.status, endpoint: '/v5/person/enrich', body: _pdlRedact(raw), linkedinUrl: '' };
+    const reason = pdlEnrichStatusReason(res.status);
+    if (res.status === 404) {
+      return { ok: true, reason, status: 404, endpoint: '/v5/person/enrich', linkedinUrl: '', noMatch: true };
+    }
+    return { ok: false, reason, status: res.status, endpoint: '/v5/person/enrich', linkedinUrl: '' };
   }
   const data = await res.json();
   // PDL returns { status, likelihood, data: { linkedin_url: "linkedin.com/in/..." | full url } }.
   const rec = (data && data.data) || {};
   let url = rec.linkedin_url || '';
   if (url && !/^https?:\/\//i.test(url)) url = `https://www.${url}`;
+  if (!pdlHasUsefulResolutionEvidence(rec, url)) {
+    return { ok: true, reason: 'PDL_ENRICH_THIN_MATCH', status: 200, endpoint: '/v5/person/enrich', linkedinUrl: '', thinMatch: true };
+  }
   return { ok: true, linkedinUrl: isLinkedInProfileUrl(url) ? url : '', likelihood: (data && data.likelihood) || 0 };
 }
 
@@ -3645,15 +3687,35 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
     //     first_name + last_name + company. On success, refresh identity
     //     verification → candidate flips to 'verified' / 'pdl-resolved' →
     //     enters final shortlist.
-    const apolloReviewCandidates = review.filter(c =>
-      c.source === 'Apollo' && !isLinkedInProfileUrl(c.linkedinUrl) && c.name
-    );
+    const apolloReviewCandidates = review.filter(c => {
+      const discovered = Array.isArray(c.discovered_by) ? c.discovered_by.map(normalizeProviderKey) : [];
+      return (c.source === 'Apollo' || c.sourceChannel === 'Apollo' ||
+        normalizeProviderKey(c.provider_of_record || '') === 'apollo' || discovered.includes('apollo')) &&
+        !isLinkedInProfileUrl(c.linkedinUrl) && c.name;
+    });
+    const markPdlEnrichNote = (reason) => {
+      const d = providerDiag(providerDiagnostics, 'pdl');
+      const clean = sanitizeProviderMessage(reason);
+      if (!d.skip_reason) d.skip_reason = clean;
+      if (!d.sanitized_error_message) d.sanitized_error_message = clean;
+    };
     // Parallel + capped at 15 to avoid Cloudflare 520 on /api/pipeline/run.
     await Promise.all(apolloReviewCandidates.slice(0, 15).map(async (c) => {
-      const parts = String(c.name || '').trim().split(/\s+/);
-      if (parts.length < 2) return;
-      const firstName = parts[0];
-      const lastName = parts[parts.length - 1];
+      const identifiers = pdlResolveIdentifiersFromName(c.name);
+      if (!identifiers.ok) {
+        markPdlEnrichNote(identifiers.reason);
+        addCandidateProviderTrace(c, {
+          provider: 'pdl',
+          stage: 'resolution',
+          called: false,
+          returned: false,
+          confidence: 'low',
+          sourceLabel: 'pdl:profile-resolve',
+          skip_reason: identifiers.reason,
+        });
+        return;
+      }
+      const { firstName, lastName } = identifiers;
       const companyName = (c.currentCompany || '').replace(/^@/, '');
       const resolved = await pdlProfileResolve({ firstName, lastName, companyName });
       if (resolved.ok && resolved.linkedinUrl) {
@@ -3671,6 +3733,17 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
         c.resolution_status = 'resolved';
         addCandidateProviderTrace(c, { provider: 'pdl', stage: 'resolution', called: true, returned: true, confidence: 'high', sourceLabel: 'pdl:profile-resolve' });
         applySourcingQualityGate(c, need);
+      } else if (resolved.noMatch || resolved.thinMatch) {
+        addCandidateProviderTrace(c, {
+          provider: 'pdl',
+          stage: 'resolution',
+          called: true,
+          returned: false,
+          confidence: 'low',
+          sourceLabel: 'pdl:profile-resolve',
+          skip_reason: resolved.reason || 'PDL_ENRICH_NO_MATCH',
+        });
+        markPdlEnrichNote(resolved.reason || 'PDL_ENRICH_NO_MATCH');
       } else if (!resolved.ok) {
         markProviderError(providerDiagnostics, 'pdl', resolved);
       }
@@ -4740,6 +4813,7 @@ module.exports = {
     pickReposForRole,
     pdlPersonSearch,
     pdlProfileLookup,
+    pdlResolveIdentifiersFromName,
     pdlProfileResolve,
     openaiParseCandidateItem,
     refineMatchScoresWithOpenAI,
