@@ -220,6 +220,7 @@ const {
   isStackOverflowUserUrl, isCredlyProfileUrl, isTryHackMeProfileUrl,
   isHackTheBoxProfileUrl, isWellfoundProfileUrl, isTrustedCandidateProfileUrl,
   VISIBILITY_STATE, applySourcingQualityGate, evaluateSourcingQuality,
+  isFirecrawlOnlyUnresolved, isGithubPrimaryEvidenceRole,
   sourcingRejectionStub,
 } = _internals;
 
@@ -1113,8 +1114,8 @@ async function main() {
   };
 
   const verifyNeed = createNeed({
-    companyId: coAllRej.id, title: 'GH Verify Role',
-    requiredSkills: ['Azure'], seniority: 'Mid', locationType: 'Remote', confirmed: true,
+    companyId: coAllRej.id, title: 'Detection Engineer',
+    requiredSkills: ['Azure', 'SIEM'], seniority: 'Mid', locationType: 'Remote', confirmed: true,
   });
   const verifyRunId = 'verify_run_' + Date.now().toString(36);
   const verifyScout = await runScout({ needId: verifyNeed.id, pipelineRunId: verifyRunId });
@@ -3504,6 +3505,48 @@ async function main() {
   assert(ghSocOnly.visibility_state !== VISIBILITY_STATE.VISIBLE &&
     ghSocOnly.reason_code === 'GITHUB_ONLY_WEAK_FOR_SOC',
     `GitHub-only SOC candidate does not satisfy mid-level gate alone (state=${ghSocOnly.visibility_state}, reason=${ghSocOnly.reason_code})`);
+
+  const mkGithubVerifiedFirecrawlOnly = (name) => findOrCreateCandidate({
+    name,
+    title: 'Security Engineer',
+    summary: 'Sigma and KQL detection engineering with SIEM content.',
+    skills: ['Sigma', 'KQL', 'SIEM'],
+    github: `https://github.com/${String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
+    sourceUrl: `https://github.com/${String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
+    source: 'GitHub',
+    sourceType: 'candidate_profile',
+    scoutReason: 'GitHub API verified type=User',
+    repositories: [{ name: 'sentinel-detection-rules', description: 'Sigma, YARA, KQL, Sentinel analytic rules' }],
+    workHistory: [work('Security Analyst', 18)],
+    scoutDecision: 'accepted',
+    discovered_by: ['firecrawl'],
+    provider_of_record: 'firecrawl',
+    resolved_by: [],
+    resolution_status: 'unresolved',
+    pipelineRunId: qualityRun,
+  });
+
+  assert(isGithubPrimaryEvidenceRole(detectionNeed) === true,
+    'Detection Engineer is a GitHub-primary-evidence role');
+  assert(isGithubPrimaryEvidenceRole(qualityNeed) === false,
+    'SOC Analyst is not a GitHub-primary-evidence role');
+
+  const ghFirecrawlDetection = mkGithubVerifiedFirecrawlOnly('GH Firecrawl Detection');
+  assert(isFirecrawlOnlyUnresolved(ghFirecrawlDetection, detectionNeed) === false,
+    'GitHub-verified Firecrawl-only Detection/SIEM candidate is exempt from unresolved review');
+  applySourcingQualityGate(ghFirecrawlDetection, detectionNeed);
+  assert(ghFirecrawlDetection.visibility_state === VISIBILITY_STATE.VISIBLE &&
+    ghFirecrawlDetection.reason_code !== 'FIRECRAWL_ONLY_UNRESOLVED',
+    `Detection/SIEM GitHub evidence remains allowed (state=${ghFirecrawlDetection.visibility_state}, reason=${ghFirecrawlDetection.reason_code})`);
+
+  const ghFirecrawlSoc = mkGithubVerifiedFirecrawlOnly('GH Firecrawl SOC');
+  assert(isFirecrawlOnlyUnresolved(ghFirecrawlSoc, qualityNeed) === true,
+    'GitHub-verified Firecrawl-only SOC candidate is not exempt from unresolved review');
+  applySourcingQualityGate(ghFirecrawlSoc, qualityNeed);
+  assert(ghFirecrawlSoc.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW &&
+    ghFirecrawlSoc.reason_code === 'FIRECRAWL_ONLY_UNRESOLVED' &&
+    isFinalShortlistEligible(ghFirecrawlSoc) === false,
+    `GitHub-only SOC candidate becomes NEEDS_REVIEW (state=${ghFirecrawlSoc.visibility_state}, reason=${ghFirecrawlSoc.reason_code})`);
 
   const beforeCount = DB.candidates.length;
   const hiddenReal = gateCandidate({
