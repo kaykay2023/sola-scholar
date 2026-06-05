@@ -1171,9 +1171,9 @@ async function main() {
   process.env.FIRECRAWL_API_KEY = 'test-firecrawl-key';
 
   STUB_APOLLO_PEOPLE = [
-    { id: 'ap1', name: 'Apollo Alice', title: 'Senior Cloud Security Engineer', city: 'Berlin', state: '', country: 'Germany', linkedin_url: 'https://www.linkedin.com/in/apollo-alice', email: 'alice@example.com', organization: { name: 'CloudCorp' }, headline: 'Sentinel KQL Azure' },
-    { id: 'ap2', name: 'Apollo Bob',   title: 'Detection Engineer',              linkedin_url: 'https://www.linkedin.com/in/apollo-bob',   email: '',                organization: { name: 'SOC Ltd' },    headline: 'SOC analyst KQL' },
-    { id: 'ap3', name: 'Apollo Charlie', title: 'SIEM Engineer',                 linkedin_url: 'https://www.linkedin.com/in/apollo-charlie', email: '',              organization: { name: 'SIEMCo' },     headline: 'Microsoft Sentinel IAM' },
+    { id: 'ap1', name: 'Apollo Alice', title: 'Senior Cloud Security Engineer', city: 'Berlin', state: '', country: 'Germany', linkedin_url: 'https://www.linkedin.com/in/apollo-alice', email: 'alice@example.com', organization: { name: 'CloudCorp' }, headline: 'Sentinel KQL Azure', employment_history: [{ title: 'Senior Cloud Security Engineer', organization: { name: 'CloudCorp' }, start_date: '2024-01-01', current: true }] },
+    { id: 'ap2', name: 'Apollo Bob',   title: 'Detection Engineer', city: 'Detroit', state: 'Michigan', country: 'United States', linkedin_url: 'https://www.linkedin.com/in/apollo-bob',   email: '',                organization: { name: 'SOC Ltd' },    headline: 'SOC analyst KQL', employment_history: [{ title: 'Detection Engineer', organization: { name: 'SOC Ltd' }, start_date: '2024-01-01', current: true }] },
+    { id: 'ap3', name: 'Apollo Charlie', title: 'SIEM Engineer', city: 'Ann Arbor', state: 'Michigan', country: 'United States', linkedin_url: 'https://www.linkedin.com/in/apollo-charlie', email: '',              organization: { name: 'SIEMCo' },     headline: 'Microsoft Sentinel IAM', employment_history: [{ title: 'SIEM Engineer', organization: { name: 'SIEMCo' }, start_date: '2024-01-01', current: true }] },
   ];
   STUB_FIRECRAWL_ITEMS = [
     // Duplicate of Apollo Bob → must NOT double-count
@@ -1274,7 +1274,7 @@ async function main() {
   process.env.FIRECRAWL_API_KEY = 'test-firecrawl-key';
   STUB_APOLLO_PEOPLE = [
     // Has real LinkedIn /in/ → accepted
-    { id: 'ap-real',    name: 'Real LinkedIn Person', title: 'Cloud Security Engineer', linkedin_url: 'https://www.linkedin.com/in/real-linkedin-person', email: '', organization: { name: 'RealCo' } },
+    { id: 'ap-real',    name: 'Real LinkedIn Person', title: 'Cloud Security Engineer', city: 'Detroit', state: 'Michigan', country: 'United States', linkedin_url: 'https://www.linkedin.com/in/real-linkedin-person', email: '', organization: { name: 'RealCo' }, employment_history: [{ title: 'Cloud Security Engineer', organization: { name: 'RealCo' }, start_date: '2024-01-01', current: true }] },
     // No linkedin_url at all → review
     { id: 'ap-nolink',  name: 'NoLink Person',        title: 'Security Engineer',       linkedin_url: '',                                                  email: 'nolink@example.com', organization: { name: 'NoLinkCo' } },
     // linkedin_url present but NOT a /in/ profile (e.g. company linkedin) → review
@@ -1323,6 +1323,105 @@ async function main() {
   assert(linkScout.acceptedCandidates === 1 && linkScout.needsScoutReview === 2,
     `Pool split: 1 accepted, 2 review (got ${linkScout.acceptedCandidates}/${linkScout.needsScoutReview})`);
 
+  // (h3) Apollo structured resolver: Apollo can resolve candidates when it
+  //      supplies structured location plus structured employment evidence, but
+  //      selected-market gating still controls client readiness.
+  const apolloWork = (title, company) => [{ title, organization: { name: company }, start_date: '2024-01-01', current: true }];
+  STUB_APOLLO_PEOPLE = [
+    {
+      id: 'ap-structured-mi', name: 'Apollo Structured Michigan', title: 'SOC Analyst',
+      city: 'Detroit', state: 'Michigan', country: 'United States',
+      linkedin_url: 'https://www.linkedin.com/in/apollo-structured-michigan', organization: { name: 'Blue Team Co' },
+      headline: 'SOC Analyst with Microsoft Sentinel, SIEM, KQL, and Incident Response', employment_history: apolloWork('SOC Analyst', 'Blue Team Co'),
+    },
+    {
+      id: 'ap-out-of-state', name: 'Apollo Texas Outside Market', title: 'SOC Analyst',
+      city: 'Austin', state: 'Texas', country: 'United States',
+      linkedin_url: 'https://www.linkedin.com/in/apollo-texas-outside-market', organization: { name: 'Texas SOC Co' },
+      headline: 'SOC Analyst with Microsoft Sentinel, SIEM, KQL, and Incident Response', employment_history: apolloWork('SOC Analyst', 'Texas SOC Co'),
+    },
+    {
+      id: 'ap-remote-only', name: 'Apollo Remote Only', title: 'SOC Analyst',
+      city: 'Remote', state: '', country: 'United States',
+      linkedin_url: 'https://www.linkedin.com/in/apollo-remote-only', organization: { name: 'Remote SOC Co' },
+      headline: 'Remote SOC Analyst with Microsoft Sentinel, SIEM, KQL, and Incident Response', employment_history: apolloWork('SOC Analyst', 'Remote SOC Co'),
+    },
+    {
+      id: 'ap-canada', name: 'Apollo Canada Outside Market', title: 'SOC Analyst',
+      city: 'Toronto', state: 'Ontario', country: 'Canada',
+      linkedin_url: 'https://www.linkedin.com/in/apollo-canada-outside-market', organization: { name: 'Canada SOC Co' },
+      headline: 'SOC Analyst with Microsoft Sentinel, SIEM, KQL, and Incident Response', employment_history: apolloWork('SOC Analyst', 'Canada SOC Co'),
+    },
+    {
+      id: 'ap-unknown-location', name: 'Apollo Unknown Location', title: 'SOC Analyst',
+      linkedin_url: 'https://www.linkedin.com/in/apollo-unknown-location', organization: { name: 'Unknown SOC Co' },
+      headline: 'SOC Analyst with Microsoft Sentinel and KQL', employment_history: apolloWork('SOC Analyst', 'Unknown SOC Co'),
+    },
+  ];
+  STUB_FIRECRAWL_ITEMS = [];
+  STUB_GH_SEARCH_USERS = { items: [] };
+  const apolloResolverNeed = createNeed({
+    companyId: coApollo.id,
+    title: 'SOC Analyst',
+    requiredSkills: ['Microsoft Sentinel', 'KQL', 'SIEM'],
+    seniority: 'Mid',
+    locationType: 'Hybrid',
+    location: 'Michigan',
+    confirmed: true,
+  });
+  const apolloResolverRunId = 'apollo_resolver_' + Date.now().toString(36);
+  await runScout({ needId: apolloResolverNeed.id, pipelineRunId: apolloResolverRunId });
+  const apolloStructured = DB.candidates.find(c => c.name === 'Apollo Structured Michigan' && c.pipelineRunId === apolloResolverRunId);
+  assert(apolloStructured && (apolloStructured.resolved_by || []).includes('apollo') && apolloStructured.resolution_status === 'resolved',
+    `Apollo structured MI candidate resolved by Apollo (resolved_by=${JSON.stringify(apolloStructured && apolloStructured.resolved_by)}, status=${apolloStructured && apolloStructured.resolution_status})`);
+  assert(apolloStructured && Array.isArray(apolloStructured.workHistory) && apolloStructured.workHistory.length === 1,
+    `Apollo structured employment persisted to workHistory (got ${JSON.stringify(apolloStructured && apolloStructured.workHistory)})`);
+  assert(apolloStructured && apolloStructured.visibility_state === VISIBILITY_STATE.VISIBLE,
+    `Apollo structured MI candidate can proceed through gates (state=${apolloStructured && apolloStructured.visibility_state}, reason=${apolloStructured && apolloStructured.reason_code})`);
+
+  const apolloTexas = DB.candidates.find(c => c.name === 'Apollo Texas Outside Market' && c.pipelineRunId === apolloResolverRunId);
+  assert(apolloTexas && (apolloTexas.resolved_by || []).includes('apollo') && apolloTexas.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW && apolloTexas.reason_code === 'LOCATION_OUTSIDE_SELECTED_MARKET' && apolloTexas.recoverable === true,
+    `Apollo Texas/out-of-state candidate for Michigan hybrid -> NEEDS_REVIEW/recoverable (state=${apolloTexas && apolloTexas.visibility_state}, reason=${apolloTexas && apolloTexas.reason_code})`);
+
+  const apolloRemoteOnly = DB.candidates.find(c => c.name === 'Apollo Remote Only' && c.pipelineRunId === apolloResolverRunId);
+  assert(apolloRemoteOnly && apolloRemoteOnly.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW && apolloRemoteOnly.reason_code === 'LOCATION_OUTSIDE_SELECTED_MARKET',
+    `Apollo remote-only candidate for Michigan hybrid is not client-ready (state=${apolloRemoteOnly && apolloRemoteOnly.visibility_state}, reason=${apolloRemoteOnly && apolloRemoteOnly.reason_code})`);
+
+  const apolloCanada = DB.candidates.find(c => c.name === 'Apollo Canada Outside Market' && c.pipelineRunId === apolloResolverRunId);
+  assert(apolloCanada && apolloCanada.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW && apolloCanada.reason_code === 'LOCATION_OUTSIDE_SELECTED_MARKET',
+    `Apollo non-US candidate for Michigan hybrid is not client-ready (state=${apolloCanada && apolloCanada.visibility_state}, reason=${apolloCanada && apolloCanada.reason_code})`);
+
+  const apolloUnknown = DB.candidates.find(c => c.name === 'Apollo Unknown Location' && c.pipelineRunId === apolloResolverRunId);
+  assert(apolloUnknown && !(apolloUnknown.resolved_by || []).includes('apollo') && apolloUnknown.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW && apolloUnknown.reason_code === 'APOLLO_STRUCTURED_RESOLUTION_REQUIRED',
+    `Apollo unknown/unresolved location -> NEEDS_REVIEW (state=${apolloUnknown && apolloUnknown.visibility_state}, reason=${apolloUnknown && apolloUnknown.reason_code})`);
+
+  const apolloResolverCands = DB.candidates.filter(c => c.pipelineRunId === apolloResolverRunId && c.source === 'Apollo');
+  const apolloClientReadyResolvedCount = apolloResolverCands.filter(c => (c.resolved_by || []).includes('apollo') && c.visibility_state === VISIBILITY_STATE.VISIBLE).length;
+  const apolloReviewCount = apolloResolverCands.filter(c => c.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW).length;
+  const apolloHiddenPurgedCount = apolloResolverCands.filter(c => [VISIBILITY_STATE.HIDDEN, VISIBILITY_STATE.PURGED].includes(c.visibility_state)).length;
+  assert(apolloResolverCands.length === apolloClientReadyResolvedCount + apolloReviewCount + apolloHiddenPurgedCount,
+    `Apollo discovered count equals client-ready resolved + review + hidden/purged (discovered=${apolloResolverCands.length}, resolved=${apolloClientReadyResolvedCount}, review=${apolloReviewCount}, hiddenPurged=${apolloHiddenPurgedCount})`);
+
+  STUB_APOLLO_PEOPLE = [{
+    id: 'ap-remote-us-texas', name: 'Apollo Remote Search Texas', title: 'SOC Analyst',
+    city: 'Austin', state: 'Texas', country: 'United States',
+    linkedin_url: 'https://www.linkedin.com/in/apollo-remote-search-texas', organization: { name: 'Remote Search Co' },
+    headline: 'SOC Analyst with Microsoft Sentinel, SIEM, KQL, and Incident Response', employment_history: apolloWork('SOC Analyst', 'Remote Search Co'),
+  }];
+  const apolloRemoteNeed = createNeed({
+    companyId: coApollo.id,
+    title: 'SOC Analyst',
+    requiredSkills: ['Microsoft Sentinel', 'KQL', 'SIEM'],
+    seniority: 'Mid',
+    locationType: 'Remote',
+    location: 'Remote US',
+    confirmed: true,
+  });
+  const apolloRemoteRunId = 'apollo_remote_market_' + Date.now().toString(36);
+  await runScout({ needId: apolloRemoteNeed.id, pipelineRunId: apolloRemoteRunId });
+  const apolloRemoteSearch = DB.candidates.find(c => c.name === 'Apollo Remote Search Texas' && c.pipelineRunId === apolloRemoteRunId);
+  assert(apolloRemoteSearch && apolloRemoteSearch.visibility_state === VISIBILITY_STATE.VISIBLE && apolloRemoteSearch.reason_code !== 'LOCATION_OUTSIDE_SELECTED_MARKET',
+    `Remote US search does not apply Michigan-only market gate (state=${apolloRemoteSearch && apolloRemoteSearch.visibility_state}, reason=${apolloRemoteSearch && apolloRemoteSearch.reason_code})`);
   // (i) expandRoleToTitles produces meaningful variants
   const titles = _internals.expandRoleToTitles('Azure Security Engineer');
   assert(titles.length >= 5, `expandRoleToTitles returns ≥5 variants for security role (got ${titles.length})`);
@@ -1382,7 +1481,7 @@ async function main() {
   STUB_APOLLO_PEOPLE = [
     { id: 'sp1', name: 'Spoof Person 1', title: 'Eng', linkedin_url: 'https://attacker.com/linkedin.com/in/spoof1', organization: { name: 'X' } },
     { id: 'sp2', name: 'Spoof Person 2', title: 'Eng', linkedin_url: 'http://evil.com/?u=linkedin.com/in/spoof2',   organization: { name: 'X' } },
-    { id: 'sp3', name: 'Real Person',    title: 'Cloud Security Engineer', linkedin_url: 'https://www.linkedin.com/in/real-li', organization: { name: 'RealCo' }, headline: 'Azure Sentinel KQL Defender for Cloud' },
+    { id: 'sp3', name: 'Real Person',    title: 'Cloud Security Engineer', city: 'Detroit', state: 'Michigan', country: 'United States', linkedin_url: 'https://www.linkedin.com/in/real-li', organization: { name: 'RealCo' }, headline: 'Azure Sentinel KQL Defender for Cloud', employment_history: [{ title: 'Cloud Security Engineer', organization: { name: 'RealCo' }, start_date: '2024-01-01', current: true }] },
   ];
   STUB_FIRECRAWL_ITEMS = [];
   STUB_GH_SEARCH_USERS = { items: [] };
@@ -1974,7 +2073,7 @@ async function main() {
   STUB_APOLLO_PEOPLE = () => {
     apolloCallCount++;
     if (apolloCallCount < 3) return [];
-    return [{ id: 'relaxed-apollo', name: 'Relaxed Apollo', title: 'Security Analyst', linkedin_url: 'https://www.linkedin.com/in/relaxed-apollo', organization: { name: 'RelaxedCo' }, headline: 'Azure Sentinel KQL' }];
+    return [{ id: 'relaxed-apollo', name: 'Relaxed Apollo', title: 'Security Analyst', city: 'Detroit', state: 'Michigan', country: 'United States', linkedin_url: 'https://www.linkedin.com/in/relaxed-apollo', organization: { name: 'RelaxedCo' }, headline: 'Azure Sentinel KQL', employment_history: [{ title: 'Security Analyst', organization: { name: 'RelaxedCo' }, start_date: '2024-01-01', current: true }] }];
   };
   STUB_FIRECRAWL_ITEMS = [];
   STUB_GH_SEARCH_USERS = { items: [] };
@@ -3201,8 +3300,10 @@ async function main() {
   process.env.HUNTER_API_KEY = 'commit-c-hunter-key';
   STUB_APOLLO_PEOPLE = [
     { id: 'hunter-target', name: 'Hunter Target', title: 'Security Engineer',
+      city: 'Detroit', state: 'Michigan', country: 'United States',
       linkedin_url: 'https://www.linkedin.com/in/hunter-target',
       organization: { name: 'HunterCo' },
+      employment_history: [{ title: 'Security Engineer', organization: { name: 'HunterCo' }, start_date: '2024-01-01', current: true }],
       // no email field
     },
   ];
