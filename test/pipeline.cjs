@@ -52,6 +52,10 @@ let STUB_FIRECRAWL_ITEMS = null;     // when set, /v1/search returns these as da
 let STUB_GH_SEARCH_USERS = null;     // when set, /search/users returns { items: [...] }
 let STUB_APOLLO_PEOPLE = null;       // when set, mixed_people/search returns { people: [...] }
 let STUB_APOLLO_HTTP = null;         // when set, mixed_people/search returns non-2xx with given status/body
+let STUB_APOLLO_MATCH = null;        // map/function for /api/v1/people/match
+let STUB_APOLLO_MATCH_HTTP = null;   // when set, people/match returns non-2xx
+const APOLLO_MATCH_CALLS = [];       // captured sanitized Match call markers
+let LAST_APOLLO_MATCH_BODY = null;   // last parsed JSON body sent to Apollo people/match
 let STUB_GH_CONTRIBUTORS = null;     // { 'owner/repo': [{login, type, html_url}] }
 let STUB_ADZUNA_RESULTS = null;      // { results: [...] }
 const GH_CONTRIB_CALLS = [];         // captured 'owner/repo' calls
@@ -143,6 +147,32 @@ global.fetch = async (url, opts) => {
     if (STUB_HUNTER_EMAIL) return mkRes({ data: { email: STUB_HUNTER_EMAIL } });
     return mkRes({ data: { email: null } });
   }
+  if (/api\.apollo\.io\/api\/v1\/people\/match/.test(u)) {
+    try { LAST_APOLLO_MATCH_BODY = opts && opts.body ? JSON.parse(opts.body) : null; }
+    catch { LAST_APOLLO_MATCH_BODY = null; }
+    APOLLO_MATCH_CALLS.push({
+      hasId: !!(LAST_APOLLO_MATCH_BODY && LAST_APOLLO_MATCH_BODY.id),
+      hasLinkedIn: !!(LAST_APOLLO_MATCH_BODY && LAST_APOLLO_MATCH_BODY.linkedin_url),
+      hasName: !!(LAST_APOLLO_MATCH_BODY && LAST_APOLLO_MATCH_BODY.name),
+      hasOrganizationName: !!(LAST_APOLLO_MATCH_BODY && LAST_APOLLO_MATCH_BODY.organization_name),
+    });
+    if (STUB_APOLLO_MATCH_HTTP) {
+      const body = STUB_APOLLO_MATCH_HTTP.body || {};
+      const txt = typeof body === 'string' ? body : JSON.stringify(body);
+      return {
+        ok: false,
+        status: STUB_APOLLO_MATCH_HTTP.status || 404,
+        json: async () => (typeof body === 'string' ? {} : body),
+        text: async () => txt,
+      };
+    }
+    const key = LAST_APOLLO_MATCH_BODY && (LAST_APOLLO_MATCH_BODY.id || LAST_APOLLO_MATCH_BODY.linkedin_url || LAST_APOLLO_MATCH_BODY.name);
+    const entry = typeof STUB_APOLLO_MATCH === 'function'
+      ? STUB_APOLLO_MATCH(LAST_APOLLO_MATCH_BODY)
+      : (STUB_APOLLO_MATCH && key ? STUB_APOLLO_MATCH[key] : null);
+    if (entry === null) return mkRes({ person: null }, 404);
+    return mkRes(entry || { person: null });
+  }
   if (/api\.apollo\.io\/v1\/mixed_people\/api_search/.test(u)) {
     // Capture outbound body for assertions on title-cap behavior.
     try { LAST_APOLLO_REQUEST_BODY = opts && opts.body ? JSON.parse(opts.body) : null; }
@@ -226,6 +256,8 @@ const {
   VISIBILITY_STATE, applySourcingQualityGate, evaluateSourcingQuality,
   isFirecrawlOnlyUnresolved, isGithubPrimaryEvidenceRole,
   sourcingRejectionStub,
+  apolloPeopleMatch, resolveApolloMaxEnrichPerRun, APOLLO_MATCH_DEFAULT_MAX_PER_RUN,
+  selectedMarketFromNeed, isApolloOutsideSelectedMarket,
 } = _internals;
 
 // NOTE: do NOT call loadDB() — it reassigns the module-internal `DB` binding
@@ -1392,7 +1424,7 @@ async function main() {
     `Apollo non-US candidate for Michigan hybrid is not client-ready (state=${apolloCanada && apolloCanada.visibility_state}, reason=${apolloCanada && apolloCanada.reason_code})`);
 
   const apolloUnknown = DB.candidates.find(c => c.name === 'Apollo Unknown Location' && c.pipelineRunId === apolloResolverRunId);
-  assert(apolloUnknown && !(apolloUnknown.resolved_by || []).includes('apollo') && apolloUnknown.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW && apolloUnknown.reason_code === 'APOLLO_STRUCTURED_RESOLUTION_REQUIRED',
+  assert(apolloUnknown && !(apolloUnknown.resolved_by || []).includes('apollo') && apolloUnknown.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW && ['APOLLO_STRUCTURED_RESOLUTION_REQUIRED', 'APOLLO_MATCH_NO_MATCH'].includes(apolloUnknown.reason_code),
     `Apollo unknown/unresolved location -> NEEDS_REVIEW (state=${apolloUnknown && apolloUnknown.visibility_state}, reason=${apolloUnknown && apolloUnknown.reason_code})`);
 
   const apolloResolverCands = DB.candidates.filter(c => c.pipelineRunId === apolloResolverRunId && c.source === 'Apollo');
@@ -1422,6 +1454,159 @@ async function main() {
   const apolloRemoteSearch = DB.candidates.find(c => c.name === 'Apollo Remote Search Texas' && c.pipelineRunId === apolloRemoteRunId);
   assert(apolloRemoteSearch && apolloRemoteSearch.visibility_state === VISIBILITY_STATE.VISIBLE && apolloRemoteSearch.reason_code !== 'LOCATION_OUTSIDE_SELECTED_MARKET',
     `Remote US search does not apply Michigan-only market gate (state=${apolloRemoteSearch && apolloRemoteSearch.visibility_state}, reason=${apolloRemoteSearch && apolloRemoteSearch.reason_code})`);
+
+  // (h4) Apollo Match enrichment: Search preview records get structural
+  //      location + employment via /api/v1/people/match, capped per run.
+  const preview = (id, name, title, company) => ({
+    id, name, title,
+    organization: { name: company },
+    has_city: true,
+    has_state: true,
+    has_country: true,
+  });
+  const matchedPerson = (id, name, title, company, city, state, country, linkedInSlug = id) => ({
+    person: {
+      id, name, title,
+      organization: { name: company },
+      city, state, country,
+      linkedin_url: `https://www.linkedin.com/in/${linkedInSlug}`,
+      employment_history: apolloWork(title, company),
+      headline: `${title} with Microsoft Sentinel, SIEM, KQL, and Incident Response`,
+    },
+  });
+
+  APOLLO_MATCH_CALLS.length = 0;
+  STUB_APOLLO_MATCH_HTTP = null;
+  STUB_APOLLO_PEOPLE = [
+    preview('ap-match-mi', 'Apollo Match Michigan', 'SOC Analyst', 'Match MI Co'),
+  ];
+  STUB_APOLLO_MATCH = {
+    'ap-match-mi': matchedPerson('ap-match-mi', 'Apollo Match Michigan', 'SOC Analyst', 'Match MI Co', 'Detroit', 'Michigan', 'United States', 'apollo-match-michigan'),
+  };
+  const apolloMatchNeed = createNeed({
+    companyId: coApollo.id,
+    title: 'SOC Analyst',
+    requiredSkills: ['Microsoft Sentinel', 'KQL', 'SIEM'],
+    seniority: 'Mid',
+    locationType: 'Hybrid',
+    location: 'Michigan',
+    confirmed: true,
+  });
+  const apolloMatchRun = 'apollo_match_success_' + Date.now().toString(36);
+  await runScout({ needId: apolloMatchNeed.id, pipelineRunId: apolloMatchRun, apolloMaxEnrichPerRun: 10 });
+  const apolloMatchMi = DB.candidates.find(c => c.name === 'Apollo Match Michigan' && c.pipelineRunId === apolloMatchRun);
+  assert(APOLLO_MATCH_CALLS.length === 1 && APOLLO_MATCH_CALLS[0].hasId === true,
+    `Apollo Match called once using Apollo id for preview candidate (calls=${JSON.stringify(APOLLO_MATCH_CALLS)})`);
+  assert(apolloMatchMi && (apolloMatchMi.resolved_by || []).includes('apollo') && apolloMatchMi.resolution_status === 'resolved',
+    `Apollo search preview + successful Match resolves candidate (resolved_by=${JSON.stringify(apolloMatchMi && apolloMatchMi.resolved_by)}, status=${apolloMatchMi && apolloMatchMi.resolution_status})`);
+  assert(apolloMatchMi && apolloMatchMi.visibility_state === VISIBILITY_STATE.VISIBLE,
+    `Apollo Match in-market enriched candidate is client-ready/VISIBLE (state=${apolloMatchMi && apolloMatchMi.visibility_state}, reason=${apolloMatchMi && apolloMatchMi.reason_code})`);
+  assert(apolloMatchMi && Array.isArray(apolloMatchMi.workHistory) && apolloMatchMi.workHistory.length === 1,
+    `Apollo Match employment_history persisted into workHistory (got ${JSON.stringify(apolloMatchMi && apolloMatchMi.workHistory)})`);
+
+  APOLLO_MATCH_CALLS.length = 0;
+  STUB_APOLLO_PEOPLE = [
+    preview('ap-match-tx', 'Apollo Match Texas', 'SOC Analyst', 'Match TX Co'),
+    preview('ap-match-mi-out', 'Apollo Match Michigan Out', 'SOC Analyst', 'Match MI Out Co'),
+  ];
+  STUB_APOLLO_MATCH = {
+    'ap-match-tx': matchedPerson('ap-match-tx', 'Apollo Match Texas', 'SOC Analyst', 'Match TX Co', 'Austin', 'Texas', 'United States', 'apollo-match-texas'),
+    'ap-match-mi-out': matchedPerson('ap-match-mi-out', 'Apollo Match Michigan Out', 'SOC Analyst', 'Match MI Out Co', 'Detroit', 'Michigan', 'United States', 'apollo-match-michigan-out'),
+  };
+  const apolloTexasNeed = createNeed({
+    companyId: coApollo.id,
+    title: 'SOC Analyst',
+    requiredSkills: ['Microsoft Sentinel', 'KQL', 'SIEM'],
+    seniority: 'Mid',
+    locationType: 'Hybrid',
+    location: 'Texas',
+    confirmed: true,
+  });
+  const apolloTexasRun = 'apollo_match_texas_' + Date.now().toString(36);
+  await runScout({ needId: apolloTexasNeed.id, pipelineRunId: apolloTexasRun, apolloMaxEnrichPerRun: 10 });
+  const matchTexas = DB.candidates.find(c => c.name === 'Apollo Match Texas' && c.pipelineRunId === apolloTexasRun);
+  const matchMichiganOut = DB.candidates.find(c => c.name === 'Apollo Match Michigan Out' && c.pipelineRunId === apolloTexasRun);
+  assert(matchTexas && matchTexas.visibility_state === VISIBILITY_STATE.VISIBLE,
+    `GENERALIZATION: Texas search allows enriched Texas candidate (state=${matchTexas && matchTexas.visibility_state}, reason=${matchTexas && matchTexas.reason_code})`);
+  assert(matchMichiganOut && matchMichiganOut.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW && matchMichiganOut.reason_code === 'LOCATION_OUTSIDE_SELECTED_MARKET',
+    `GENERALIZATION: Texas search blocks enriched Michigan candidate as NEEDS_REVIEW (state=${matchMichiganOut && matchMichiganOut.visibility_state}, reason=${matchMichiganOut && matchMichiganOut.reason_code})`);
+
+  STUB_APOLLO_PEOPLE = [
+    preview('ap-match-remote-local', 'Apollo Match Remote Local', 'SOC Analyst', 'Remote Local Co'),
+    preview('ap-match-uk-local', 'Apollo Match UK Local', 'SOC Analyst', 'UK Local Co'),
+  ];
+  STUB_APOLLO_MATCH = {
+    'ap-match-remote-local': matchedPerson('ap-match-remote-local', 'Apollo Match Remote Local', 'SOC Analyst', 'Remote Local Co', 'Remote', '', 'United States', 'apollo-match-remote-local'),
+    'ap-match-uk-local': matchedPerson('ap-match-uk-local', 'Apollo Match UK Local', 'SOC Analyst', 'UK Local Co', 'London', '', 'United Kingdom', 'apollo-match-uk-local'),
+  };
+  const apolloLocalRun = 'apollo_match_local_gate_' + Date.now().toString(36);
+  await runScout({ needId: apolloTexasNeed.id, pipelineRunId: apolloLocalRun, apolloMaxEnrichPerRun: 10 });
+  const remoteLocal = DB.candidates.find(c => c.name === 'Apollo Match Remote Local' && c.pipelineRunId === apolloLocalRun);
+  const ukLocal = DB.candidates.find(c => c.name === 'Apollo Match UK Local' && c.pipelineRunId === apolloLocalRun);
+  assert(remoteLocal && remoteLocal.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW && remoteLocal.reason_code === 'LOCATION_OUTSIDE_SELECTED_MARKET',
+    `Apollo Match remote-only candidate on local search is not client-ready (state=${remoteLocal && remoteLocal.visibility_state}, reason=${remoteLocal && remoteLocal.reason_code})`);
+  assert(ukLocal && ukLocal.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW && ukLocal.reason_code === 'LOCATION_OUTSIDE_SELECTED_MARKET',
+    `Apollo Match non-US candidate on local search is not client-ready (state=${ukLocal && ukLocal.visibility_state}, reason=${ukLocal && ukLocal.reason_code})`);
+
+  STUB_APOLLO_PEOPLE = [
+    preview('ap-match-remote-us', 'Apollo Match Remote US', 'SOC Analyst', 'Remote US Co'),
+  ];
+  STUB_APOLLO_MATCH = {
+    'ap-match-remote-us': matchedPerson('ap-match-remote-us', 'Apollo Match Remote US', 'SOC Analyst', 'Remote US Co', 'Austin', 'Texas', 'United States', 'apollo-match-remote-us'),
+  };
+  const apolloMatchRemoteNeed = createNeed({
+    companyId: coApollo.id,
+    title: 'SOC Analyst',
+    requiredSkills: ['Microsoft Sentinel', 'KQL', 'SIEM'],
+    seniority: 'Mid',
+    locationType: 'Remote',
+    location: 'Remote US',
+    confirmed: true,
+  });
+  const apolloMatchRemoteRun = 'apollo_match_remote_' + Date.now().toString(36);
+  await runScout({ needId: apolloMatchRemoteNeed.id, pipelineRunId: apolloMatchRemoteRun, apolloMaxEnrichPerRun: 10 });
+  const remoteUs = DB.candidates.find(c => c.name === 'Apollo Match Remote US' && c.pipelineRunId === apolloMatchRemoteRun);
+  assert(remoteUs && remoteUs.visibility_state === VISIBILITY_STATE.VISIBLE && remoteUs.reason_code !== 'LOCATION_OUTSIDE_SELECTED_MARKET',
+    `Remote/global search does not apply state market gate to Apollo Match candidate (state=${remoteUs && remoteUs.visibility_state}, reason=${remoteUs && remoteUs.reason_code})`);
+
+  STUB_APOLLO_PEOPLE = [preview('ap-match-none', 'Apollo Match No Match', 'SOC Analyst', 'No Match Co')];
+  STUB_APOLLO_MATCH = { 'ap-match-none': null };
+  const apolloNoMatchRun = 'apollo_match_no_match_' + Date.now().toString(36);
+  await runScout({ needId: apolloMatchNeed.id, pipelineRunId: apolloNoMatchRun, apolloMaxEnrichPerRun: 10 });
+  const noMatchApollo = DB.candidates.find(c => c.name === 'Apollo Match No Match' && c.pipelineRunId === apolloNoMatchRun);
+  assert(noMatchApollo && noMatchApollo.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW && noMatchApollo.reason_code === 'APOLLO_MATCH_NO_MATCH' && noMatchApollo.recoverable === true,
+    `Apollo Match 404/no-match stays NEEDS_REVIEW/recoverable (state=${noMatchApollo && noMatchApollo.visibility_state}, reason=${noMatchApollo && noMatchApollo.reason_code})`);
+
+  APOLLO_MATCH_CALLS.length = 0;
+  STUB_APOLLO_PEOPLE = [
+    preview('ap-cap-1', 'Apollo Cap One', 'SOC Analyst', 'Cap One Co'),
+    preview('ap-cap-2', 'Apollo Cap Two', 'SOC Analyst', 'Cap Two Co'),
+  ];
+  STUB_APOLLO_MATCH = {
+    'ap-cap-1': matchedPerson('ap-cap-1', 'Apollo Cap One', 'SOC Analyst', 'Cap One Co', 'Detroit', 'Michigan', 'United States', 'apollo-cap-one'),
+    'ap-cap-2': matchedPerson('ap-cap-2', 'Apollo Cap Two', 'SOC Analyst', 'Cap Two Co', 'Detroit', 'Michigan', 'United States', 'apollo-cap-two'),
+  };
+  const apolloCapRun = 'apollo_match_cap_' + Date.now().toString(36);
+  await runScout({ needId: apolloMatchNeed.id, pipelineRunId: apolloCapRun, apolloMaxEnrichPerRun: 1 });
+  const capOne = DB.candidates.find(c => c.name === 'Apollo Cap One' && c.pipelineRunId === apolloCapRun);
+  const capTwo = DB.candidates.find(c => c.name === 'Apollo Cap Two' && c.pipelineRunId === apolloCapRun);
+  const capCands = DB.candidates.filter(c => c.pipelineRunId === apolloCapRun && c.source === 'Apollo');
+  const capResolvedVisible = capCands.filter(c => (c.resolved_by || []).includes('apollo') && c.visibility_state === VISIBILITY_STATE.VISIBLE).length;
+  const capReview = capCands.filter(c => c.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW).length;
+  assert(APOLLO_MATCH_CALLS.length === 1,
+    `Apollo Match budget cap counts actual calls only (calls=${APOLLO_MATCH_CALLS.length})`);
+  assert(capOne && capOne.visibility_state === VISIBILITY_STATE.VISIBLE,
+    `Apollo Match first candidate under cap can resolve/VISIBLE (state=${capOne && capOne.visibility_state})`);
+  assert(capTwo && capTwo.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW && capTwo.reason_code === 'APOLLO_MATCH_QUEUED_BUDGET_CAP' && capTwo.recoverable === true,
+    `Apollo Match budget cap queues remaining candidate as recoverable NEEDS_REVIEW (state=${capTwo && capTwo.visibility_state}, reason=${capTwo && capTwo.reason_code})`);
+  assert(capCands.length === capResolvedVisible + capReview,
+    `Apollo Match discovered == resolved + review (zero lost; discovered=${capCands.length}, resolved=${capResolvedVisible}, review=${capReview})`);
+
+  assert(resolveApolloMaxEnrichPerRun(undefined) === APOLLO_MATCH_DEFAULT_MAX_PER_RUN,
+    `Apollo Match default per-run cap is ${APOLLO_MATCH_DEFAULT_MAX_PER_RUN}`);
+  STUB_APOLLO_MATCH = null;
+  STUB_APOLLO_MATCH_HTTP = null;
+
   // (i) expandRoleToTitles produces meaningful variants
   const titles = _internals.expandRoleToTitles('Azure Security Engineer');
   assert(titles.length >= 5, `expandRoleToTitles returns ≥5 variants for security role (got ${titles.length})`);
