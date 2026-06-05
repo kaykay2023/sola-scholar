@@ -258,40 +258,49 @@ const ProviderProvenance = ({candidate = {}}) => {
 
 const ProviderDiagnosticsTable = ({diagnostics = {}}) => {
   const rows = Object.entries(diagnostics || {});
+  const [open, setOpen] = React.useState(false);
   if (!rows.length) return null;
   return (
     <div className="border border-gray-100 rounded-xl overflow-hidden mb-4">
-      <div className="px-3 py-2 bg-gray-50 border-b border-gray-100">
-        <p className="text-xs font-bold text-gray-700 uppercase">Provider Diagnostics</p>
-      </div>
-      <div className="overflow-x-auto">
-        <table className="min-w-full text-[11px]">
-          <thead className="bg-white text-gray-500">
-            <tr>
-              {['Provider','Called?','Returned','Accepted','Visible','Hidden','Needs Review','Error / Skipped reason','Latency'].map(h => (
-                <th key={h} className="px-3 py-2 text-left font-semibold border-b border-gray-100 whitespace-nowrap">{h}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map(([key, d]) => (
-              <tr key={key} className="border-b border-gray-50 last:border-0">
-                <td className="px-3 py-2 font-semibold text-gray-700 whitespace-nowrap">{providerLabel(key)}</td>
-                <td className="px-3 py-2 text-gray-600">{d.was_called ? 'Yes' : 'No'}</td>
-                <td className="px-3 py-2 text-gray-600">{d.returned_count || 0}</td>
-                <td className="px-3 py-2 text-gray-600">{d.accepted_count || 0}</td>
-                <td className="px-3 py-2 text-gray-600">{d.visible_count || 0}</td>
-                <td className="px-3 py-2 text-gray-600">{d.hidden_count || 0}</td>
-                <td className="px-3 py-2 text-gray-600">{(d.needs_review_count || 0) + (d.needs_scout_review_count || 0)}</td>
-                <td className="px-3 py-2 text-gray-600 max-w-xs truncate" title={d.error ? d.sanitized_error_message : d.skip_reason}>
-                  {d.error ? `${d.error_type || 'error'}: ${d.sanitized_error_message || ''}` : (d.was_skipped ? d.skip_reason : '')}
-                </td>
-                <td className="px-3 py-2 text-gray-600 whitespace-nowrap">{d.latency_ms || 0} ms</td>
+      <button
+        type="button"
+        onClick={() => setOpen(v => !v)}
+        className="w-full px-3 py-2 bg-gray-50 border-b border-gray-100 flex items-center justify-between text-left hover:bg-gray-100"
+        aria-expanded={open}
+      >
+        <span className="text-xs font-bold text-gray-700 uppercase">Provider Diagnostics</span>
+        <span className="text-xs text-gray-500" aria-hidden="true">{open ? '▾' : '▸'}</span>
+      </button>
+      {open && (
+        <div className="overflow-x-auto">
+          <table className="min-w-full text-[11px]">
+            <thead className="bg-white text-gray-500">
+              <tr>
+                {['Provider','Called?','Returned','Accepted','Visible','Hidden','Needs Review','Error / Skipped reason','Latency'].map(h => (
+                  <th key={h} className="px-3 py-2 text-left font-semibold border-b border-gray-100 whitespace-nowrap">{h}</th>
+                ))}
               </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+            </thead>
+            <tbody>
+              {rows.map(([key, d]) => (
+                <tr key={key} className="border-b border-gray-50 last:border-0">
+                  <td className="px-3 py-2 font-semibold text-gray-700 whitespace-nowrap">{providerLabel(key)}</td>
+                  <td className="px-3 py-2 text-gray-600">{d.was_called ? 'Yes' : 'No'}</td>
+                  <td className="px-3 py-2 text-gray-600">{d.returned_count || 0}</td>
+                  <td className="px-3 py-2 text-gray-600">{d.accepted_count || 0}</td>
+                  <td className="px-3 py-2 text-gray-600">{d.visible_count || 0}</td>
+                  <td className="px-3 py-2 text-gray-600">{d.hidden_count || 0}</td>
+                  <td className="px-3 py-2 text-gray-600">{(d.needs_review_count || 0) + (d.needs_scout_review_count || 0)}</td>
+                  <td className="px-3 py-2 text-gray-600 max-w-xs truncate" title={d.error ? d.sanitized_error_message : d.skip_reason}>
+                    {d.error ? `${d.error_type || 'error'}: ${d.sanitized_error_message || ''}` : (d.was_skipped ? d.skip_reason : '')}
+                  </td>
+                  <td className="px-3 py-2 text-gray-600 whitespace-nowrap">{d.latency_ms || 0} ms</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 };
