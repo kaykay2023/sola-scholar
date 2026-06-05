@@ -58,6 +58,7 @@ const GH_CONTRIB_CALLS = [];         // captured 'owner/repo' calls
 let STUB_PDL_SEARCH = null;          // when set, /v5/person/search returns { data: [...] }
 let STUB_PDL_LOOKUP = null;          // when set, /v5/person/enrich?profile= returns { data: {...} }
 let STUB_PDL_RESOLVE = null;         // map: 'firstName lastName' → { data: { linkedin_url } } or null
+let STUB_PDL_RESOLVE_HTTP = null;    // when set, /v5/person/enrich resolve returns { status, body }
 let STUB_HUNTER_EMAIL = null;        // when set, hunter email-finder returns this string
 const PDL_CALLS = [];                // captured endpoint paths
 let LAST_PDL_SEARCH_BODY = null;     // last parsed JSON body sent to PDL /v5/person/search
@@ -120,6 +121,9 @@ global.fetch = async (url, opts) => {
       return mkRes(STUB_PDL_LOOKUP || { data: null });
     }
     PDL_CALLS.push('enrich/resolve');
+    if (STUB_PDL_RESOLVE_HTTP) {
+      return mkRes(STUB_PDL_RESOLVE_HTTP.body || {}, STUB_PDL_RESOLVE_HTTP.status || 200);
+    }
     const m = u.match(/first_name=([^&]+)&last_name=([^&]+)/);
     const key = m ? `${decodeURIComponent(m[1])} ${decodeURIComponent(m[2])}` : '';
     const entry = STUB_PDL_RESOLVE && STUB_PDL_RESOLVE[key];
@@ -2906,7 +2910,7 @@ async function main() {
   STUB_APOLLO_PEOPLE = null;
 
   // ── 31. Commit C — PDL module (Person Search + Resolve + Lookup) + Hunter on candidates ──
-  const { pdlPersonSearch, pdlProfileLookup, pdlProfileResolve } = _internals;
+  const { pdlPersonSearch, pdlProfileLookup, pdlProfileResolve, pdlResolveIdentifiersFromName } = _internals;
 
   // (a) PDL helpers DORMANT when PDL_API_KEY missing
   delete process.env.PDL_API_KEY;
@@ -3021,7 +3025,12 @@ async function main() {
     },
   ];
   STUB_PDL_RESOLVE = {
-    'Rescue Candidate': { data: { linkedin_url: 'linkedin.com/in/rescue-candidate' }, likelihood: 8 },
+    'Rescue Candidate': { data: {
+      linkedin_url: 'linkedin.com/in/rescue-candidate',
+      location_country: 'United States',
+      job_title: 'Security Engineer',
+      job_company_name: 'RescueCo',
+    }, likelihood: 8 },
   };
   const rescueNeed = createNeed({
     companyId: coApollo.id, title: 'Security Engineer',
@@ -3041,6 +3050,120 @@ async function main() {
     `Rescued candidate scoutDecision flipped from review → accepted`);
   assert(rescued && isFinalShortlistEligible(rescued) === true,
     `Rescued candidate IS final-shortlist eligible`);
+
+  // (d2) PDL Resolve guard — insufficient identifiers skip enrich, no noisy provider error.
+  STUB_PDL_SEARCH = { data: [] };
+  STUB_PDL_LOOKUP = null;
+  STUB_PDL_RESOLVE = {};
+  STUB_PDL_RESOLVE_HTTP = null;
+  PDL_CALLS.length = 0;
+  STUB_APOLLO_PEOPLE = [
+    { id: 'single-token-1', name: 'Mononym', title: 'Security Engineer',
+      organization: { name: 'SoloCo' },
+    },
+  ];
+  const singleTokenNeed = createNeed({
+    companyId: coApollo.id, title: 'Security Engineer',
+    requiredSkills: ['Azure'], seniority: 'Mid', locationType: 'Remote', confirmed: true,
+  });
+  const singleTokenRun = 'pdl_single_token_' + Date.now().toString(36);
+  const singleTokenScout = await runScout({ needId: singleTokenNeed.id, pipelineRunId: singleTokenRun });
+  const singleToken = DB.candidates.find(c => c.pipelineRunId === singleTokenRun && c.name === 'Mononym');
+  assert(!PDL_CALLS.includes('enrich/resolve'),
+    `single-token Apollo name does NOT call PDL enrich/resolve (calls=${JSON.stringify(PDL_CALLS)})`);
+  const singleTokenIdentifiers = pdlResolveIdentifiersFromName('Mononym');
+  assert(singleTokenIdentifiers.ok === false &&
+    singleTokenIdentifiers.reason === 'PDL_ENRICH_SKIPPED_INSUFFICIENT_IDENTIFIERS',
+    `single-token Apollo candidate records PDL_ENRICH_SKIPPED_INSUFFICIENT_IDENTIFIERS`);
+  assert(singleToken && singleToken.scoutDecision === 'review' &&
+    singleToken.resolution_status === 'unresolved' && isFinalShortlistEligible(singleToken) === false,
+    `single-token unresolved candidate stays in review/recoverable path`);
+  assert(singleTokenScout.providerDiagnostics.pdl.error === false,
+    `single-token PDL enrich skip does not mark provider failed`);
+
+  // (d3) PDL Resolve 404 — no match, not fatal, candidate stays review/recoverable.
+  STUB_PDL_SEARCH = { data: [] };
+  STUB_PDL_RESOLVE = {};
+  STUB_PDL_RESOLVE_HTTP = { status: 404, body: { error: 'not_found' } };
+  PDL_CALLS.length = 0;
+  STUB_APOLLO_PEOPLE = [
+    { id: 'no-match-1', name: 'No Match', title: 'Security Engineer',
+      organization: { name: 'NoMatchCo' },
+    },
+  ];
+  const noMatchNeed = createNeed({
+    companyId: coApollo.id, title: 'Security Engineer',
+    requiredSkills: ['Azure'], seniority: 'Mid', locationType: 'Remote', confirmed: true,
+  });
+  const noMatchRun = 'pdl_no_match_' + Date.now().toString(36);
+  const noMatchScout = await runScout({ needId: noMatchNeed.id, pipelineRunId: noMatchRun });
+  const noMatch = DB.candidates.find(c => c.pipelineRunId === noMatchRun && c.name === 'No Match');
+  assert(PDL_CALLS.includes('enrich/resolve'),
+    `two-token Apollo name calls PDL enrich/resolve for 404 no-match case`);
+  assert(noMatch && Array.isArray(noMatch.provider_trace) &&
+    noMatch.provider_trace.some(t => t.provider === 'pdl' && t.called === true &&
+      t.returned === false && t.skip_reason === 'PDL_ENRICH_NO_MATCH'),
+    `PDL 404 records PDL_ENRICH_NO_MATCH trace`);
+  assert(noMatch && noMatch.scoutDecision === 'review' &&
+    noMatch.resolution_status === 'unresolved' && isFinalShortlistEligible(noMatch) === false,
+    `PDL 404 no-match candidate remains NEEDS_REVIEW/recoverable`);
+  assert(noMatchScout.providerDiagnostics.pdl.error === false,
+    `PDL 404 no-match does not mark provider failed globally`);
+
+  // (d4) PDL Resolve 200 thin match — not structurally resolved.
+  STUB_PDL_SEARCH = { data: [] };
+  STUB_PDL_RESOLVE_HTTP = null;
+  STUB_PDL_RESOLVE = {
+    'Thin Match': { data: { linkedin_url: 'linkedin.com/in/thin-match' }, likelihood: 7 },
+  };
+  PDL_CALLS.length = 0;
+  STUB_APOLLO_PEOPLE = [
+    { id: 'thin-match-1', name: 'Thin Match', title: 'Security Engineer',
+      organization: { name: 'ThinCo' },
+    },
+  ];
+  const thinNeed = createNeed({
+    companyId: coApollo.id, title: 'Security Engineer',
+    requiredSkills: ['Azure'], seniority: 'Mid', locationType: 'Remote', confirmed: true,
+  });
+  const thinRun = 'pdl_thin_match_' + Date.now().toString(36);
+  const thinScout = await runScout({ needId: thinNeed.id, pipelineRunId: thinRun });
+  const thin = DB.candidates.find(c => c.pipelineRunId === thinRun && c.name === 'Thin Match');
+  assert(thin && !/linkedin\.com\/in\/thin-match/.test(thin.linkedinUrl || '') &&
+    thin.identityVerificationStatus !== 'verified' && thin.resolution_status === 'unresolved',
+    `PDL 200 thin match does not mark candidate resolved/verified`);
+  assert(thin && Array.isArray(thin.provider_trace) &&
+    thin.provider_trace.some(t => t.provider === 'pdl' && t.called === true &&
+      t.returned === false && t.skip_reason === 'PDL_ENRICH_THIN_MATCH'),
+    `PDL 200 thin match records PDL_ENRICH_THIN_MATCH`);
+  assert(thinScout.providerDiagnostics.pdl.error === false,
+    `PDL 200 thin match does not mark provider failed globally`);
+
+  // (d5) PDL Resolve non-200/non-404 classifications avoid unknown-error.
+  async function assertPdlResolveHttpClassification(status, reason, errorType) {
+    STUB_PDL_SEARCH = { data: [] };
+    STUB_PDL_RESOLVE = {};
+    STUB_PDL_RESOLVE_HTTP = { status, body: { error: reason } };
+    STUB_APOLLO_PEOPLE = [
+      { id: `pdl-http-${status}`, name: `Http ${status}`, title: 'Security Engineer',
+        organization: { name: `Http${status}Co` },
+      },
+    ];
+    const httpNeed = createNeed({
+      companyId: coApollo.id, title: 'Security Engineer',
+      requiredSkills: ['Azure'], seniority: 'Mid', locationType: 'Remote', confirmed: true,
+    });
+    const httpRun = `pdl_http_${status}_` + Date.now().toString(36);
+    const scout = await runScout({ needId: httpNeed.id, pipelineRunId: httpRun });
+    assert(scout.providerDiagnostics.pdl.error === true,
+      `PDL HTTP ${status} marks provider diagnostic error`);
+    assert(scout.providerDiagnostics.pdl.sanitized_error_message === reason,
+      `PDL HTTP ${status} sanitized reason is ${reason}`);
+    assert(scout.providerDiagnostics.pdl.error_type === errorType,
+      `PDL HTTP ${status} is classified as ${errorType}, not unknown-error`);
+  }
+  await assertPdlResolveHttpClassification(429, 'PDL_RATE_LIMITED', 'rate-limited');
+  await assertPdlResolveHttpClassification(500, 'PDL_TEMPORARY_PROVIDER_ERROR', 'provider-error');
 
   // (e) Profile Lookup — enriches accepted candidate with skills snapshot
   STUB_PDL_SEARCH = {
@@ -3099,6 +3222,7 @@ async function main() {
   STUB_PDL_SEARCH = null;
   STUB_PDL_LOOKUP = null;
   STUB_PDL_RESOLVE = null;
+  STUB_PDL_RESOLVE_HTTP = null;
   STUB_HUNTER_EMAIL = null;
   delete process.env.PDL_API_KEY;
   STUB_APOLLO_PEOPLE = null;
