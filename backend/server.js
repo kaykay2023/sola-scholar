@@ -519,6 +519,148 @@ function inferLocationTier(location = '', tiers = buildLocationTiers()) {
   return match || null;
 }
 
+const US_STATE_ALIASES = {
+  alabama: 'alabama', al: 'alabama',
+  alaska: 'alaska', ak: 'alaska',
+  arizona: 'arizona', az: 'arizona',
+  arkansas: 'arkansas', ar: 'arkansas',
+  california: 'california', ca: 'california',
+  colorado: 'colorado', co: 'colorado',
+  connecticut: 'connecticut', ct: 'connecticut',
+  delaware: 'delaware', de: 'delaware',
+  florida: 'florida', fl: 'florida',
+  georgia: 'georgia', ga: 'georgia',
+  hawaii: 'hawaii', hi: 'hawaii',
+  idaho: 'idaho', id: 'idaho',
+  illinois: 'illinois', il: 'illinois',
+  indiana: 'indiana', in: 'indiana',
+  iowa: 'iowa', ia: 'iowa',
+  kansas: 'kansas', ks: 'kansas',
+  kentucky: 'kentucky', ky: 'kentucky',
+  louisiana: 'louisiana', la: 'louisiana',
+  maine: 'maine', me: 'maine',
+  maryland: 'maryland', md: 'maryland',
+  massachusetts: 'massachusetts', ma: 'massachusetts',
+  michigan: 'michigan', mi: 'michigan',
+  minnesota: 'minnesota', mn: 'minnesota',
+  mississippi: 'mississippi', ms: 'mississippi',
+  missouri: 'missouri', mo: 'missouri',
+  montana: 'montana', mt: 'montana',
+  nebraska: 'nebraska', ne: 'nebraska',
+  nevada: 'nevada', nv: 'nevada',
+  'new hampshire': 'new hampshire', nh: 'new hampshire',
+  'new jersey': 'new jersey', nj: 'new jersey',
+  'new mexico': 'new mexico', nm: 'new mexico',
+  'new york': 'new york', ny: 'new york',
+  'north carolina': 'north carolina', nc: 'north carolina',
+  'north dakota': 'north dakota', nd: 'north dakota',
+  ohio: 'ohio', oh: 'ohio',
+  oklahoma: 'oklahoma', ok: 'oklahoma',
+  oregon: 'oregon', or: 'oregon',
+  pennsylvania: 'pennsylvania', pa: 'pennsylvania',
+  'rhode island': 'rhode island', ri: 'rhode island',
+  'south carolina': 'south carolina', sc: 'south carolina',
+  'south dakota': 'south dakota', sd: 'south dakota',
+  tennessee: 'tennessee', tn: 'tennessee',
+  texas: 'texas', tx: 'texas',
+  utah: 'utah', ut: 'utah',
+  vermont: 'vermont', vt: 'vermont',
+  virginia: 'virginia', va: 'virginia',
+  washington: 'washington', wa: 'washington',
+  'west virginia': 'west virginia', wv: 'west virginia',
+  wisconsin: 'wisconsin', wi: 'wisconsin',
+  wyoming: 'wyoming', wy: 'wyoming',
+  'district of columbia': 'district of columbia', dc: 'district of columbia',
+};
+const US_STATE_NAMES = Array.from(new Set(Object.values(US_STATE_ALIASES)))
+  .sort((a, b) => b.length - a.length);
+const US_STATE_ABBRS = Object.keys(US_STATE_ALIASES)
+  .filter(k => k.length === 2)
+  .sort();
+
+function compactLocationText(...parts) {
+  return parts
+    .filter(Boolean)
+    .map(p => String(p).trim())
+    .filter(Boolean)
+    .join(', ');
+}
+
+function normalizeLocationToken(value = '') {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function detectUsState(value = '') {
+  const low = normalizeLocationToken(value);
+  if (!low) return '';
+  for (const name of US_STATE_NAMES) {
+    if (new RegExp(`(^| )${name.replace(/ /g, ' ')}( |$)`).test(low)) return name;
+  }
+  for (const abbr of US_STATE_ABBRS) {
+    if (new RegExp(`(^| )${abbr}( |$)`).test(low)) return US_STATE_ALIASES[abbr];
+  }
+  return '';
+}
+
+function isUsCountry(value = '') {
+  return /^(united states|usa|us|u s|united states of america)$/i.test(normalizeLocationToken(value));
+}
+
+function isNonUsCountry(value = '') {
+  const low = normalizeLocationToken(value);
+  return !!low && !isUsCountry(low) && !/^(remote|global|worldwide|anywhere)$/.test(low);
+}
+
+function countryFromLocationText(value = '') {
+  const low = normalizeLocationToken(value);
+  if (!low) return '';
+  if (/(^| )(united states|usa|us|u s|united states of america)( |$)/.test(low)) return 'United States';
+  if (/(^| )(united kingdom|uk|great britain|england|scotland|wales)( |$)/.test(low)) return 'United Kingdom';
+  if (/(^| )canada( |$)/.test(low)) return 'Canada';
+  if (/(^| )germany( |$)/.test(low)) return 'Germany';
+  if (/(^| )france( |$)/.test(low)) return 'France';
+  if (/(^| )india( |$)/.test(low)) return 'India';
+  if (/(^| )australia( |$)/.test(low)) return 'Australia';
+  return '';
+}
+
+function selectedMarketFromNeed(need = {}) {
+  const location = String(need.location || '').trim();
+  const locationType = String(need.locationType || '').trim().toLowerCase();
+  const low = normalizeLocationToken(location);
+  if (!location) return { mode: 'none' };
+  if (/global|worldwide|anywhere/.test(low)) return { mode: 'global' };
+  if (/remote/.test(locationType) || /^remote( us)?$/.test(low) || /nationwide|united states|usa|^us$/.test(low)) {
+    return { mode: 'remote-us' };
+  }
+  const state = detectUsState(location);
+  const city = normalizeLocationToken(location
+    .replace(/\bhybrid\b/ig, '')
+    .replace(/\bremote\b/ig, '')
+    .split(',')
+    .map(part => part.trim())
+    .filter(part => part && !detectUsState(part) && !isUsCountry(part))
+    .join(' '));
+  return { mode: 'concrete', location, state, city };
+}
+
+function candidateLocationSnapshot(c = {}) {
+  const location = String(c.location || '').trim();
+  const state = detectUsState([c.state, c.location_state, c.location_region, location].filter(Boolean).join(' '));
+  const country = c.country || c.location_country || countryFromLocationText(location);
+  return {
+    location,
+    state,
+    country: String(country || '').trim(),
+    text: normalizeLocationToken(compactLocationText(c.city, c.state, c.country, location)),
+    remoteOnly: /\bremote\b/i.test(location) && !state,
+  };
+}
+
 function buildCandidateSearchExpansion(need = {}, { enabled = false } = {}) {
   const titleVariants = buildRankedTitleVariants(need.title || '');
   const locationTiers = buildLocationTiers(need);
@@ -1009,7 +1151,7 @@ function evaluateSourcingQuality(c = {}, need = {}) {
       isApolloUnresolvedCandidate(c)) {
     return {
       visibility_state: VISIBILITY_STATE.NEEDS_REVIEW,
-      reason_code: 'APOLLO_STRUCTURED_RESOLUTION_REQUIRED',
+      reason_code: apolloUnresolvedReason(c),
       signals_snapshot: {
         ...(result.signals_snapshot || {}),
         prior_reason_code: result.reason_code,
@@ -1032,19 +1174,30 @@ function isApolloCandidateRecord(c = {}) {
 
 function isApolloOutsideSelectedMarket(c = {}, need = {}) {
   if (!isApolloCandidateRecord(c)) return false;
-  const locationType = String(need.locationType || '').toLowerCase();
-  const requiredLocation = String(need.location || '').trim();
-  if (!requiredLocation || /remote/.test(locationType) || /^(remote|remote us|global|global remote|worldwide|anywhere)$/i.test(requiredLocation)) return false;
-  const candidateLocation = String(c.location || '').trim();
-  if (!candidateLocation) return false;
-  const low = candidateLocation.toLowerCase();
-  if (/\bremote\b/.test(low)) return true;
-  const requiredLow = requiredLocation.toLowerCase();
-  if (low.includes(requiredLow)) return false;
-  const tier = inferLocationTier(candidateLocation, buildLocationTiers(need));
-  if (!tier) return true;
-  const key = String(tier.key || '').toLowerCase();
-  return !(key === 'role-location' || key === 'detroit-hybrid' || key === 'michigan-hybrid');
+  const market = selectedMarketFromNeed(need);
+  if (market.mode === 'none' || market.mode === 'global') return false;
+  const candidate = candidateLocationSnapshot(c);
+  if (!candidate.location && !candidate.state && !candidate.country) return false;
+  if (market.mode === 'remote-us') {
+    return isNonUsCountry(candidate.country);
+  }
+  if (candidate.remoteOnly) return true;
+  if (isNonUsCountry(candidate.country)) return true;
+  if (market.state) return candidate.state !== market.state;
+  if (market.city) return !candidate.text.includes(market.city);
+  return false;
+}
+
+function apolloUnresolvedReason(c = {}) {
+  const traces = Array.isArray(c.provider_trace) ? c.provider_trace : [];
+  const reasons = traces
+    .filter(t => normalizeProviderKey(t.provider) === 'apollo' && t.stage === 'resolution')
+    .map(t => String(t.skip_reason || '').trim())
+    .filter(Boolean);
+  if (reasons.includes('APOLLO_MATCH_QUEUED_BUDGET_CAP')) return 'APOLLO_MATCH_QUEUED_BUDGET_CAP';
+  if (reasons.includes('APOLLO_MATCH_NO_MATCH')) return 'APOLLO_MATCH_NO_MATCH';
+  if (reasons.includes('APOLLO_MATCH_NO_STRUCTURED_DATA')) return 'APOLLO_MATCH_NO_STRUCTURED_DATA';
+  return 'APOLLO_STRUCTURED_RESOLUTION_REQUIRED';
 }
 
 function isApolloUnresolvedCandidate(c = {}) {
@@ -1615,6 +1768,99 @@ function apolloStructuredResolution(person = {}) {
     return { ok: false, reason: 'APOLLO_STRUCTURED_RESOLUTION_SKIPPED_INSUFFICIENT_DATA', workHistory: [] };
   }
   return { ok: true, city, state, country, currentTitle, currentCompany, workHistory };
+}
+
+const APOLLO_MATCH_DEFAULT_MAX_PER_RUN = 10;
+function resolveApolloMaxEnrichPerRun(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return APOLLO_MATCH_DEFAULT_MAX_PER_RUN;
+  return Math.max(0, Math.min(100, Math.floor(n)));
+}
+
+function apolloMatchIdentifier(person = {}) {
+  const body = {};
+  if (person.id) body.id = String(person.id);
+  else if (person.person_id) body.id = String(person.person_id);
+  else if (person.linkedin_url) body.linkedin_url = String(person.linkedin_url);
+  else if (person.linkedinUrl) body.linkedin_url = String(person.linkedinUrl);
+  else {
+    const name = person.name || `${person.first_name || ''} ${person.last_name || ''}`.trim();
+    const company = apolloOrgName(person.organization) || person.organization_name || person.company_name || person.current_company || '';
+    if (name) body.name = String(name);
+    if (company) body.organization_name = String(company);
+  }
+  return body;
+}
+
+function mergeApolloPerson(searchPerson = {}, matchedPerson = {}) {
+  if (!matchedPerson || typeof matchedPerson !== 'object') return searchPerson || {};
+  return {
+    ...(searchPerson || {}),
+    ...matchedPerson,
+    organization: matchedPerson.organization || searchPerson.organization,
+    employment_history: Array.isArray(matchedPerson.employment_history)
+      ? matchedPerson.employment_history
+      : searchPerson.employment_history,
+    employmentHistory: Array.isArray(matchedPerson.employmentHistory)
+      ? matchedPerson.employmentHistory
+      : searchPerson.employmentHistory,
+    experience: Array.isArray(matchedPerson.experience) ? matchedPerson.experience : searchPerson.experience,
+    positions: Array.isArray(matchedPerson.positions) ? matchedPerson.positions : searchPerson.positions,
+  };
+}
+
+function extractApolloMatchedPerson(data = {}) {
+  if (!data || typeof data !== 'object') return null;
+  if (data.person && typeof data.person === 'object') return data.person;
+  if (data.data && data.data.person && typeof data.data.person === 'object') return data.data.person;
+  if (data.data && typeof data.data === 'object') return data.data;
+  return null;
+}
+
+function isApolloAuthOrCreditStatus(status) {
+  return [401, 402, 403].includes(Number(status));
+}
+
+async function apolloPeopleMatch(person = {}) {
+  if (!isConfigured('apollo')) return { ok: false, matched: false, reason: 'APOLLO_API_KEY missing' };
+  const body = apolloMatchIdentifier(person);
+  if (!Object.keys(body).length) {
+    return { ok: true, matched: false, reason: 'APOLLO_MATCH_SKIPPED_INSUFFICIENT_IDENTIFIERS' };
+  }
+  const endpoint = '/api/v1/people/match';
+  const url = 'https://api.apollo.io/api/v1/people/match?reveal_personal_emails=false&reveal_phone_number=false&run_waterfall_email=false&run_waterfall_phone=false';
+  let res;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache', 'accept': 'application/json', 'X-Api-Key': process.env.APOLLO_API_KEY },
+      body: JSON.stringify(body),
+    });
+  } catch {
+    return { ok: false, matched: false, reason: 'APOLLO_MATCH_FETCH_ERROR', endpoint };
+  }
+  if (res.status === 404) return { ok: true, matched: false, reason: 'APOLLO_MATCH_NO_MATCH', endpoint, status: 404 };
+  if (!res.ok) {
+    let raw = '';
+    try { raw = await res.text(); } catch { raw = ''; }
+    const redacted = sanitizeProviderMessage(String(raw || '')
+      .replace(/(api[_-]?key|password|secret|token|bearer|authorization)\s*[:=]\s*["']?[A-Za-z0-9_\-.]+["']?/gi, '$1=<REDACTED>')
+      .replace(/\b[A-Za-z0-9_\-]{32,}\b/g, '<REDACTED-LONG-TOKEN>'))
+      .slice(0, 600);
+    return {
+      ok: false,
+      matched: false,
+      fatal: isApolloAuthOrCreditStatus(res.status),
+      reason: isApolloAuthOrCreditStatus(res.status) ? `APOLLO_MATCH_AUTH_OR_CREDIT_ERROR_${res.status}` : `APOLLO_MATCH_HTTP_${res.status}`,
+      status: res.status,
+      endpoint,
+      body: redacted,
+    };
+  }
+  const data = await res.json();
+  const matchedPerson = extractApolloMatchedPerson(data);
+  if (!matchedPerson) return { ok: true, matched: false, reason: 'APOLLO_MATCH_NO_MATCH', endpoint, status: res.status };
+  return { ok: true, matched: true, person: matchedPerson, endpoint, status: res.status };
 }
 // Apollo people search tuned for CANDIDATE sourcing (not hiring managers).
 // Accepts title variants + optional location/seniority/keyword filters.
@@ -3093,7 +3339,7 @@ function classifySourceItem({ title = '', url = '', description = '', source = '
   return { sourceType: 'unknown', scoutDecision: 'rejected', scoutReason: 'no candidate-like signal', sourceDomain };
 }
 
-async function runScout({ needId, pipelineRunId = null, expandCandidatePool = false } = {}) {
+async function runScout({ needId, pipelineRunId = null, expandCandidatePool = false, apolloMaxEnrichPerRun = APOLLO_MATCH_DEFAULT_MAX_PER_RUN } = {}) {
   const need = DB.hiring_needs.find(n => n.id === needId);
   if (!need) { await logActivity('Scout', 'Need not found', 'error'); return { sourced: 0, candidates: [], sourcedRaw: 0, acceptedCandidates: 0, needsScoutReview: 0, rejectedNonCandidates: 0, rejectedSamples: [] }; }
   if (!need.confirmed) { await logActivity('Scout', 'Need is not confirmed; confirm before sourcing', 'warn'); return { sourced: 0, candidates: [], sourcedRaw: 0, acceptedCandidates: 0, needsScoutReview: 0, rejectedNonCandidates: 0, rejectedSamples: [], reason: 'unconfirmed' }; }
@@ -3120,6 +3366,9 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
   const sourceQueryStats       = { apollo: [], firecrawl: [], github: [] };
   const providerDiagnostics    = initProviderRunDiagnostics();
   const candById = new Map(); // candidate.id -> first source tag (for dedupe attribution)
+  const apolloEnrichCap = resolveApolloMaxEnrichPerRun(apolloMaxEnrichPerRun);
+  let apolloEnrichCalls = 0;
+  let apolloMatchFatal = null;
   const recordCandidateByGate = (c, sourceTag) => {
     applySourcingQualityGate(c, need);
     if (c.visibility_state === VISIBILITY_STATE.VISIBLE && c.scoutDecision === 'accepted') {
@@ -3229,20 +3478,80 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
         const linkedinUrl = p.linkedin_url || '';
         // Strict host-anchored check. Rejects spoofed URLs like
         // `https://attacker.com/linkedin.com/in/jane` and LinkedIn /company/ pages.
-        const hasRealLinkedIn = isLinkedInProfileUrl(linkedinUrl);
-        const apolloResolution = apolloStructuredResolution(p);
-        const orgName = apolloOrgName(p.organization) || p.organization_name || p.company_name || '';
-        const loc = [apolloResolution.city || p.city, apolloResolution.state || p.state, apolloResolution.country || p.country].filter(Boolean).join(', ');
-        const summary = p.headline || p.title || '';
+        let apolloPerson = p;
+        let apolloResolution = apolloStructuredResolution(apolloPerson);
+        let apolloResolutionTrace = null;
+        if (!apolloResolution.ok) {
+          if (apolloEnrichCalls >= apolloEnrichCap) {
+            apolloResolutionTrace = {
+              provider: 'apollo',
+              stage: 'resolution',
+              called: false,
+              returned: false,
+              confidence: 'low',
+              sourceLabel: 'apollo:people-match',
+              skip_reason: 'APOLLO_MATCH_QUEUED_BUDGET_CAP',
+            };
+          } else {
+            apolloEnrichCalls++;
+            if (providerDiagnostics.apollo) providerDiagnostics.apollo.match_call_count = apolloEnrichCalls;
+            const matched = await apolloPeopleMatch(p);
+            if (!matched.ok) {
+              markProviderError(providerDiagnostics, 'apollo', matched);
+              await logActivity(
+                'Scout',
+                `Apollo Match stopped: ${matched.reason} endpoint=${matched.endpoint || '/api/v1/people/match'}`,
+                matched.fatal ? 'error' : 'warn',
+                { source: 'apollo', step: 'people-match', reason: matched.reason, status: matched.status || null, endpoint: matched.endpoint || '/api/v1/people/match' },
+              );
+              apolloResolutionTrace = {
+                provider: 'apollo',
+                stage: 'resolution',
+                called: true,
+                returned: false,
+                confidence: 'low',
+                sourceLabel: 'apollo:people-match',
+                skip_reason: matched.reason || 'APOLLO_MATCH_ERROR',
+              };
+              if (matched.fatal) apolloMatchFatal = matched;
+            } else if (!matched.matched) {
+              apolloResolutionTrace = {
+                provider: 'apollo',
+                stage: 'resolution',
+                called: true,
+                returned: false,
+                confidence: 'low',
+                sourceLabel: 'apollo:people-match',
+                skip_reason: matched.reason || 'APOLLO_MATCH_NO_MATCH',
+              };
+            } else {
+              apolloPerson = mergeApolloPerson(p, matched.person);
+              apolloResolution = apolloStructuredResolution(apolloPerson);
+              apolloResolutionTrace = apolloResolution.ok
+                ? { provider: 'apollo', stage: 'resolution', called: true, returned: true, confidence: 'high', sourceLabel: 'apollo:people-match' }
+                : { provider: 'apollo', stage: 'resolution', called: true, returned: false, confidence: 'low', sourceLabel: 'apollo:people-match', skip_reason: 'APOLLO_MATCH_NO_STRUCTURED_DATA' };
+            }
+          }
+        }
+        if (!apolloResolutionTrace) {
+          apolloResolutionTrace = apolloResolution.ok
+            ? { provider: 'apollo', stage: 'resolution', called: false, returned: true, confidence: 'high', sourceLabel: 'apollo:structured-candidate-data' }
+            : { provider: 'apollo', stage: 'resolution', called: false, returned: false, confidence: 'low', sourceLabel: 'apollo:structured-candidate-data', skip_reason: apolloResolution.reason };
+        }
+        const enrichedLinkedInUrl = apolloPerson.linkedin_url || linkedinUrl || '';
+        const hasEnrichedLinkedIn = isLinkedInProfileUrl(enrichedLinkedInUrl);
+        const orgName = apolloOrgName(apolloPerson.organization) || apolloPerson.organization_name || apolloPerson.company_name || '';
+        const loc = [apolloResolution.city || apolloPerson.city, apolloResolution.state || apolloPerson.state, apolloResolution.country || apolloPerson.country].filter(Boolean).join(', ');
+        const summary = apolloPerson.headline || apolloPerson.title || '';
         // Apollo results without a real LinkedIn /in/ URL go to the review
         // pool, NOT visible/accepted. Do not synthesize an `apollo://` URL —
         // visible candidates must carry a real profile link.
-        const sourceType    = hasRealLinkedIn ? 'candidate_profile' : 'possible_candidate';
-        const scoutDecision = hasRealLinkedIn ? 'accepted'          : 'review';
-        const scoutReason   = hasRealLinkedIn
+        const sourceType    = hasEnrichedLinkedIn ? 'candidate_profile' : 'possible_candidate';
+        const scoutDecision = hasEnrichedLinkedIn ? 'accepted'          : 'review';
+        const scoutReason   = hasEnrichedLinkedIn
           ? 'Apollo people search candidate result'
           : 'Apollo result missing real LinkedIn/profile URL — manual review';
-        const sourceDomain  = hasRealLinkedIn ? 'linkedin.com' : 'apollo.io';
+        const sourceDomain  = hasEnrichedLinkedIn ? 'linkedin.com' : 'apollo.io';
         // Apollo phone extraction — defensive across Apollo's varying response
         // shapes. Prefer the sanitized number on phone_numbers[0]; fall back
         // to raw_number, then top-level mobile_phone / corporate_phone.
@@ -3263,21 +3572,18 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
           profileText,
           expansionEnabled: !!attempt.expandCandidatePool,
         });
-        const apolloResolutionTrace = apolloResolution.ok
-          ? { provider: 'apollo', stage: 'resolution', called: false, returned: true, confidence: 'high', sourceLabel: 'apollo:structured-candidate-data' }
-          : { provider: 'apollo', stage: 'resolution', called: false, returned: false, confidence: 'low', sourceLabel: 'apollo:structured-candidate-data', skip_reason: apolloResolution.reason };
 
         const c = findOrCreateCandidate({
           name,
-          title: p.title || '',
+          title: apolloPerson.title || '',
           company: orgName,
           location: loc,
           summary,
-          skills: extractSkills(`${p.title || ''} ${summary}`),
+          skills: extractSkills(`${apolloPerson.title || ''} ${summary}`),
           email: (p.email && p.email.includes('@')) ? p.email : '',
           phone,
-          linkedinUrl: hasRealLinkedIn ? linkedinUrl : '',
-          sourceUrl: hasRealLinkedIn ? linkedinUrl : '',
+          linkedinUrl: hasEnrichedLinkedIn ? enrichedLinkedInUrl : '',
+          sourceUrl: hasEnrichedLinkedIn ? enrichedLinkedInUrl : '',
           source: 'Apollo',
           sourceType,
           scoutDecision,
@@ -3296,7 +3602,9 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
         });
         applyReviewMetadata(c, need, meta);
         recordCandidateByGate(c, 'apollo');
+        if (apolloMatchFatal) break;
       }
+      if (apolloMatchFatal) break;
       if (!expandCandidatePool) break;
     }
     markProviderFinished(providerDiagnostics, 'apollo');
@@ -4518,7 +4826,7 @@ function newPipelineRunId() {
   return 'run_' + Date.now().toString(36) + '_' + crypto.randomBytes(3).toString('hex');
 }
 
-async function runPipeline({ company, role, skills = [], location = '', seniority = 'Mid', expandCandidatePool = false }) {
+async function runPipeline({ company, role, skills = [], location = '', seniority = 'Mid', expandCandidatePool = false, apolloMaxEnrichPerRun = APOLLO_MATCH_DEFAULT_MAX_PER_RUN }) {
   const pipelineRunId = newPipelineRunId();
   console.log(`[pipeline] start runId=${pipelineRunId} role="${role}" company="${company}"`);
   await logActivity('Pipeline', `Pipeline start ${pipelineRunId}: ${role} @ ${company}`, 'running', { pipelineRunId });
@@ -4565,7 +4873,7 @@ async function runPipeline({ company, role, skills = [], location = '', seniorit
   result.steps.push({ step: 'need', needId: need.id });
 
   // 4. Source candidates (scoped by pipelineRunId; scout rejects job posts/blogs/docs)
-  const scout = await runScout({ needId: need.id, pipelineRunId, expandCandidatePool: !!expandCandidatePool });
+  const scout = await runScout({ needId: need.id, pipelineRunId, expandCandidatePool: !!expandCandidatePool, apolloMaxEnrichPerRun });
   result.steps.push({
     step: 'scout',
     sourcedRaw: scout.sourcedRaw,
@@ -4967,9 +5275,14 @@ module.exports = {
     pruneScoutStatsByRun,
     SCOUT_STATS_BY_RUN_CAP,
     apolloCandidateSearch,
+    apolloPeopleMatch,
+    resolveApolloMaxEnrichPerRun,
+    APOLLO_MATCH_DEFAULT_MAX_PER_RUN,
     expandRoleToTitles,
     normalizeApolloTitles,
     APOLLO_PERSON_TITLES_MAX,
+    selectedMarketFromNeed,
+    isApolloOutsideSelectedMarket,
     isLinkedInProfileUrl,
     isUsableGitHubProfileUrl,
     hasUsableProfileLink,
