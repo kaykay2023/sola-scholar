@@ -256,7 +256,7 @@ const {
   newPipelineRunId, hasReviewEvidence, tierFromScore, scoreCandidateAgainstNeed,
   classifySourceItem, generateClientReport, isLinkedInProfileUrl,
   isUsableGitHubProfileUrl, hasUsableProfileLink, isVisibleMatch,
-  isVerifiedGitHubProfile, isFinalShortlistEligible,
+  isVerifiedGitHubProfile, isFinalShortlistEligible, isClientReadyForNeed,
   scoreSourcedPage, buildApolloCandidateAttempts, buildFirecrawlProfileQueries,
   buildCandidateSearchExpansion, buildRankedTitleVariants, buildLocationTiers,
   extractProfileKeywordSignals, collectCandidateProfileLinks,
@@ -3852,7 +3852,24 @@ async function main() {
     locationType: 'Remote',
     confirmed: true,
   });
-  const qualityRun = 'quality_gate_' + Date.now().toString(36);
+  const michiganHybridNeed = createNeed({
+    companyId: coApollo.id,
+    title: 'SOC Analyst',
+    requiredSkills: ['Microsoft Sentinel', 'KQL', 'SIEM'],
+    seniority: 'Mid',
+    locationType: 'Hybrid',
+    location: 'Michigan hybrid',
+    confirmed: true,
+  });
+  const texasHybridNeed = createNeed({
+    companyId: coApollo.id,
+    title: 'SOC Analyst',
+    requiredSkills: ['Microsoft Sentinel', 'KQL', 'SIEM'],
+    seniority: 'Mid',
+    locationType: 'Hybrid',
+    location: 'Texas hybrid',
+    confirmed: true,
+  });  const qualityRun = 'quality_gate_' + Date.now().toString(36);
   const work = (title, months, opts = {}) => ({
     title,
     company: opts.company || 'SecurityCo',
@@ -3982,22 +3999,111 @@ async function main() {
     'SOC Analyst is not a GitHub-primary-evidence role');
 
   const ghFirecrawlDetection = mkGithubVerifiedFirecrawlOnly('GH Firecrawl Detection');
-  assert(isFirecrawlOnlyUnresolved(ghFirecrawlDetection, detectionNeed) === false,
-    'GitHub-verified Firecrawl-only Detection/SIEM candidate is exempt from unresolved review');
+  assert(isFirecrawlOnlyUnresolved(ghFirecrawlDetection, detectionNeed) === true,
+    'Firecrawl-only unresolved is identified independently of role type');
   applySourcingQualityGate(ghFirecrawlDetection, detectionNeed);
   assert(ghFirecrawlDetection.visibility_state === VISIBILITY_STATE.VISIBLE &&
-    ghFirecrawlDetection.reason_code !== 'FIRECRAWL_ONLY_UNRESOLVED',
-    `Detection/SIEM GitHub evidence remains allowed (state=${ghFirecrawlDetection.visibility_state}, reason=${ghFirecrawlDetection.reason_code})`);
+    ghFirecrawlDetection.reason_code !== 'FIRECRAWL_ONLY_UNRESOLVED_LOCAL_HYBRID',
+    `Remote Detection/SIEM GitHub evidence remains allowed (state=${ghFirecrawlDetection.visibility_state}, reason=${ghFirecrawlDetection.reason_code})`);
 
   const ghFirecrawlSoc = mkGithubVerifiedFirecrawlOnly('GH Firecrawl SOC');
-  assert(isFirecrawlOnlyUnresolved(ghFirecrawlSoc, qualityNeed) === true,
-    'GitHub-verified Firecrawl-only SOC candidate is not exempt from unresolved review');
-  applySourcingQualityGate(ghFirecrawlSoc, qualityNeed);
+  applySourcingQualityGate(ghFirecrawlSoc, michiganHybridNeed);
   assert(ghFirecrawlSoc.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW &&
-    ghFirecrawlSoc.reason_code === 'FIRECRAWL_ONLY_UNRESOLVED' &&
-    isFinalShortlistEligible(ghFirecrawlSoc) === false,
-    `GitHub-only SOC candidate becomes NEEDS_REVIEW (state=${ghFirecrawlSoc.visibility_state}, reason=${ghFirecrawlSoc.reason_code})`);
+    ghFirecrawlSoc.reason_code === 'FIRECRAWL_ONLY_UNRESOLVED_LOCAL_HYBRID' &&
+    isClientReadyForNeed(ghFirecrawlSoc, michiganHybridNeed) === false,
+    `Firecrawl-only unresolved Michigan hybrid candidate becomes NEEDS_REVIEW (state=${ghFirecrawlSoc.visibility_state}, reason=${ghFirecrawlSoc.reason_code})`);
 
+  const firecrawlTexas = mkGithubVerifiedFirecrawlOnly('GH Firecrawl Texas');
+  applySourcingQualityGate(firecrawlTexas, texasHybridNeed);
+  assert(firecrawlTexas.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW &&
+    firecrawlTexas.reason_code === 'FIRECRAWL_ONLY_UNRESOLVED_LOCAL_HYBRID' &&
+    isClientReadyForNeed(firecrawlTexas, texasHybridNeed) === false,
+    `Firecrawl-only unresolved Texas hybrid candidate becomes NEEDS_REVIEW (state=${firecrawlTexas.visibility_state}, reason=${firecrawlTexas.reason_code})`);
+
+  const mkApolloResolvedLocal = (name, state, need, city = state === 'Texas' ? 'Austin' : 'Detroit') => gateCandidate({
+    name,
+    title: 'SOC Analyst',
+    currentTitle: 'SOC Analyst',
+    currentCompany: 'SecurityCo',
+    skills: ['Microsoft Sentinel', 'KQL', 'SIEM'],
+    source: 'Apollo',
+    sourceType: 'candidate_profile',
+    provider_of_record: 'apollo',
+    discovered_by: ['apollo'],
+    resolved_by: ['apollo'],
+    resolution_status: 'resolved',
+    location: `${city}, ${state}, United States`,
+    city,
+    state,
+    country: 'United States',
+    workHistory: [work('SOC Analyst', 24)],
+  }, need);
+
+  const apolloMichigan = mkApolloResolvedLocal('Apollo Michigan Visible', 'Michigan', michiganHybridNeed);
+  assert(apolloMichigan.visibility_state === VISIBILITY_STATE.VISIBLE &&
+    isClientReadyForNeed(apolloMichigan, michiganHybridNeed) === true &&
+    (apolloMichigan.resolved_by || []).includes('apollo'),
+    `Apollo-resolved Michigan candidate is client-ready for Michigan hybrid (state=${apolloMichigan.visibility_state})`);
+
+  const apolloTexasForMichigan = mkApolloResolvedLocal('Apollo Texas Review', 'Texas', michiganHybridNeed);
+  assert(apolloTexasForMichigan.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW &&
+    apolloTexasForMichigan.reason_code === 'LOCATION_OUTSIDE_SELECTED_MARKET' &&
+    isClientReadyForNeed(apolloTexasForMichigan, michiganHybridNeed) === false,
+    `Apollo-resolved Texas candidate is review for Michigan hybrid (state=${apolloTexasForMichigan.visibility_state}, reason=${apolloTexasForMichigan.reason_code})`);
+
+  const apolloTexasVisible = mkApolloResolvedLocal('Apollo Texas Visible', 'Texas', texasHybridNeed);
+  assert(apolloTexasVisible.visibility_state === VISIBILITY_STATE.VISIBLE &&
+    isClientReadyForNeed(apolloTexasVisible, texasHybridNeed) === true,
+    `Apollo-resolved Texas candidate is client-ready for Texas hybrid (state=${apolloTexasVisible.visibility_state})`);
+
+  const liveGateRun = 'live_firecrawl_gate_' + Date.now().toString(36);
+  const liveNeed = createNeed({
+    companyId: coApollo.id,
+    title: 'SOC Analyst / Detection Analyst',
+    requiredSkills: ['Microsoft Sentinel', 'KQL', 'SIEM'],
+    seniority: 'Mid',
+    locationType: 'Hybrid',
+    location: 'Michigan hybrid',
+    confirmed: true,
+  });
+  const liveApollo = [
+    mkApolloResolvedLocal('Live Apollo Michigan One', 'Michigan', liveNeed),
+    mkApolloResolvedLocal('Live Apollo Michigan Two', 'Michigan', liveNeed),
+  ];
+  const liveFirecrawl = ['One', 'Two', 'Three', 'Four'].map(label => {
+    const c = mkGithubVerifiedFirecrawlOnly(`Live Firecrawl Only ${label}`);
+    c.pipelineRunId = liveGateRun;
+    applySourcingQualityGate(c, liveNeed);
+    return c;
+  });
+  const liveCandidates = [...liveApollo, ...liveFirecrawl];
+  liveApollo.forEach(c => { c.pipelineRunId = liveGateRun; });
+  liveCandidates.forEach((c, i) => createOrUpdateMatch({
+    needId: liveNeed.id,
+    candidateId: c.id,
+    pipelineRunId: liveGateRun,
+    score: 95 - i,
+    tier: 'Strong Match',
+    matchedSkills: ['SIEM', 'KQL'],
+    missingSkills: [],
+    reasoning: ['fixture'],
+    rank: i + 1,
+  }));
+  const liveVisibleMatches = DB.matches.filter(m =>
+    m.needId === liveNeed.id && m.pipelineRunId === liveGateRun && isVisibleMatch(m));
+  const liveReviewCandidates = liveCandidates.filter(c => c.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW);
+  assert(liveVisibleMatches.length === 2 && liveReviewCandidates.length === 4,
+    `live-case reproduction: 2 Apollo visible, 4 Firecrawl review (visible=${liveVisibleMatches.length}, review=${liveReviewCandidates.length})`);
+  assert(liveCandidates.length === liveVisibleMatches.length + liveReviewCandidates.length,
+    `live-case reproduction has zero lost candidates (discovered=${liveCandidates.length}, visible=${liveVisibleMatches.length}, review=${liveReviewCandidates.length})`);
+  const liveReport = await generateClientReport({ needId: liveNeed.id, pipelineRunId: liveGateRun });
+  const viewNames = liveVisibleMatches
+    .map(m => DB.candidates.find(c => c.id === m.candidateId)?.name || '')
+    .sort();
+  const reportNames = (liveReport.report?.candidates || []).map(c => c.name).sort();
+  assert(liveReport.ok && liveReport.report.visibleMatchCount === 2 &&
+    JSON.stringify(viewNames) === JSON.stringify(reportNames),
+    `View Matches and client report return the same client-ready set (view=${viewNames.join('|')}, report=${reportNames.join('|')})`);
   const beforeCount = DB.candidates.length;
   const hiddenReal = gateCandidate({
     name: 'Hidden Real Candidate',
@@ -4179,8 +4285,10 @@ async function main() {
     .sort((a, b) => b.score - a.score).map(x => x.id).join('|');
   assert(orderBefore === orderAfter,
     `Provider diagnostics do not change candidate ordering`);
-  assert(isFinalShortlistEligible(diagCandidate) === true,
-    `Provider diagnostics do not change verified-only filtering`);
+  assert(diagCandidate.identityVerificationStatus === 'verified' &&
+    isFinalShortlistEligible(diagCandidate) === false &&
+    isClientReadyForNeed(diagCandidate, diagNeed) === false,
+    `Provider diagnostics preserve identity verification while Firecrawl-only local/hybrid stays out of client-ready`);
 
   const frontendHtml = fs.readFileSync(path.join(__dirname, '..', 'backend', 'public', 'index.html'), 'utf8');
   assert(/ProviderDiagnosticsTable/.test(frontendHtml) && /Provider Diagnostics/.test(frontendHtml),
