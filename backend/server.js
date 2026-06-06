@@ -1122,7 +1122,7 @@ function sourcingSignalsSnapshot(c = {}, need = {}) {
     security_roles: securityRoles,
     current_security_signal: currentSecuritySignal,
     github_work_like_evidence: githubWorkLikeEvidence,
-    github_only_soc_signal: !!(isSocNeed(need) && (c.github || c.source === 'GitHub') && !collectWorkHistory(c).length),
+    github_only_soc_signal: !!(isSocNeed(need) && (c.github || c.source === 'GitHub') && !hasStructuralResolver(c)),
     negative_terms: negativeSignals,
     confidence_modifier: confidenceModifier,
     has_structured_work_history: hasStructuredWorkHistory,
@@ -1137,58 +1137,73 @@ function isRealCandidateLike(c = {}) {
   return false;
 }
 
-function evaluateSourcingQuality(c = {}, need = {}) {
-  const result = evaluateSourcingQualityBase(c, need);
-  if (result.visibility_state === VISIBILITY_STATE.VISIBLE &&
-      result.reason_code !== 'MANUAL_REVIEW_APPROVED' &&
-      isFirecrawlOnlyUnresolved(c, need)) {
-    return {
-      visibility_state: VISIBILITY_STATE.NEEDS_REVIEW,
-      reason_code: 'FIRECRAWL_ONLY_UNRESOLVED',
-      signals_snapshot: {
-        ...(result.signals_snapshot || {}),
-        prior_reason_code: result.reason_code,
-        provider_of_record: normalizeProviderKey(c.provider_of_record || ''),
-        resolution_status: c.resolution_status || 'unresolved',
-      },
-      recoverable: true,
-    };
-  }
-  if (result.visibility_state === VISIBILITY_STATE.VISIBLE &&
-      result.reason_code !== 'MANUAL_REVIEW_APPROVED' &&
-      isApolloOutsideSelectedMarket(c, need)) {
-    return {
-      visibility_state: VISIBILITY_STATE.NEEDS_REVIEW,
-      reason_code: 'LOCATION_OUTSIDE_SELECTED_MARKET',
-      signals_snapshot: {
-        ...(result.signals_snapshot || {}),
-        prior_reason_code: result.reason_code,
-        provider_of_record: normalizeProviderKey(c.provider_of_record || ''),
-        resolution_status: c.resolution_status || 'unresolved',
-        required_location: need.location || '',
-        candidate_location: c.location || '',
-      },
-      recoverable: true,
-    };
-  }
-  if (result.visibility_state === VISIBILITY_STATE.VISIBLE &&
-      result.reason_code !== 'MANUAL_REVIEW_APPROVED' &&
-      isApolloUnresolvedCandidate(c)) {
-    return {
-      visibility_state: VISIBILITY_STATE.NEEDS_REVIEW,
-      reason_code: apolloUnresolvedReason(c),
-      signals_snapshot: {
-        ...(result.signals_snapshot || {}),
-        prior_reason_code: result.reason_code,
-        provider_of_record: normalizeProviderKey(c.provider_of_record || ''),
-        resolution_status: c.resolution_status || 'unresolved',
-      },
-      recoverable: true,
-    };
-  }
-  return result;
+function hasStructuralResolver(c = {}) {
+  return (Array.isArray(c.resolved_by) ? c.resolved_by : [])
+    .map(normalizeProviderKey)
+    .some(p => p === 'apollo' || p === 'pdl');
 }
 
+function reviewGateResult(result = {}, c = {}, reasonCode = 'STRUCTURAL_RESOLUTION_REQUIRED', extra = {}) {
+  return {
+    visibility_state: VISIBILITY_STATE.NEEDS_REVIEW,
+    reason_code: reasonCode,
+    signals_snapshot: {
+      ...(result.signals_snapshot || sourcingSignalsSnapshot(c, {})),
+      prior_reason_code: result.reason_code || '',
+      provider_of_record: normalizeProviderKey(c.provider_of_record || ''),
+      resolution_status: c.resolution_status || 'unresolved',
+      ...extra,
+    },
+    recoverable: true,
+  };
+}
+
+function isOutsideSelectedMarket(c = {}, need = {}) {
+  const market = selectedMarketFromNeed(need);
+  if (market.mode === 'none' || market.mode === 'global') return false;
+  const candidate = candidateLocationSnapshot(c);
+  if (!candidate.location && !candidate.state && !candidate.country) return market.mode === 'concrete';
+  if (market.mode === 'remote-us') return isNonUsCountry(candidate.country);
+  if (candidate.remoteOnly) return true;
+  if (isNonUsCountry(candidate.country)) return true;
+  if (market.state) return candidate.state !== market.state;
+  if (market.city) return !candidate.text.includes(market.city);
+  return false;
+}
+
+function evaluateSourcingQuality(c = {}, need = {}) {
+  const result = evaluateSourcingQualityBase(c, need);
+  if (result.visibility_state !== VISIBILITY_STATE.VISIBLE || result.reason_code === 'MANUAL_REVIEW_APPROVED') {
+    return result;
+  }
+
+  const market = selectedMarketFromNeed(need);
+  const localHybridGateApplies = market.mode === 'concrete';
+  const structurallyResolved = hasStructuralResolver(c);
+  const signals = result.signals_snapshot || sourcingSignalsSnapshot(c, need);
+
+  if (localHybridGateApplies && !structurallyResolved) {
+    if (isFirecrawlOnlyUnresolved(c, need)) {
+      return reviewGateResult(result, c, 'FIRECRAWL_ONLY_UNRESOLVED_LOCAL_HYBRID');
+    }
+    if (isApolloUnresolvedCandidate(c)) {
+      return reviewGateResult(result, c, apolloUnresolvedReason(c));
+    }
+    if (signals.github_only_soc_signal && !signals.security_months_cumulative) {
+      return reviewGateResult(result, c, 'GITHUB_ONLY_WEAK_FOR_SOC');
+    }
+    return reviewGateResult(result, c, 'STRUCTURAL_RESOLUTION_REQUIRED');
+  }
+
+  if (structurallyResolved && isOutsideSelectedMarket(c, need)) {
+    return reviewGateResult(result, c, 'LOCATION_OUTSIDE_SELECTED_MARKET', {
+      required_location: need.location || '',
+      candidate_location: c.location || '',
+    });
+  }
+
+  return result;
+}
 function isApolloCandidateRecord(c = {}) {
   const provider = normalizeProviderKey(c.provider_of_record || '');
   const discovered = (Array.isArray(c.discovered_by) ? c.discovered_by : [])
@@ -1198,21 +1213,8 @@ function isApolloCandidateRecord(c = {}) {
 }
 
 function isApolloOutsideSelectedMarket(c = {}, need = {}) {
-  if (!isApolloCandidateRecord(c)) return false;
-  const market = selectedMarketFromNeed(need);
-  if (market.mode === 'none' || market.mode === 'global') return false;
-  const candidate = candidateLocationSnapshot(c);
-  if (!candidate.location && !candidate.state && !candidate.country) return false;
-  if (market.mode === 'remote-us') {
-    return isNonUsCountry(candidate.country);
-  }
-  if (candidate.remoteOnly) return true;
-  if (isNonUsCountry(candidate.country)) return true;
-  if (market.state) return candidate.state !== market.state;
-  if (market.city) return !candidate.text.includes(market.city);
-  return false;
+  return isApolloCandidateRecord(c) && isOutsideSelectedMarket(c, need);
 }
-
 function apolloUnresolvedReason(c = {}) {
   const traces = Array.isArray(c.provider_trace) ? c.provider_trace : [];
   const reasons = traces
@@ -1240,23 +1242,8 @@ function isFirecrawlOnlyUnresolved(c = {}, need = {}) {
     .filter(Boolean);
   const firecrawlOnly = provider === 'firecrawl' ||
     (discovered.length > 0 && discovered.every(p => p === 'firecrawl'));
-  if (!firecrawlOnly) return false;
-
-  const ghUrls = [c.github, c.sourceUrl, c.portfolioUrl, c.linkedinUrl].filter(Boolean);
-  const githubVerified = c.source === 'GitHub' ||
-    isVerifiedGitHubProfile(c) ||
-    (/GitHub API verified type=User/i.test(c.scoutReason || '') && ghUrls.some(isUsableGitHubProfileUrl));
-  if (!githubVerified) return false;
-  if (githubVerified && isGithubPrimaryEvidenceRole(need)) return false;
-
-  const resolvedByStructuredProvider = (Array.isArray(c.resolved_by) ? c.resolved_by : [])
-    .map(normalizeProviderKey)
-    .some(p => p === 'apollo' || p === 'pdl');
-  if (resolvedByStructuredProvider) return false;
-  if (c.resolution_status === 'resolved') return false;
-  return true;
+  return firecrawlOnly && !hasStructuralResolver(c);
 }
-
 function evaluateSourcingQualityBase(c = {}, need = {}) {
   const signals = sourcingSignalsSnapshot(c, need);
   if (c.manualVisibilityApproval || c.visibility_override === VISIBILITY_STATE.VISIBLE) {
@@ -1275,7 +1262,7 @@ function evaluateSourcingQualityBase(c = {}, need = {}) {
     return { visibility_state: VISIBILITY_STATE.HIDDEN, reason_code: 'NO_SECURITY_WORK_HISTORY', signals_snapshot: signals, recoverable: true };
   }
   if (signals.github_only_soc_signal && !signals.security_months_cumulative) {
-    return { visibility_state: VISIBILITY_STATE.HIDDEN, reason_code: 'GITHUB_ONLY_WEAK_FOR_SOC', signals_snapshot: signals, recoverable: true };
+    return { visibility_state: VISIBILITY_STATE.NEEDS_REVIEW, reason_code: 'GITHUB_ONLY_WEAK_FOR_SOC', signals_snapshot: signals, recoverable: true };
   }
   if (signals.security_months_cumulative >= 12 && signals.most_recent_security_role_within_3y) {
     return { visibility_state: VISIBILITY_STATE.VISIBLE, reason_code: 'MID_SECURITY_EXPERIENCE_PASS', signals_snapshot: signals, recoverable: false };
@@ -3163,6 +3150,13 @@ function isFinalShortlistEligible(c) {
   return false;
 }
 
+function isClientReadyForNeed(c, need = {}) {
+  if (!isFinalShortlistEligible(c)) return false;
+  const market = selectedMarketFromNeed(need);
+  if (market.mode !== 'concrete') return true;
+  return evaluateSourcingQuality(c, need).visibility_state === VISIBILITY_STATE.VISIBLE;
+}
+
 // Single source of truth for "is this match currently visible?".
 // Applied to: runMatchmaker visible count, /api/matches default, dashboard
 // matches_visible stat, and client report match filter.
@@ -3176,7 +3170,8 @@ function isVisibleMatch(m) {
   if (!m) return false;
   if (m.tier === 'Drop') return false;
   const c = DB.candidates.find(x => x.id === m.candidateId);
-  return isFinalShortlistEligible(c);
+  const need = DB.hiring_needs.find(n => n.id === m.needId);
+  return isClientReadyForNeed(c, need);
 }
 
 function refreshProviderDiagnosticsCounts(diags, { pipelineRunId = null, needId = null } = {}) {
@@ -4589,7 +4584,7 @@ async function runMatchmaker({ needId, pipelineRunId = null } = {}) {
   // Single source of truth: isFinalShortlistEligible. Anything failing the
   // central gate (review/rejected/demo/null scoutDecision OR no LinkedIn /in/
   // and no verified GitHub user) stays out of the pool.
-  const pool = allInRun.filter(isFinalShortlistEligible);
+  const pool = allInRun.filter(c => isClientReadyForNeed(c, need));
   const reviewPoolSize = allInRun.length - pool.length;
   if (!pool.length) {
     await logActivity(
@@ -5348,6 +5343,10 @@ module.exports = {
     providerProvenanceMetadata,
     addCandidateProviderTrace,
     isFinalShortlistEligible,
+    isClientReadyForNeed,
+    hasStructuralResolver,
     isVisibleMatch,
   },
 };
+
+
