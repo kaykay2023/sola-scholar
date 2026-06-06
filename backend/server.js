@@ -648,6 +648,31 @@ function selectedMarketFromNeed(need = {}) {
   return { mode: 'concrete', location, state, city };
 }
 
+function apolloSearchLocationFromNeed(need = {}) {
+  const market = selectedMarketFromNeed(need);
+  if (market.mode === 'global') return [];
+  if (market.mode === 'remote-us') return ['United States'];
+  if (market.mode !== 'concrete') return [];
+  const raw = String(need.location || '')
+    .replace(/\b(hybrid|remote|onsite|on-site|in[-\s]?office)\b/ig, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!raw) return [];
+  if (market.state) {
+    const stateName = market.state.replace(/\b\w/g, ch => ch.toUpperCase());
+    const city = market.city
+      ? market.city.replace(/\b\w/g, ch => ch.toUpperCase())
+      : '';
+    return [`${city ? `${city}, ` : ''}${stateName}, US`];
+  }
+  const cleaned = raw
+    .replace(/\b(united states|usa|us|u s|united states of america)\b/ig, '')
+    .replace(/,+/g, ',')
+    .replace(/(^,|,$)/g, '')
+    .trim();
+  return cleaned ? [`${cleaned}, US`] : [];
+}
+
 function candidateLocationSnapshot(c = {}) {
   const location = String(c.location || '').trim();
   const state = detectUsState([c.state, c.location_state, c.location_region, location].filter(Boolean).join(' '));
@@ -1770,7 +1795,7 @@ function apolloStructuredResolution(person = {}) {
   return { ok: true, city, state, country, currentTitle, currentCompany, workHistory };
 }
 
-const APOLLO_MATCH_DEFAULT_MAX_PER_RUN = 10;
+const APOLLO_MATCH_DEFAULT_MAX_PER_RUN = 25;
 function resolveApolloMaxEnrichPerRun(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return APOLLO_MATCH_DEFAULT_MAX_PER_RUN;
@@ -2016,16 +2041,27 @@ function buildApolloCandidateAttempts(need, { expandCandidatePool = false } = {}
   const expandedTitles = expandRoleToTitles(role);
   const roleOnly = role ? [role] : expandedTitles.slice(0, 1);
   const broadTitles = uniqStrings([...expandedTitles, ...BROAD_SECURITY_TITLES], 20);
-  const locations = need?.location && !/^remote$/i.test(need.location) ? [need.location] : [];
+  const locations = apolloSearchLocationFromNeed(need);
+  const isConcreteMarket = selectedMarketFromNeed(need).mode === 'concrete';
   const expansion = buildCandidateSearchExpansion(need, { enabled: expandCandidatePool });
   let attempts = [
     { label: 'focused-title-primary-skill', titles: expandedTitles, keywords: primarySkill, locations },
     { label: 'focused-title-top-skills', titles: expandedTitles, keywords: topSkills, locations },
     { label: 'focused-title-only', titles: expandedTitles, keywords: '', locations },
-    { label: 'role-title-only-no-location', titles: roleOnly, keywords: '', locations: [] },
-    { label: 'expanded-related-titles', titles: broadTitles, keywords: primarySkill, locations: [] },
-    { label: 'expanded-related-title-only', titles: broadTitles, keywords: '', locations: [] },
   ];
+  if (!isConcreteMarket) {
+    attempts.push(
+      { label: 'role-title-only-no-location', titles: roleOnly, keywords: '', locations: [] },
+      { label: 'expanded-related-titles', titles: broadTitles, keywords: primarySkill, locations: [] },
+      { label: 'expanded-related-title-only', titles: broadTitles, keywords: '', locations: [] },
+    );
+  } else {
+    attempts.push(
+      { label: 'role-title-only-located', titles: roleOnly, keywords: '', locations },
+      { label: 'expanded-related-titles-located', titles: broadTitles, keywords: primarySkill, locations },
+      { label: 'expanded-related-title-only-located', titles: broadTitles, keywords: '', locations },
+    );
+  }
   attempts = attempts.map(a => ({
     ...a,
     searchVariantMeta: (a.titles || []).map(t => {
@@ -5278,6 +5314,7 @@ module.exports = {
     apolloPeopleMatch,
     resolveApolloMaxEnrichPerRun,
     APOLLO_MATCH_DEFAULT_MAX_PER_RUN,
+    apolloSearchLocationFromNeed,
     expandRoleToTitles,
     normalizeApolloTitles,
     APOLLO_PERSON_TITLES_MAX,

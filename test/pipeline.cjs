@@ -55,6 +55,7 @@ let STUB_APOLLO_HTTP = null;         // when set, mixed_people/search returns no
 let STUB_APOLLO_MATCH = null;        // map/function for /api/v1/people/match
 let STUB_APOLLO_MATCH_HTTP = null;   // when set, people/match returns non-2xx
 const APOLLO_MATCH_CALLS = [];       // captured sanitized Match call markers
+const APOLLO_SEARCH_CALLS = [];      // captured sanitized Search request bodies
 let LAST_APOLLO_MATCH_BODY = null;   // last parsed JSON body sent to Apollo people/match
 let STUB_GH_CONTRIBUTORS = null;     // { 'owner/repo': [{login, type, html_url}] }
 let STUB_ADZUNA_RESULTS = null;      // { results: [...] }
@@ -177,6 +178,15 @@ global.fetch = async (url, opts) => {
     // Capture outbound body for assertions on title-cap behavior.
     try { LAST_APOLLO_REQUEST_BODY = opts && opts.body ? JSON.parse(opts.body) : null; }
     catch { LAST_APOLLO_REQUEST_BODY = null; }
+    APOLLO_SEARCH_CALLS.push({
+      person_locations: Array.isArray(LAST_APOLLO_REQUEST_BODY && LAST_APOLLO_REQUEST_BODY.person_locations)
+        ? LAST_APOLLO_REQUEST_BODY.person_locations.slice()
+        : [],
+      q_keywords: LAST_APOLLO_REQUEST_BODY && LAST_APOLLO_REQUEST_BODY.q_keywords || '',
+      titleCount: Array.isArray(LAST_APOLLO_REQUEST_BODY && LAST_APOLLO_REQUEST_BODY.person_titles)
+        ? LAST_APOLLO_REQUEST_BODY.person_titles.length
+        : 0,
+    });
     LAST_APOLLO_REQUEST_HEADERS = {};
     const h = (opts && opts.headers) || {};
     if (typeof h.forEach === 'function') {
@@ -256,7 +266,7 @@ const {
   VISIBILITY_STATE, applySourcingQualityGate, evaluateSourcingQuality,
   isFirecrawlOnlyUnresolved, isGithubPrimaryEvidenceRole,
   sourcingRejectionStub,
-  apolloPeopleMatch, resolveApolloMaxEnrichPerRun, APOLLO_MATCH_DEFAULT_MAX_PER_RUN,
+  apolloPeopleMatch, resolveApolloMaxEnrichPerRun, APOLLO_MATCH_DEFAULT_MAX_PER_RUN, apolloSearchLocationFromNeed,
   selectedMarketFromNeed, isApolloOutsideSelectedMarket,
 } = _internals;
 
@@ -1475,7 +1485,21 @@ async function main() {
     },
   });
 
+  assert(JSON.stringify(apolloSearchLocationFromNeed({ location: 'Michigan hybrid', locationType: 'Hybrid' })) === JSON.stringify(['Michigan, US']),
+    `Apollo location strips hybrid work mode for Michigan (got ${JSON.stringify(apolloSearchLocationFromNeed({ location: 'Michigan hybrid', locationType: 'Hybrid' }))})`);
+  assert(JSON.stringify(apolloSearchLocationFromNeed({ location: 'Texas hybrid', locationType: 'Hybrid' })) === JSON.stringify(['Texas, US']),
+    `Apollo location strips hybrid work mode for Texas (got ${JSON.stringify(apolloSearchLocationFromNeed({ location: 'Texas hybrid', locationType: 'Hybrid' }))})`);
+  assert(JSON.stringify(apolloSearchLocationFromNeed({ location: 'Detroit onsite', locationType: 'Onsite' })) === JSON.stringify(['Detroit, US']),
+    `Apollo location strips onsite work mode for city search (got ${JSON.stringify(apolloSearchLocationFromNeed({ location: 'Detroit onsite', locationType: 'Onsite' }))})`);
+  assert(JSON.stringify(apolloSearchLocationFromNeed({ location: 'Michigan remote', locationType: 'Hybrid' })) === JSON.stringify(['Michigan, US']),
+    `Apollo location strips remote work mode when the search is still located (got ${JSON.stringify(apolloSearchLocationFromNeed({ location: 'Michigan remote', locationType: 'Hybrid' }))})`);
+  assert(JSON.stringify(apolloSearchLocationFromNeed({ location: 'Remote US', locationType: 'Remote' })) === JSON.stringify(['United States']),
+    `Remote US Apollo search sends country-only location (got ${JSON.stringify(apolloSearchLocationFromNeed({ location: 'Remote US', locationType: 'Remote' }))})`);
+  assert(JSON.stringify(apolloSearchLocationFromNeed({ location: 'Global', locationType: 'Remote' })) === JSON.stringify([]),
+    `Global Apollo search sends no location filter (got ${JSON.stringify(apolloSearchLocationFromNeed({ location: 'Global', locationType: 'Remote' }))})`);
+
   APOLLO_MATCH_CALLS.length = 0;
+  APOLLO_SEARCH_CALLS.length = 0;
   STUB_APOLLO_MATCH_HTTP = null;
   STUB_APOLLO_PEOPLE = [
     preview('ap-match-mi', 'Apollo Match Michigan', 'SOC Analyst', 'Match MI Co'),
@@ -1489,12 +1513,18 @@ async function main() {
     requiredSkills: ['Microsoft Sentinel', 'KQL', 'SIEM'],
     seniority: 'Mid',
     locationType: 'Hybrid',
-    location: 'Michigan',
+    location: 'Michigan hybrid',
     confirmed: true,
   });
   const apolloMatchRun = 'apollo_match_success_' + Date.now().toString(36);
   await runScout({ needId: apolloMatchNeed.id, pipelineRunId: apolloMatchRun, apolloMaxEnrichPerRun: 10 });
   const apolloMatchMi = DB.candidates.find(c => c.name === 'Apollo Match Michigan' && c.pipelineRunId === apolloMatchRun);
+  assert(APOLLO_SEARCH_CALLS.length > 0 && JSON.stringify(APOLLO_SEARCH_CALLS[0].person_locations) === JSON.stringify(['Michigan, US']),
+    `Michigan hybrid Apollo primary search uses person_locations ["Michigan, US"] (got ${JSON.stringify(APOLLO_SEARCH_CALLS[0] && APOLLO_SEARCH_CALLS[0].person_locations)})`);
+  assert(APOLLO_SEARCH_CALLS.every(call => JSON.stringify(call.person_locations) === JSON.stringify(['Michigan, US'])),
+    `Located Michigan search does not fall back to no-location nationwide attempts (calls=${JSON.stringify(APOLLO_SEARCH_CALLS.map(c => c.person_locations))})`);
+  assert(APOLLO_SEARCH_CALLS.every(call => !(call.person_locations || []).some(loc => /\bhybrid\b|\bonsite\b|\bremote\b/i.test(loc))),
+    `Apollo person_locations strip work-mode words for located search (calls=${JSON.stringify(APOLLO_SEARCH_CALLS.map(c => c.person_locations))})`);
   assert(APOLLO_MATCH_CALLS.length === 1 && APOLLO_MATCH_CALLS[0].hasId === true,
     `Apollo Match called once using Apollo id for preview candidate (calls=${JSON.stringify(APOLLO_MATCH_CALLS)})`);
   assert(apolloMatchMi && (apolloMatchMi.resolved_by || []).includes('apollo') && apolloMatchMi.resolution_status === 'resolved',
@@ -1505,6 +1535,7 @@ async function main() {
     `Apollo Match employment_history persisted into workHistory (got ${JSON.stringify(apolloMatchMi && apolloMatchMi.workHistory)})`);
 
   APOLLO_MATCH_CALLS.length = 0;
+  APOLLO_SEARCH_CALLS.length = 0;
   STUB_APOLLO_PEOPLE = [
     preview('ap-match-tx', 'Apollo Match Texas', 'SOC Analyst', 'Match TX Co'),
     preview('ap-match-mi-out', 'Apollo Match Michigan Out', 'SOC Analyst', 'Match MI Out Co'),
@@ -1519,13 +1550,17 @@ async function main() {
     requiredSkills: ['Microsoft Sentinel', 'KQL', 'SIEM'],
     seniority: 'Mid',
     locationType: 'Hybrid',
-    location: 'Texas',
+    location: 'Texas hybrid',
     confirmed: true,
   });
   const apolloTexasRun = 'apollo_match_texas_' + Date.now().toString(36);
   await runScout({ needId: apolloTexasNeed.id, pipelineRunId: apolloTexasRun, apolloMaxEnrichPerRun: 10 });
   const matchTexas = DB.candidates.find(c => c.name === 'Apollo Match Texas' && c.pipelineRunId === apolloTexasRun);
   const matchMichiganOut = DB.candidates.find(c => c.name === 'Apollo Match Michigan Out' && c.pipelineRunId === apolloTexasRun);
+  assert(APOLLO_SEARCH_CALLS.length > 0 && JSON.stringify(APOLLO_SEARCH_CALLS[0].person_locations) === JSON.stringify(['Texas, US']),
+    `Texas hybrid Apollo primary search uses person_locations ["Texas, US"] (got ${JSON.stringify(APOLLO_SEARCH_CALLS[0] && APOLLO_SEARCH_CALLS[0].person_locations)})`);
+  assert(APOLLO_SEARCH_CALLS.every(call => JSON.stringify(call.person_locations) === JSON.stringify(['Texas, US'])),
+    `Located Texas search does not fall back to no-location nationwide attempts (calls=${JSON.stringify(APOLLO_SEARCH_CALLS.map(c => c.person_locations))})`);
   assert(matchTexas && matchTexas.visibility_state === VISIBILITY_STATE.VISIBLE,
     `GENERALIZATION: Texas search allows enriched Texas candidate (state=${matchTexas && matchTexas.visibility_state}, reason=${matchTexas && matchTexas.reason_code})`);
   assert(matchMichiganOut && matchMichiganOut.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW && matchMichiganOut.reason_code === 'LOCATION_OUTSIDE_SELECTED_MARKET',
@@ -1564,8 +1599,13 @@ async function main() {
     confirmed: true,
   });
   const apolloMatchRemoteRun = 'apollo_match_remote_' + Date.now().toString(36);
+  APOLLO_SEARCH_CALLS.length = 0;
   await runScout({ needId: apolloMatchRemoteNeed.id, pipelineRunId: apolloMatchRemoteRun, apolloMaxEnrichPerRun: 10 });
   const remoteUs = DB.candidates.find(c => c.name === 'Apollo Match Remote US' && c.pipelineRunId === apolloMatchRemoteRun);
+  assert(APOLLO_SEARCH_CALLS.some(call => JSON.stringify(call.person_locations) === JSON.stringify(['United States'])),
+    `Remote US Apollo search uses country-only location filter, not a state filter (calls=${JSON.stringify(APOLLO_SEARCH_CALLS.map(c => c.person_locations))})`);
+  assert(APOLLO_SEARCH_CALLS.every(call => !(call.person_locations || []).some(loc => /Michigan|Texas, US/i.test(loc))),
+    `Remote/global search does not inherit a state-only Apollo location filter (calls=${JSON.stringify(APOLLO_SEARCH_CALLS.map(c => c.person_locations))})`);
   assert(remoteUs && remoteUs.visibility_state === VISIBILITY_STATE.VISIBLE && remoteUs.reason_code !== 'LOCATION_OUTSIDE_SELECTED_MARKET',
     `Remote/global search does not apply state market gate to Apollo Match candidate (state=${remoteUs && remoteUs.visibility_state}, reason=${remoteUs && remoteUs.reason_code})`);
 
