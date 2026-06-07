@@ -182,7 +182,11 @@ global.fetch = async (url, opts) => {
       person_locations: Array.isArray(LAST_APOLLO_REQUEST_BODY && LAST_APOLLO_REQUEST_BODY.person_locations)
         ? LAST_APOLLO_REQUEST_BODY.person_locations.slice()
         : [],
+      person_titles: Array.isArray(LAST_APOLLO_REQUEST_BODY && LAST_APOLLO_REQUEST_BODY.person_titles)
+        ? LAST_APOLLO_REQUEST_BODY.person_titles.slice()
+        : [],
       q_keywords: LAST_APOLLO_REQUEST_BODY && LAST_APOLLO_REQUEST_BODY.q_keywords || '',
+      per_page: LAST_APOLLO_REQUEST_BODY && LAST_APOLLO_REQUEST_BODY.per_page || 0,
       titleCount: Array.isArray(LAST_APOLLO_REQUEST_BODY && LAST_APOLLO_REQUEST_BODY.person_titles)
         ? LAST_APOLLO_REQUEST_BODY.person_titles.length
         : 0,
@@ -266,7 +270,7 @@ const {
   VISIBILITY_STATE, applySourcingQualityGate, evaluateSourcingQuality,
   isFirecrawlOnlyUnresolved, isGithubPrimaryEvidenceRole,
   sourcingRejectionStub,
-  apolloPeopleMatch, resolveApolloMaxEnrichPerRun, APOLLO_MATCH_DEFAULT_MAX_PER_RUN, apolloSearchLocationFromNeed,
+  apolloPeopleMatch, resolveApolloMaxEnrichPerRun, resolveApolloVolumeConfig, APOLLO_MATCH_DEFAULT_MAX_PER_RUN, APOLLO_MAX_RESULTS_PER_VARIANT_DEFAULT, APOLLO_MAX_VARIANTS_PER_RUN_DEFAULT, APOLLO_MAX_CANDIDATES_PER_RUN_DEFAULT, apolloSearchLocationFromNeed,
   selectedMarketFromNeed, isApolloOutsideSelectedMarket,
 } = _internals;
 
@@ -1644,6 +1648,95 @@ async function main() {
 
   assert(resolveApolloMaxEnrichPerRun(undefined) === APOLLO_MATCH_DEFAULT_MAX_PER_RUN,
     `Apollo Match default per-run cap is ${APOLLO_MATCH_DEFAULT_MAX_PER_RUN}`);
+  const volumeCfg = resolveApolloVolumeConfig({ maxResultsPerVariant: 10, maxVariantsPerRun: 5, maxCandidatesPerRun: 50 });
+  assert(volumeCfg.maxResultsPerVariant === APOLLO_MAX_RESULTS_PER_VARIANT_DEFAULT &&
+    volumeCfg.maxVariantsPerRun === APOLLO_MAX_VARIANTS_PER_RUN_DEFAULT &&
+    volumeCfg.maxCandidatesPerRun === APOLLO_MAX_CANDIDATES_PER_RUN_DEFAULT,
+    `Apollo volume defaults are bounded/configurable (${JSON.stringify(volumeCfg)})`);
+  const volumeAttempts = buildApolloCandidateAttempts({
+    title: 'SOC Analyst / Detection Analyst',
+    requiredSkills: ['Microsoft Sentinel', 'KQL', 'SIEM'],
+    seniority: 'Mid',
+    locationType: 'Hybrid',
+    location: 'Michigan hybrid',
+  }, { expandCandidatePool: true, volumeConfig: volumeCfg });
+  assert(volumeAttempts.length === 5 && volumeAttempts.every(a => a.titles.length === 1),
+    `Expand ON runs capped single-title Apollo variants (count=${volumeAttempts.length}, titles=${JSON.stringify(volumeAttempts.map(a => a.titles))})`);
+  assert(volumeAttempts.every(a => JSON.stringify(a.locations) === JSON.stringify(['Michigan, US'])) &&
+    volumeAttempts.every(a => !(a.locations || []).some(loc => /\bhybrid\b|\bonsite\b|\bremote\b/i.test(loc))),
+    `Expand ON Michigan hybrid Apollo attempts stay selected-market filtered (locations=${JSON.stringify(volumeAttempts.map(a => a.locations))})`);
+  assert(volumeAttempts[0].searchVariantMeta[0].variant_type === 'exact_tool_role' &&
+    volumeAttempts.slice(0, 4).every(a => a.searchVariantMeta[0].specificity_weight === 1.0),
+    `Apollo variants are ordered exact/tool-specific first (variants=${JSON.stringify(volumeAttempts.map(a => a.searchVariantMeta[0]))})`);
+
+  APOLLO_MATCH_CALLS.length = 0;
+  APOLLO_SEARCH_CALLS.length = 0;
+  STUB_FIRECRAWL_ITEMS = [
+    { title: 'Firecrawl Only Volume One - SOC Analyst', url: 'https://www.linkedin.com/in/firecrawl-volume-one', description: 'SOC Analyst Michigan LinkedIn profile mention' },
+    { title: 'Firecrawl Only Volume Two - Detection Analyst', url: 'https://www.linkedin.com/in/firecrawl-volume-two', description: 'Detection Analyst Michigan LinkedIn profile mention' },
+  ];
+  STUB_GH_SEARCH_USERS = { items: [] };
+  process.env.FIRECRAWL_API_KEY = 'test-firecrawl-key';
+  process.env.PDL_API_KEY = 'test-pdl-key';
+  STUB_PDL_SEARCH = { data: [] };
+  STUB_PDL_RESOLVE_HTTP = { status: 402, body: { error: 'payment_required' } };
+  const apolloVolumePerson = (id, name, title, company = 'Volume Security Co') => ({
+    id, name, title,
+    city: 'Detroit', state: 'Michigan', country: 'United States',
+    linkedin_url: `https://www.linkedin.com/in/${id}`,
+    organization: { name: company },
+    headline: `${title} with Microsoft Sentinel, SIEM, KQL, and Incident Response`,
+    employment_history: apolloWork(title, company),
+  });
+  const variantPeople = {
+    'soc analyst / detection analyst': apolloVolumePerson('apollo-volume-input', 'Apollo Volume Input', 'SOC Analyst'),
+    'microsoft sentinel soc analyst': apolloVolumePerson('apollo-volume-sentinel-soc', 'Apollo Volume Sentinel SOC', 'Microsoft Sentinel SOC Analyst'),
+    'microsoft sentinel analyst': apolloVolumePerson('apollo-volume-sentinel', 'Apollo Volume Sentinel', 'Microsoft Sentinel Analyst'),
+    'microsoft sentinel detection analyst': apolloVolumePerson('apollo-volume-detection', 'Apollo Volume Detection', 'Microsoft Sentinel Detection Analyst'),
+    'siem detection analyst': apolloVolumePerson('apollo-volume-siem-detection', 'Apollo Volume SIEM Detection', 'SIEM Detection Analyst'),
+  };
+  STUB_APOLLO_PEOPLE = body => {
+    const titles = (body.person_titles || []).map(t => String(t).toLowerCase());
+    if (titles.length !== 1) return [apolloVolumePerson('apollo-volume-baseline', 'Apollo Volume Baseline', 'SOC Analyst')];
+    return variantPeople[titles[0]] ? [variantPeople[titles[0]]] : [];
+  };
+  STUB_APOLLO_MATCH = null;
+  const volumeNeed = createNeed({
+    companyId: coApollo.id,
+    title: 'SOC Analyst / Detection Analyst',
+    requiredSkills: ['Microsoft Sentinel', 'KQL', 'SIEM'],
+    seniority: 'Mid',
+    locationType: 'Hybrid',
+    location: 'Michigan hybrid',
+    confirmed: true,
+  });
+  const volumeBaselineRun = 'apollo_volume_baseline_' + Date.now().toString(36);
+  await runScout({ needId: volumeNeed.id, pipelineRunId: volumeBaselineRun, expandCandidatePool: false });
+  const baselineApollo = DB.candidates.filter(c => c.pipelineRunId === volumeBaselineRun && (c.discovered_by || []).includes('apollo'));
+  APOLLO_SEARCH_CALLS.length = 0;
+  const volumeExpandedRun = 'apollo_volume_expanded_' + Date.now().toString(36);
+  await runScout({ needId: volumeNeed.id, pipelineRunId: volumeExpandedRun, expandCandidatePool: true });
+  const expandedApollo = DB.candidates.filter(c => c.pipelineRunId === volumeExpandedRun && (c.discovered_by || []).includes('apollo'));
+  const expandedApolloVisible = expandedApollo.filter(c => c.visibility_state === VISIBILITY_STATE.VISIBLE && isClientReadyForNeed(c, volumeNeed));
+  const expandedApolloReview = expandedApollo.filter(c => c.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW);
+  const expandedFirecrawlVisible = DB.candidates.filter(c => c.pipelineRunId === volumeExpandedRun && (c.discovered_by || []).includes('firecrawl') && c.visibility_state === VISIBILITY_STATE.VISIBLE);
+  assert(APOLLO_SEARCH_CALLS.length === 5 && APOLLO_SEARCH_CALLS.every(call => JSON.stringify(call.person_locations) === JSON.stringify(['Michigan, US'])) &&
+    APOLLO_SEARCH_CALLS.every(call => call.titleCount === 1 && call.per_page === 10),
+    `Expand ON Michigan hybrid runs five capped location-filtered Apollo variant searches (calls=${JSON.stringify(APOLLO_SEARCH_CALLS)})`);
+  assert(JSON.stringify(APOLLO_SEARCH_CALLS.map(call => call.person_titles[0])) === JSON.stringify(volumeAttempts.map(a => a.titles[0])),
+    `Apollo live search calls follow ranked variant order (calls=${JSON.stringify(APOLLO_SEARCH_CALLS.map(call => call.person_titles[0]))})`);
+  assert(expandedApollo.length > baselineApollo.length && expandedApolloVisible.length === 5,
+    `Apollo discovered/visible count increases via structured variants only (baseline=${baselineApollo.length}, expanded=${expandedApollo.length}, visible=${expandedApolloVisible.length})`);
+  assert(expandedApollo.every(c => (c.resolved_by || []).includes('apollo') && c.provider_of_record === 'apollo') && expandedApolloVisible.length >= 5,
+    `Apollo expanded candidates resolve by Apollo and can become visible when gates pass (visible=${expandedApolloVisible.length})`);
+  assert(expandedApollo.length === expandedApolloVisible.length + expandedApolloReview.length,
+    `Apollo volume discovered == visible/resolved + review (zero lost; discovered=${expandedApollo.length}, visible=${expandedApolloVisible.length}, review=${expandedApolloReview.length})`);
+  assert(expandedFirecrawlVisible.length === 0,
+    `PDL 402/unavailable does not cause Firecrawl-only candidates to leak into visible/client-ready (firecrawlVisible=${expandedFirecrawlVisible.length})`);
+
+  STUB_FIRECRAWL_ITEMS = [];
+  STUB_PDL_SEARCH = null;
+  STUB_PDL_RESOLVE_HTTP = null;
   STUB_APOLLO_MATCH = null;
   STUB_APOLLO_MATCH_HTTP = null;
 
@@ -3667,6 +3760,10 @@ async function main() {
     `Variant expansion includes medium-specificity SOC Analyst`);
   assert(sentinelVariants.some(v => v.title === 'Cybersecurity Analyst' && v.specificity_weight === 0.45 && v.variant_type === 'wide_net'),
     `Variant expansion includes wide-net Cybersecurity Analyst`);
+  assert(sentinelVariants.some(v => v.title === 'Security Analyst' && v.variant_type === 'wide_net'),
+    `Variant expansion includes wide-net Security Analyst`);
+  assert(sentinelVariants.some(v => v.title === 'Azure Security Engineer' && v.variant_type === 'wide_net'),
+    `Variant expansion includes wide-net Azure Security Engineer`);
   assert(!sentinelVariants.some(v => /^KQL$/i.test(v.title) || /^Kusto$/i.test(v.title)),
     `KQL/Kusto are NOT title variants`);
 
