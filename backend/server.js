@@ -451,10 +451,17 @@ function seniorityReviewMetadata(c = {}, need = {}) {
   };
 }
 
+function splitRoleTitleLabel(role = '') {
+  const raw = String(role || '').trim();
+  if (!raw) return [];
+  return uniqStrings(raw.split(/\s*\/\s*/).map(part => part.trim()));
+}
+
 function buildRankedTitleVariants(role = '') {
   const raw = String(role || '').trim();
   const low = raw.toLowerCase();
-  const sentinelRole = /sentinel|soc|siem|detection|threat|incident response/i.test(low);
+  const roleTitles = splitRoleTitleLabel(raw);
+  const sentinelRole = /sentinel|soc|siem|detection|threat|incident response|kql|kusto/i.test(low);
   const variants = [];
   const add = (title, specificity_weight, variant_type) => {
     if (!title) return;
@@ -462,31 +469,31 @@ function buildRankedTitleVariants(role = '') {
     if (variants.some(v => v.title.toLowerCase() === key)) return;
     variants.push({ title, specificity_weight, variant_type });
   };
-  if (raw) add(raw, 1.0, sentinelRole ? 'exact_tool_role' : 'input_role');
   if (sentinelRole) {
-    [
-      'Microsoft Sentinel SOC Analyst',
-      'Microsoft Sentinel Analyst',
-      'Microsoft Sentinel Detection Analyst',
-      'SIEM Detection Analyst',
-    ].forEach(t => add(t, 1.0, 'exact_tool_role'));
+    roleTitles
+      .filter(title => !/sentinel|kql|kusto/i.test(title))
+      .forEach(title => add(title, 1.0, 'exact_role'));
     [
       'SOC Analyst',
       'Security Operations Analyst',
-      'SIEM Analyst',
+      'Security Analyst',
       'Detection Analyst',
+      'SIEM Analyst',
       'Threat Detection Analyst',
       'Incident Response Analyst',
+      'Cybersecurity Analyst',
     ].forEach(t => add(t, 0.7, 'medium_specificity'));
     [
-      'Cybersecurity Analyst',
-      'Security Analyst',
       'Azure Security Analyst',
       'Azure Security Engineer',
     ].forEach(t => add(t, 0.45, 'wide_net'));
   } else {
-    for (const t of expandRoleToTitles(raw)) {
-      add(t, t.toLowerCase() === low ? 1.0 : 0.65, t.toLowerCase() === low ? 'input_role' : 'related_role');
+    for (const title of roleTitles) add(title, 1.0, 'input_role');
+    for (const baseTitle of roleTitles.length ? roleTitles : [raw]) {
+      const baseLow = baseTitle.toLowerCase();
+      for (const t of expandRoleToTitles(baseTitle)) {
+        add(t, t.toLowerCase() === baseLow ? 1.0 : 0.65, t.toLowerCase() === baseLow ? 'input_role' : 'related_role');
+      }
     }
   }
   return variants;
@@ -1997,9 +2004,10 @@ function buildFirecrawlBoardQueries(need) {
 // Generate Apollo title variants from a free-text role string. Keyword-driven
 // expansion — no LLM call. Used only for candidate sourcing.
 function expandRoleToTitles(role) {
+  const rawTitles = splitRoleTitleLabel(role);
   const r = String(role || '').toLowerCase().trim();
   const set = new Set();
-  if (role) set.add(role);
+  rawTitles.forEach(t => set.add(t));
   // Security / cloud-security focused set (highest priority for current ICP).
   // 15 titles — fits well under Apollo's max-25 person_titles cap even when
   // combined with the input role itself.
@@ -2070,7 +2078,7 @@ function buildApolloCandidateAttempts(need, { expandCandidatePool = false, volum
   const primarySkill = skills[0] || '';
   const topSkills = skills.slice(0, 2).join(' ');
   const expandedTitles = expandRoleToTitles(role);
-  const roleOnly = role ? [role] : expandedTitles.slice(0, 1);
+  const roleOnly = splitRoleTitleLabel(role);
   const broadTitles = uniqStrings([...expandedTitles, ...BROAD_SECURITY_TITLES], 20);
   const locations = apolloSearchLocationFromNeed(need);
   const market = selectedMarketFromNeed(need);

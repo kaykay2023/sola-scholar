@@ -1662,12 +1662,24 @@ async function main() {
   }, { expandCandidatePool: true, volumeConfig: volumeCfg });
   assert(volumeAttempts.length === 5 && volumeAttempts.every(a => a.titles.length === 1),
     `Expand ON runs capped single-title Apollo variants (count=${volumeAttempts.length}, titles=${JSON.stringify(volumeAttempts.map(a => a.titles))})`);
+  assert(JSON.stringify(volumeAttempts.map(a => a.titles[0])) === JSON.stringify([
+    'SOC Analyst',
+    'Detection Analyst',
+    'Security Operations Analyst',
+    'Security Analyst',
+    'SIEM Analyst',
+  ]),
+    `Combined SOC/Detection label splits into real Apollo titles in ranked order (titles=${JSON.stringify(volumeAttempts.map(a => a.titles[0]))})`);
+  assert(volumeAttempts.every(a => !(a.titles || []).some(t => /\/|sentinel|kql|kusto/i.test(t))) &&
+    volumeAttempts.every(a => /KQL Kusto Microsoft Sentinel/.test(a.keywords || '')),
+    `Apollo title variants avoid slash/tool terms while q_keywords carries tool terms (attempts=${JSON.stringify(volumeAttempts.map(a => ({ titles: a.titles, keywords: a.keywords })))})`);
   assert(volumeAttempts.every(a => JSON.stringify(a.locations) === JSON.stringify(['Michigan, US'])) &&
     volumeAttempts.every(a => !(a.locations || []).some(loc => /\bhybrid\b|\bonsite\b|\bremote\b/i.test(loc))),
     `Expand ON Michigan hybrid Apollo attempts stay selected-market filtered (locations=${JSON.stringify(volumeAttempts.map(a => a.locations))})`);
-  assert(volumeAttempts[0].searchVariantMeta[0].variant_type === 'exact_tool_role' &&
-    volumeAttempts.slice(0, 4).every(a => a.searchVariantMeta[0].specificity_weight === 1.0),
-    `Apollo variants are ordered exact/tool-specific first (variants=${JSON.stringify(volumeAttempts.map(a => a.searchVariantMeta[0]))})`);
+  assert(volumeAttempts[0].searchVariantMeta[0].variant_type === 'exact_role' &&
+    volumeAttempts[1].searchVariantMeta[0].variant_type === 'exact_role' &&
+    volumeAttempts.slice(0, 2).every(a => a.searchVariantMeta[0].specificity_weight === 1.0),
+    `Apollo variants are ordered exact split titles first (variants=${JSON.stringify(volumeAttempts.map(a => a.searchVariantMeta[0]))})`);
 
   APOLLO_MATCH_CALLS.length = 0;
   APOLLO_SEARCH_CALLS.length = 0;
@@ -1689,11 +1701,11 @@ async function main() {
     employment_history: apolloWork(title, company),
   });
   const variantPeople = {
-    'soc analyst / detection analyst': apolloVolumePerson('apollo-volume-input', 'Apollo Volume Input', 'SOC Analyst'),
-    'microsoft sentinel soc analyst': apolloVolumePerson('apollo-volume-sentinel-soc', 'Apollo Volume Sentinel SOC', 'Microsoft Sentinel SOC Analyst'),
-    'microsoft sentinel analyst': apolloVolumePerson('apollo-volume-sentinel', 'Apollo Volume Sentinel', 'Microsoft Sentinel Analyst'),
-    'microsoft sentinel detection analyst': apolloVolumePerson('apollo-volume-detection', 'Apollo Volume Detection', 'Microsoft Sentinel Detection Analyst'),
-    'siem detection analyst': apolloVolumePerson('apollo-volume-siem-detection', 'Apollo Volume SIEM Detection', 'SIEM Detection Analyst'),
+    'soc analyst': apolloVolumePerson('apollo-volume-soc', 'Apollo Volume SOC', 'SOC Analyst'),
+    'detection analyst': apolloVolumePerson('apollo-volume-detection', 'Apollo Volume Detection', 'Detection Analyst'),
+    'security operations analyst': apolloVolumePerson('apollo-volume-secops', 'Apollo Volume SecOps', 'Security Operations Analyst'),
+    'security analyst': apolloVolumePerson('apollo-volume-security', 'Apollo Volume Security', 'Security Analyst'),
+    'siem analyst': apolloVolumePerson('apollo-volume-siem', 'Apollo Volume SIEM', 'SIEM Analyst'),
   };
   STUB_APOLLO_PEOPLE = body => {
     const titles = (body.person_titles || []).map(t => String(t).toLowerCase());
@@ -1723,6 +1735,9 @@ async function main() {
   assert(APOLLO_SEARCH_CALLS.length === 5 && APOLLO_SEARCH_CALLS.every(call => JSON.stringify(call.person_locations) === JSON.stringify(['Michigan, US'])) &&
     APOLLO_SEARCH_CALLS.every(call => call.titleCount === 1 && call.per_page === 10),
     `Expand ON Michigan hybrid runs five capped location-filtered Apollo variant searches (calls=${JSON.stringify(APOLLO_SEARCH_CALLS)})`);
+  assert(APOLLO_SEARCH_CALLS.every(call => !(call.person_titles || []).some(t => /\/|sentinel|kql|kusto/i.test(t))) &&
+    APOLLO_SEARCH_CALLS.every(call => call.q_keywords === 'KQL Kusto Microsoft Sentinel'),
+    `Apollo live search calls send real titles and keep tool terms in q_keywords (calls=${JSON.stringify(APOLLO_SEARCH_CALLS)})`);
   assert(JSON.stringify(APOLLO_SEARCH_CALLS.map(call => call.person_titles[0])) === JSON.stringify(volumeAttempts.map(a => a.titles[0])),
     `Apollo live search calls follow ranked variant order (calls=${JSON.stringify(APOLLO_SEARCH_CALLS.map(call => call.person_titles[0]))})`);
   assert(expandedApollo.length > baselineApollo.length && expandedApolloVisible.length === 5,
@@ -3754,18 +3769,26 @@ async function main() {
 
   // ── 20b. Candidate-pool expansion metadata stays metadata-only ───────
   const sentinelVariants = buildRankedTitleVariants('Microsoft Sentinel SOC Analyst');
-  assert(sentinelVariants.some(v => v.title === 'Microsoft Sentinel SOC Analyst' && v.specificity_weight === 1.0 && v.variant_type === 'exact_tool_role'),
-    `Variant expansion includes high-specificity Sentinel SOC Analyst`);
-  assert(sentinelVariants.some(v => v.title === 'SOC Analyst' && v.variant_type === 'medium_specificity'),
-    `Variant expansion includes medium-specificity SOC Analyst`);
-  assert(sentinelVariants.some(v => v.title === 'Cybersecurity Analyst' && v.specificity_weight === 0.45 && v.variant_type === 'wide_net'),
-    `Variant expansion includes wide-net Cybersecurity Analyst`);
-  assert(sentinelVariants.some(v => v.title === 'Security Analyst' && v.variant_type === 'wide_net'),
-    `Variant expansion includes wide-net Security Analyst`);
-  assert(sentinelVariants.some(v => v.title === 'Azure Security Engineer' && v.variant_type === 'wide_net'),
-    `Variant expansion includes wide-net Azure Security Engineer`);
-  assert(!sentinelVariants.some(v => /^KQL$/i.test(v.title) || /^Kusto$/i.test(v.title)),
-    `KQL/Kusto are NOT title variants`);
+  assert(!sentinelVariants.some(v => /sentinel|kql|kusto/i.test(v.title)),
+    `Tool-specific terms are NOT baked into Apollo title variants`);
+  for (const must of [
+    'SOC Analyst',
+    'Security Operations Analyst',
+    'Security Analyst',
+    'SIEM Analyst',
+    'Detection Analyst',
+    'Incident Response Analyst',
+    'Cybersecurity Analyst',
+  ]) {
+    assert(sentinelVariants.some(v => v.title === must),
+      `Variant expansion includes real title "${must}"`);
+  }
+
+  const combinedVariants = buildRankedTitleVariants('SOC Analyst / Detection Analyst');
+  assert(combinedVariants[0].title === 'SOC Analyst' &&
+    combinedVariants[1].title === 'Detection Analyst' &&
+    !combinedVariants.some(v => /\//.test(v.title)),
+    `Combined role labels split into real titles without slash variants (variants=${JSON.stringify(combinedVariants.slice(0, 5))})`);
 
   const expansionPlan = buildCandidateSearchExpansion({
     title: 'Microsoft Sentinel SOC Analyst',
@@ -3836,8 +3859,8 @@ async function main() {
     scoutDecision: 'accepted',
     pipelineRunId: metaRun,
     providersFound: ['apollo'],
-    searchVariantsFound: ['Microsoft Sentinel SOC Analyst'],
-    searchVariantMeta: [{ title: 'Microsoft Sentinel SOC Analyst', specificity_weight: 1.0, variant_type: 'exact_tool_role' }],
+    searchVariantsFound: ['SOC Analyst'],
+    searchVariantMeta: [{ title: 'SOC Analyst', specificity_weight: 1.0, variant_type: 'exact_role' }],
   });
   const linklessWide = findOrCreateCandidate({
     name: 'Linkless Wide Net',
@@ -3870,8 +3893,8 @@ async function main() {
     source: 'Apollo',
     scoutDecision: 'accepted',
     providersFound: ['apollo'],
-    searchVariantsFound: ['Microsoft Sentinel Analyst'],
-    searchVariantMeta: [{ title: 'Microsoft Sentinel Analyst', specificity_weight: 1.0, variant_type: 'exact_tool_role' }],
+    searchVariantsFound: ['SOC Analyst'],
+    searchVariantMeta: [{ title: 'SOC Analyst', specificity_weight: 1.0, variant_type: 'exact_role' }],
     locationTiersMatched: ['Michigan hybrid'],
     locationTierMeta: [{ key: 'michigan-hybrid', label: 'Michigan hybrid', proximity_tier: 'Michigan hybrid', proximity_rank: 2 }],
   });
@@ -3889,7 +3912,7 @@ async function main() {
   });
   assert(multiMetaA.id === multiMetaB.id &&
     multiMetaB.providersFound.includes('apollo') && multiMetaB.providersFound.includes('firecrawl') &&
-    multiMetaB.searchVariantsFound.includes('Microsoft Sentinel Analyst') && multiMetaB.searchVariantsFound.includes('SIEM Analyst') &&
+    multiMetaB.searchVariantsFound.includes('SOC Analyst') && multiMetaB.searchVariantsFound.includes('SIEM Analyst') &&
     multiMetaB.locationTiersMatched.includes('Michigan hybrid') && multiMetaB.locationTiersMatched.includes('Remote US'),
     `Candidate stores all variants/providers/location tiers across deduped touches`);
 
