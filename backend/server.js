@@ -480,7 +480,9 @@ function buildRankedTitleVariants(role = '') {
     ].forEach(t => add(t, 0.7, 'medium_specificity'));
     [
       'Cybersecurity Analyst',
+      'Security Analyst',
       'Azure Security Analyst',
+      'Azure Security Engineer',
     ].forEach(t => add(t, 0.45, 'wide_net'));
   } else {
     for (const t of expandRoleToTitles(raw)) {
@@ -1765,6 +1767,20 @@ function normalizeApolloWorkHistory(person = {}) {
   return entries;
 }
 
+function apolloResolutionPriority(person = {}) {
+  const location = person.location || {};
+  const workHistory = normalizeApolloWorkHistory(person);
+  const hasStructuredLocation = !!String(person.state || person.location_state || person.location_region || person.country || person.location_country || location.state || location.region || location.country || '').trim();
+  const hasCurrentRole = !!String(person.title || person.current_title || '').trim() && !!apolloOrgName(person.organization || person.current_organization || person.organization_name || person.company_name);
+  let score = 0;
+  if (apolloStructuredResolution(person).ok) score += 8;
+  if (isLinkedInProfileUrl(person.linkedin_url || person.linkedinUrl || '')) score += 4;
+  if (workHistory.length) score += 2;
+  if (hasStructuredLocation) score += 1;
+  if (hasCurrentRole) score += 1;
+  return score;
+}
+
 function apolloStructuredResolution(person = {}) {
   const location = person.location || {};
   const city = person.city || person.location_city || location.city || location.locality || '';
@@ -1782,11 +1798,39 @@ function apolloStructuredResolution(person = {}) {
   return { ok: true, city, state, country, currentTitle, currentCompany, workHistory };
 }
 
-const APOLLO_MATCH_DEFAULT_MAX_PER_RUN = 25;
-function resolveApolloMaxEnrichPerRun(value) {
+const APOLLO_MATCH_DEFAULT_MAX_PER_RUN = 50;
+const APOLLO_MAX_RESULTS_PER_VARIANT_DEFAULT = 10;
+const APOLLO_MAX_VARIANTS_PER_RUN_DEFAULT = 5;
+const APOLLO_MAX_CANDIDATES_PER_RUN_DEFAULT = 50;
+
+function resolveBoundedPositiveInt(value, fallback, { min = 1, max = 100 } = {}) {
   const n = Number(value);
-  if (!Number.isFinite(n)) return APOLLO_MATCH_DEFAULT_MAX_PER_RUN;
-  return Math.max(0, Math.min(100, Math.floor(n)));
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(n)));
+}
+
+function resolveApolloMaxEnrichPerRun(value) {
+  return resolveBoundedPositiveInt(value, APOLLO_MATCH_DEFAULT_MAX_PER_RUN, { min: 0, max: 100 });
+}
+
+function resolveApolloVolumeConfig(overrides = {}) {
+  return {
+    maxResultsPerVariant: resolveBoundedPositiveInt(
+      overrides.maxResultsPerVariant ?? process.env.APOLLO_MAX_RESULTS_PER_VARIANT,
+      APOLLO_MAX_RESULTS_PER_VARIANT_DEFAULT,
+      { min: 1, max: 25 },
+    ),
+    maxVariantsPerRun: resolveBoundedPositiveInt(
+      overrides.maxVariantsPerRun ?? process.env.APOLLO_MAX_VARIANTS_PER_RUN,
+      APOLLO_MAX_VARIANTS_PER_RUN_DEFAULT,
+      { min: 1, max: 10 },
+    ),
+    maxCandidatesPerRun: resolveBoundedPositiveInt(
+      overrides.maxCandidatesPerRun ?? process.env.APOLLO_MAX_CANDIDATES_PER_RUN,
+      APOLLO_MAX_CANDIDATES_PER_RUN_DEFAULT,
+      { min: 1, max: 100 },
+    ),
+  };
 }
 
 function apolloMatchIdentifier(person = {}) {
@@ -2020,7 +2064,7 @@ function uniqStrings(items, limit = Infinity) {
   return out;
 }
 
-function buildApolloCandidateAttempts(need, { expandCandidatePool = false } = {}) {
+function buildApolloCandidateAttempts(need, { expandCandidatePool = false, volumeConfig = null } = {}) {
   const role = need?.title || '';
   const skills = uniqStrings(need?.requiredSkills || [], 5);
   const primarySkill = skills[0] || '';
@@ -2029,24 +2073,26 @@ function buildApolloCandidateAttempts(need, { expandCandidatePool = false } = {}
   const roleOnly = role ? [role] : expandedTitles.slice(0, 1);
   const broadTitles = uniqStrings([...expandedTitles, ...BROAD_SECURITY_TITLES], 20);
   const locations = apolloSearchLocationFromNeed(need);
-  const isConcreteMarket = selectedMarketFromNeed(need).mode === 'concrete';
+  const market = selectedMarketFromNeed(need);
+  const isConcreteMarket = market.mode === 'concrete';
   const expansion = buildCandidateSearchExpansion(need, { enabled: expandCandidatePool });
+  const cfg = volumeConfig || resolveApolloVolumeConfig();
   let attempts = [
-    { label: 'focused-title-primary-skill', titles: expandedTitles, keywords: primarySkill, locations },
-    { label: 'focused-title-top-skills', titles: expandedTitles, keywords: topSkills, locations },
-    { label: 'focused-title-only', titles: expandedTitles, keywords: '', locations },
+    { label: 'focused-title-primary-skill', titles: expandedTitles, keywords: primarySkill, locations, perPage: 25 },
+    { label: 'focused-title-top-skills', titles: expandedTitles, keywords: topSkills, locations, perPage: 25 },
+    { label: 'focused-title-only', titles: expandedTitles, keywords: '', locations, perPage: 25 },
   ];
   if (!isConcreteMarket) {
     attempts.push(
-      { label: 'role-title-only-no-location', titles: roleOnly, keywords: '', locations: [] },
-      { label: 'expanded-related-titles', titles: broadTitles, keywords: primarySkill, locations: [] },
-      { label: 'expanded-related-title-only', titles: broadTitles, keywords: '', locations: [] },
+      { label: 'role-title-only-no-location', titles: roleOnly, keywords: '', locations: [], perPage: 25 },
+      { label: 'expanded-related-titles', titles: broadTitles, keywords: primarySkill, locations: [], perPage: 25 },
+      { label: 'expanded-related-title-only', titles: broadTitles, keywords: '', locations: [], perPage: 25 },
     );
   } else {
     attempts.push(
-      { label: 'role-title-only-located', titles: roleOnly, keywords: '', locations },
-      { label: 'expanded-related-titles-located', titles: broadTitles, keywords: primarySkill, locations },
-      { label: 'expanded-related-title-only-located', titles: broadTitles, keywords: '', locations },
+      { label: 'role-title-only-located', titles: roleOnly, keywords: '', locations, perPage: 25 },
+      { label: 'expanded-related-titles-located', titles: broadTitles, keywords: primarySkill, locations, perPage: 25 },
+      { label: 'expanded-related-title-only-located', titles: broadTitles, keywords: '', locations, perPage: 25 },
     );
   }
   attempts = attempts.map(a => ({
@@ -2059,23 +2105,32 @@ function buildApolloCandidateAttempts(need, { expandCandidatePool = false } = {}
     expandCandidatePool: false,
   }));
   if (expandCandidatePool) {
-    const byType = type => expansion.titleVariants.filter(v => v.variant_type === type);
-    const groups = [
-      { label: 'expanded-high-specificity', variants: byType('exact_tool_role').concat(byType('input_role')), keywords: expansion.profileKeywords.slice(0, 3).join(' ') },
-      { label: 'expanded-medium-specificity', variants: byType('medium_specificity').concat(byType('related_role')).slice(0, 10), keywords: expansion.profileKeywords.slice(0, 3).join(' ') },
-      { label: 'expanded-wide-net', variants: byType('wide_net').slice(0, 6), keywords: expansion.profileKeywords.slice(0, 2).join(' ') },
-    ];
+    const rankedVariants = expansion.titleVariants.slice(0, cfg.maxVariantsPerRun);
+    const concreteTier = {
+      key: 'selected-market',
+      label: locations[0] || String(need.location || '').trim() || 'Selected market',
+      proximity_tier: locations[0] || String(need.location || '').trim() || 'Selected market',
+      proximity_rank: 1,
+      searchLocation: locations[0] || '',
+    };
+    const locationPlans = isConcreteMarket
+      ? [concreteTier]
+      : expansion.locationTiers.filter(t => {
+        if (market.mode === 'global') return !t.searchLocation;
+        if (market.mode === 'remote-us') return t.key === 'remote-us' || t.searchLocation === 'United States';
+        return true;
+      });
+    const keywordText = expansion.profileKeywords.slice(0, 3).join(' ');
     attempts = [];
-    for (const tier of expansion.locationTiers) {
-      for (const g of groups) {
-        const variants = g.variants.length ? g.variants : expansion.titleVariants.slice(0, 1);
-        if (!variants.length) continue;
+    for (const tier of (locationPlans.length ? locationPlans : [{ key: 'global', label: 'Global', proximity_tier: 'Global', proximity_rank: 9, searchLocation: '' }])) {
+      for (const variant of rankedVariants) {
         attempts.push({
-          label: `${g.label}:${tier.key}`,
-          titles: variants.map(v => v.title),
-          keywords: g.keywords,
+          label: `expanded-${variant.variant_type}:${tier.key}:${variant.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}`,
+          titles: [variant.title],
+          keywords: keywordText,
           locations: tier.searchLocation ? [tier.searchLocation] : [],
-          searchVariantMeta: variants,
+          perPage: cfg.maxResultsPerVariant,
+          searchVariantMeta: [variant],
           locationTier: tier,
           expandCandidatePool: true,
         });
@@ -2093,7 +2148,6 @@ function buildApolloCandidateAttempts(need, { expandCandidatePool = false } = {}
     return true;
   });
 }
-
 function quoteTerm(value) {
   return `"${String(value || '').replace(/"/g, '').trim()}"`;
 }
@@ -3397,8 +3451,10 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
   const sourceQueryStats       = { apollo: [], firecrawl: [], github: [] };
   const providerDiagnostics    = initProviderRunDiagnostics();
   const candById = new Map(); // candidate.id -> first source tag (for dedupe attribution)
+  const apolloVolumeConfig = resolveApolloVolumeConfig();
   const apolloEnrichCap = resolveApolloMaxEnrichPerRun(apolloMaxEnrichPerRun);
   let apolloEnrichCalls = 0;
+  let apolloCandidatePullCount = 0;
   let apolloMatchFatal = null;
   const recordCandidateByGate = (c, sourceTag) => {
     applySourcingQualityGate(c, need);
@@ -3439,7 +3495,7 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
   // Force-accept as candidate_profile — does NOT pass through the heuristic
   // classifier (which is built for noisy Firecrawl results).
   if (isConfigured('apollo')) {
-    const apolloAttempts = buildApolloCandidateAttempts(need, { expandCandidatePool });
+    const apolloAttempts = buildApolloCandidateAttempts(need, { expandCandidatePool, volumeConfig: apolloVolumeConfig });
     if (!apolloAttempts.length) {
       markProviderSkipped(providerDiagnostics, 'apollo', 'no Apollo candidate titles to search');
     } else {
@@ -3449,7 +3505,7 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
         titles: attempt.titles,
         locations: attempt.locations,
         keywords: attempt.keywords,
-        perPage: 25,
+        perPage: attempt.perPage || apolloVolumeConfig.maxResultsPerVariant,
         page: 1,
       });
       const apolloReturned = (ap.people || []).length;
@@ -3485,13 +3541,21 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
       }
 
       if (!apolloReturned) continue;
+      const remainingApolloSlots = Math.max(0, apolloVolumeConfig.maxCandidatesPerRun - apolloCandidatePullCount);
+      if (remainingApolloSlots <= 0) break;
+      const apolloPeople = (ap.people || [])
+        .map((person, index) => ({ person, index, priority: apolloResolutionPriority(person) }))
+        .sort((a, b) => (b.priority - a.priority) || (a.index - b.index))
+        .slice(0, remainingApolloSlots)
+        .map(item => item.person);
       await logActivity(
         'Scout',
         `Apollo relaxation accepted step "${attempt.label}" with ${apolloReturned} people`,
         'success',
         { source: 'apollo', step: attempt.label, returned: apolloReturned },
       );
-      for (const p of (ap.people || [])) {
+      for (const p of apolloPeople) {
+        apolloCandidatePullCount++;
         sourcedRaw++;
         rawResultsBySource.apollo++;
         const name = (p.name || `${p.first_name || ''} ${p.last_name || ''}`.trim() || '').trim();
@@ -3635,7 +3699,7 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
         recordCandidateByGate(c, 'apollo');
         if (apolloMatchFatal) break;
       }
-      if (apolloMatchFatal) break;
+      if (apolloMatchFatal || apolloCandidatePullCount >= apolloVolumeConfig.maxCandidatesPerRun) break;
       if (!expandCandidatePool) break;
     }
     markProviderFinished(providerDiagnostics, 'apollo');
@@ -5308,7 +5372,11 @@ module.exports = {
     apolloCandidateSearch,
     apolloPeopleMatch,
     resolveApolloMaxEnrichPerRun,
+    resolveApolloVolumeConfig,
     APOLLO_MATCH_DEFAULT_MAX_PER_RUN,
+    APOLLO_MAX_RESULTS_PER_VARIANT_DEFAULT,
+    APOLLO_MAX_VARIANTS_PER_RUN_DEFAULT,
+    APOLLO_MAX_CANDIDATES_PER_RUN_DEFAULT,
     apolloSearchLocationFromNeed,
     expandRoleToTitles,
     normalizeApolloTitles,
