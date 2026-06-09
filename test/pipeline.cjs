@@ -51,6 +51,7 @@ const recentISO = new Date(Date.now() - 1 * 86400 * 1000).toISOString(); // 1 da
 let STUB_FIRECRAWL_ITEMS = null;     // when set, /v1/search returns these as data[]
 let STUB_GH_SEARCH_USERS = null;     // when set, /search/users returns { items: [...] }
 let STUB_APOLLO_PEOPLE = null;       // when set, mixed_people/search returns { people: [...] }
+let STUB_APOLLO_CONTACTS = null;     // when set, mixed_people/search returns { contacts: [...] }
 let STUB_APOLLO_HTTP = null;         // when set, mixed_people/search returns non-2xx with given status/body
 let STUB_APOLLO_MATCH = null;        // map/function for /api/v1/people/match
 let STUB_APOLLO_MATCH_HTTP = null;   // when set, people/match returns non-2xx
@@ -213,6 +214,7 @@ global.fetch = async (url, opts) => {
     const people = (typeof STUB_APOLLO_PEOPLE === 'function')
       ? STUB_APOLLO_PEOPLE(LAST_APOLLO_REQUEST_BODY)
       : (STUB_APOLLO_PEOPLE || []);
+    if (STUB_APOLLO_CONTACTS) return mkRes({ contacts: STUB_APOLLO_CONTACTS });
     return mkRes({ people });
   }
 
@@ -1493,10 +1495,18 @@ async function main() {
     `Apollo location strips hybrid work mode for Michigan (got ${JSON.stringify(apolloSearchLocationFromNeed({ location: 'Michigan hybrid', locationType: 'Hybrid' }))})`);
   assert(JSON.stringify(apolloSearchLocationFromNeed({ location: 'Texas hybrid', locationType: 'Hybrid' })) === JSON.stringify(['Texas, US']),
     `Apollo location strips hybrid work mode for Texas (got ${JSON.stringify(apolloSearchLocationFromNeed({ location: 'Texas hybrid', locationType: 'Hybrid' }))})`);
+  assert(JSON.stringify(apolloSearchLocationFromNeed({ location: 'Texas onsite', locationType: 'Onsite' })) === JSON.stringify(['Texas, US']),
+    `Apollo location strips onsite work mode for Texas (got ${JSON.stringify(apolloSearchLocationFromNeed({ location: 'Texas onsite', locationType: 'Onsite' }))})`);
   assert(JSON.stringify(apolloSearchLocationFromNeed({ location: 'Detroit onsite', locationType: 'Onsite' })) === JSON.stringify(['Detroit, US']),
     `Apollo location strips onsite work mode for city search (got ${JSON.stringify(apolloSearchLocationFromNeed({ location: 'Detroit onsite', locationType: 'Onsite' }))})`);
   assert(JSON.stringify(apolloSearchLocationFromNeed({ location: 'Michigan remote', locationType: 'Hybrid' })) === JSON.stringify(['Michigan, US']),
     `Apollo location strips remote work mode when the search is still located (got ${JSON.stringify(apolloSearchLocationFromNeed({ location: 'Michigan remote', locationType: 'Hybrid' }))})`);
+  assert(JSON.stringify(apolloSearchLocationFromNeed({ location: 'Remote or Detroit, Michigan', locationType: 'Hybrid' })) === JSON.stringify(['Detroit, Michigan, US']),
+    `Apollo location strips remote connector words for Detroit search (got ${JSON.stringify(apolloSearchLocationFromNeed({ location: 'Remote or Detroit, Michigan', locationType: 'Hybrid' }))})`);
+  assert(JSON.stringify(apolloSearchLocationFromNeed({ location: 'Remote or Detroit, Michigan', locationType: 'Remote' })) === JSON.stringify(['Detroit, Michigan, US']),
+    `Concrete location text wins over remote flag for mixed remote/local search (got ${JSON.stringify(apolloSearchLocationFromNeed({ location: 'Remote or Detroit, Michigan', locationType: 'Remote' }))})`);
+  assert(JSON.stringify(apolloSearchLocationFromNeed({ location: 'Remote and Austin, Texas', locationType: 'Hybrid' })) === JSON.stringify(['Austin, Texas, US']),
+    `Apollo location strips and connector words for Austin search (got ${JSON.stringify(apolloSearchLocationFromNeed({ location: 'Remote and Austin, Texas', locationType: 'Hybrid' }))})`);
   assert(JSON.stringify(apolloSearchLocationFromNeed({ location: 'Remote US', locationType: 'Remote' })) === JSON.stringify(['United States']),
     `Remote US Apollo search sends country-only location (got ${JSON.stringify(apolloSearchLocationFromNeed({ location: 'Remote US', locationType: 'Remote' }))})`);
   assert(JSON.stringify(apolloSearchLocationFromNeed({ location: 'Global', locationType: 'Remote' })) === JSON.stringify([]),
@@ -2959,6 +2969,12 @@ async function main() {
   const capOkRes = await apolloCandidateSearch({ titles: ['Azure Security Engineer'] });
   assert(capOkRes.ok === true && capOkRes.people.length === 1,
     `OK path still returns people after cap fix (got ok=${capOkRes.ok}, people=${capOkRes.people.length})`);
+  STUB_APOLLO_PEOPLE = [];
+  STUB_APOLLO_CONTACTS = [{ id: 'contacts-ok', name: 'Contacts OK', linkedin_url: 'https://www.linkedin.com/in/contacts-ok' }];
+  const contactsOkRes = await apolloCandidateSearch({ titles: ['Azure Security Engineer'], locations: ['Detroit, US'], perPage: 10 });
+  assert(contactsOkRes.ok === true && contactsOkRes.people.length === 1,
+    `Apollo api_search reads contacts[] when people[] is absent (got ok=${contactsOkRes.ok}, people=${contactsOkRes.people.length})`);
+  STUB_APOLLO_CONTACTS = null;
 
   // (g) Error path still logs safely (re-prove with the new normalized body)
   STUB_APOLLO_HTTP = { status: 422, body: { error: 'Invalid value for person_titles: too long (max 25)' } };

@@ -643,18 +643,32 @@ function selectedMarketFromNeed(need = {}) {
   const low = normalizeLocationToken(location);
   if (!location) return { mode: 'none' };
   if (/global|worldwide|anywhere/.test(low)) return { mode: 'global' };
-  if (/remote/.test(locationType) || /^remote( us)?$/.test(low) || /nationwide|united states|usa|^us$/.test(low)) {
-    return { mode: 'remote-us' };
-  }
   const state = detectUsState(location);
   const city = normalizeLocationToken(location
     .replace(/\bhybrid\b/ig, '')
     .replace(/\bremote\b/ig, '')
+    .replace(/\bonsite|on-site|in[-\s]?office\b/ig, '')
+    .replace(/\b(or|and)\b/ig, '')
     .split(',')
     .map(part => part.trim())
     .filter(part => part && !detectUsState(part) && !isUsCountry(part))
     .join(' '));
+  if (state || city) return { mode: 'concrete', location, state, city };
+  if (/remote/.test(locationType) || /^remote( us)?$/.test(low) || /nationwide|united states|usa|^us$/.test(low)) {
+    return { mode: 'remote-us' };
+  }
   return { mode: 'concrete', location, state, city };
+}
+
+function cleanApolloLocationText(value = '') {
+  return String(value || '')
+    .replace(/\b(hybrid|remote|onsite|on-site|in[-\s]?office)\b/ig, ' ')
+    .replace(/\b(or|and)\b/ig, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/\s+,/g, ',')
+    .replace(/,\s*,+/g, ',')
+    .replace(/(^,|,$)/g, '')
+    .trim();
 }
 
 function apolloSearchLocationFromNeed(need = {}) {
@@ -662,10 +676,7 @@ function apolloSearchLocationFromNeed(need = {}) {
   if (market.mode === 'global') return [];
   if (market.mode === 'remote-us') return ['United States'];
   if (market.mode !== 'concrete') return [];
-  const raw = String(need.location || '')
-    .replace(/\b(hybrid|remote|onsite|on-site|in[-\s]?office)\b/ig, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+  const raw = cleanApolloLocationText(need.location || '');
   if (!raw) return [];
   if (market.state) {
     const stateName = market.state.replace(/\b\w/g, ch => ch.toUpperCase());
@@ -1695,7 +1706,7 @@ async function apolloSearch({ titles, industry }) {
   });
   if (!res.ok) return { ok: false, reason: `Apollo HTTP ${res.status}`, people: [] };
   const data = await res.json();
-  return { ok: true, people: data.people || [] };
+  return { ok: true, people: data.people || data.contacts || [] };
 }
 
 // Apollo's mixed_people/search enforces a max of 25 entries on person_titles.
@@ -1970,7 +1981,7 @@ async function apolloCandidateSearch({ titles, locations = [], seniorities = [],
     };
   }
   const data = await res.json();
-  return { ok: true, people: data.people || [] };
+  return { ok: true, people: data.people || data.contacts || [] };
 }
 
 // Firecrawl multi-query Scout — targeted boards / sites that consistently
