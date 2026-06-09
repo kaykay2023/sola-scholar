@@ -214,7 +214,7 @@ global.fetch = async (url, opts) => {
     const people = (typeof STUB_APOLLO_PEOPLE === 'function')
       ? STUB_APOLLO_PEOPLE(LAST_APOLLO_REQUEST_BODY)
       : (STUB_APOLLO_PEOPLE || []);
-    if (STUB_APOLLO_CONTACTS) return mkRes({ contacts: STUB_APOLLO_CONTACTS });
+    if (STUB_APOLLO_CONTACTS) return mkRes({ people, contacts: STUB_APOLLO_CONTACTS });
     return mkRes({ people });
   }
 
@@ -1681,8 +1681,8 @@ async function main() {
   ]),
     `Combined SOC/Detection label splits into real Apollo titles in ranked order (titles=${JSON.stringify(volumeAttempts.map(a => a.titles[0]))})`);
   assert(volumeAttempts.every(a => !(a.titles || []).some(t => /\/|sentinel|kql|kusto/i.test(t))) &&
-    volumeAttempts.every(a => /KQL Kusto Microsoft Sentinel/.test(a.keywords || '')),
-    `Apollo title variants avoid slash/tool terms while q_keywords carries tool terms (attempts=${JSON.stringify(volumeAttempts.map(a => ({ titles: a.titles, keywords: a.keywords })))})`);
+    volumeAttempts.every(a => !(a.keywords || '')),
+    `Apollo title variants avoid slash/tool terms and do not force q_keywords hard filters (attempts=${JSON.stringify(volumeAttempts.map(a => ({ titles: a.titles, keywords: a.keywords })))})`);
   assert(volumeAttempts.every(a => JSON.stringify(a.locations) === JSON.stringify(['Michigan, US'])) &&
     volumeAttempts.every(a => !(a.locations || []).some(loc => /\bhybrid\b|\bonsite\b|\bremote\b/i.test(loc))),
     `Expand ON Michigan hybrid Apollo attempts stay selected-market filtered (locations=${JSON.stringify(volumeAttempts.map(a => a.locations))})`);
@@ -1746,8 +1746,8 @@ async function main() {
     APOLLO_SEARCH_CALLS.every(call => call.titleCount === 1 && call.per_page === 10),
     `Expand ON Michigan hybrid runs five capped location-filtered Apollo variant searches (calls=${JSON.stringify(APOLLO_SEARCH_CALLS)})`);
   assert(APOLLO_SEARCH_CALLS.every(call => !(call.person_titles || []).some(t => /\/|sentinel|kql|kusto/i.test(t))) &&
-    APOLLO_SEARCH_CALLS.every(call => call.q_keywords === 'KQL Kusto Microsoft Sentinel'),
-    `Apollo live search calls send real titles and keep tool terms in q_keywords (calls=${JSON.stringify(APOLLO_SEARCH_CALLS)})`);
+    APOLLO_SEARCH_CALLS.every(call => !call.q_keywords),
+    `Apollo live search calls send real titles without restrictive q_keywords (calls=${JSON.stringify(APOLLO_SEARCH_CALLS)})`);
   assert(JSON.stringify(APOLLO_SEARCH_CALLS.map(call => call.person_titles[0])) === JSON.stringify(volumeAttempts.map(a => a.titles[0])),
     `Apollo live search calls follow ranked variant order (calls=${JSON.stringify(APOLLO_SEARCH_CALLS.map(call => call.person_titles[0]))})`);
   assert(expandedApollo.length > baselineApollo.length && expandedApolloVisible.length === 5,
@@ -2973,7 +2973,7 @@ async function main() {
   STUB_APOLLO_CONTACTS = [{ id: 'contacts-ok', name: 'Contacts OK', linkedin_url: 'https://www.linkedin.com/in/contacts-ok' }];
   const contactsOkRes = await apolloCandidateSearch({ titles: ['Azure Security Engineer'], locations: ['Detroit, US'], perPage: 10 });
   assert(contactsOkRes.ok === true && contactsOkRes.people.length === 1,
-    `Apollo api_search reads contacts[] when people[] is absent (got ok=${contactsOkRes.ok}, people=${contactsOkRes.people.length})`);
+    `Apollo api_search reads contacts[] when people[] is empty (got ok=${contactsOkRes.ok}, people=${contactsOkRes.people.length})`);
   STUB_APOLLO_CONTACTS = null;
 
   // (g) Error path still logs safely (re-prove with the new normalized body)

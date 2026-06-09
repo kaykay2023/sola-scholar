@@ -1690,6 +1690,12 @@ function categorizeManagerTitle(title) {
   return 'Other';
 }
 
+function apolloPeopleFromResponse(data = {}) {
+  const people = Array.isArray(data.people) ? data.people : [];
+  const contacts = Array.isArray(data.contacts) ? data.contacts : [];
+  return people.length ? people : (contacts.length ? contacts : []);
+}
+
 async function apolloSearch({ titles, industry }) {
   if (!isConfigured('apollo')) return { ok: false, reason: 'APOLLO_API_KEY missing', people: [] };
   // Same Apollo cap rule as candidate path: trim, dedupe (case-insensitive),
@@ -1706,7 +1712,7 @@ async function apolloSearch({ titles, industry }) {
   });
   if (!res.ok) return { ok: false, reason: `Apollo HTTP ${res.status}`, people: [] };
   const data = await res.json();
-  return { ok: true, people: data.people || data.contacts || [] };
+  return { ok: true, people: apolloPeopleFromResponse(data) };
 }
 
 // Apollo's mixed_people/search enforces a max of 25 entries on person_titles.
@@ -1981,7 +1987,7 @@ async function apolloCandidateSearch({ titles, locations = [], seniorities = [],
     };
   }
   const data = await res.json();
-  return { ok: true, people: data.people || data.contacts || [] };
+  return { ok: true, people: apolloPeopleFromResponse(data) };
 }
 
 // Firecrawl multi-query Scout — targeted boards / sites that consistently
@@ -2085,9 +2091,6 @@ function uniqStrings(items, limit = Infinity) {
 
 function buildApolloCandidateAttempts(need, { expandCandidatePool = false, volumeConfig = null } = {}) {
   const role = need?.title || '';
-  const skills = uniqStrings(need?.requiredSkills || [], 5);
-  const primarySkill = skills[0] || '';
-  const topSkills = skills.slice(0, 2).join(' ');
   const expandedTitles = expandRoleToTitles(role);
   const roleOnly = splitRoleTitleLabel(role);
   const broadTitles = uniqStrings([...expandedTitles, ...BROAD_SECURITY_TITLES], 20);
@@ -2097,20 +2100,18 @@ function buildApolloCandidateAttempts(need, { expandCandidatePool = false, volum
   const expansion = buildCandidateSearchExpansion(need, { enabled: expandCandidatePool });
   const cfg = volumeConfig || resolveApolloVolumeConfig();
   let attempts = [
-    { label: 'focused-title-primary-skill', titles: expandedTitles, keywords: primarySkill, locations, perPage: 25 },
-    { label: 'focused-title-top-skills', titles: expandedTitles, keywords: topSkills, locations, perPage: 25 },
     { label: 'focused-title-only', titles: expandedTitles, keywords: '', locations, perPage: 25 },
   ];
   if (!isConcreteMarket) {
     attempts.push(
       { label: 'role-title-only-no-location', titles: roleOnly, keywords: '', locations: [], perPage: 25 },
-      { label: 'expanded-related-titles', titles: broadTitles, keywords: primarySkill, locations: [], perPage: 25 },
+      { label: 'expanded-related-titles', titles: broadTitles, keywords: '', locations: [], perPage: 25 },
       { label: 'expanded-related-title-only', titles: broadTitles, keywords: '', locations: [], perPage: 25 },
     );
   } else {
     attempts.push(
       { label: 'role-title-only-located', titles: roleOnly, keywords: '', locations, perPage: 25 },
-      { label: 'expanded-related-titles-located', titles: broadTitles, keywords: primarySkill, locations, perPage: 25 },
+      { label: 'expanded-related-titles-located', titles: broadTitles, keywords: '', locations, perPage: 25 },
       { label: 'expanded-related-title-only-located', titles: broadTitles, keywords: '', locations, perPage: 25 },
     );
   }
@@ -2139,14 +2140,13 @@ function buildApolloCandidateAttempts(need, { expandCandidatePool = false, volum
         if (market.mode === 'remote-us') return t.key === 'remote-us' || t.searchLocation === 'United States';
         return true;
       });
-    const keywordText = expansion.profileKeywords.slice(0, 3).join(' ');
     attempts = [];
     for (const tier of (locationPlans.length ? locationPlans : [{ key: 'global', label: 'Global', proximity_tier: 'Global', proximity_rank: 9, searchLocation: '' }])) {
       for (const variant of rankedVariants) {
         attempts.push({
           label: `expanded-${variant.variant_type}:${tier.key}:${variant.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}`,
           titles: [variant.title],
-          keywords: keywordText,
+          keywords: '',
           locations: tier.searchLocation ? [tier.searchLocation] : [],
           perPage: cfg.maxResultsPerVariant,
           searchVariantMeta: [variant],
