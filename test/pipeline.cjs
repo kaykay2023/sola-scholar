@@ -63,6 +63,7 @@ let STUB_ADZUNA_RESULTS = null;      // { results: [...] }
 const GH_CONTRIB_CALLS = [];         // captured 'owner/repo' calls
 let STUB_PDL_SEARCH = null;          // when set, /v5/person/search returns { data: [...] }
 let STUB_PDL_LOOKUP = null;          // when set, /v5/person/enrich?profile= returns { data: {...} }
+let STUB_PDL_LOOKUP_HTTP = null;     // when set, /v5/person/enrich?profile= returns { status, body }
 let STUB_PDL_RESOLVE = null;         // map: 'firstName lastName' → { data: { linkedin_url } } or null
 let STUB_PDL_RESOLVE_HTTP = null;    // when set, /v5/person/enrich resolve returns { status, body }
 let STUB_HUNTER_EMAIL = null;        // when set, hunter email-finder returns this string
@@ -124,7 +125,16 @@ global.fetch = async (url, opts) => {
   if (/api\.peopledatalabs\.com\/v5\/person\/enrich/.test(u)) {
     if (/[?&]profile=/.test(u)) {
       PDL_CALLS.push('enrich/profile');
-      return mkRes(STUB_PDL_LOOKUP || { data: null });
+      if (STUB_PDL_LOOKUP_HTTP) {
+        return mkRes(STUB_PDL_LOOKUP_HTTP.body || {}, STUB_PDL_LOOKUP_HTTP.status || 200);
+      }
+      const m = u.match(/[?&]profile=([^&]+)/);
+      const profile = m ? decodeURIComponent(m[1]) : '';
+      const entry = typeof STUB_PDL_LOOKUP === 'function'
+        ? STUB_PDL_LOOKUP(profile, u)
+        : STUB_PDL_LOOKUP;
+      if (entry && entry.__status) return mkRes(entry.body || {}, entry.__status);
+      return mkRes(entry || { data: null });
     }
     PDL_CALLS.push('enrich/resolve');
     if (STUB_PDL_RESOLVE_HTTP) {
@@ -578,12 +588,12 @@ async function main() {
       name: 'Low Overlap Verified',
       skills: ['cloud security'],   // does not exactly match Security/Azure/KQL/IR
       linkedinUrl: 'https://www.linkedin.com/in/low-overlap',
-      source: 'PDL',
+      source: 'Apollo',
       scoutDecision: 'accepted',
       pipelineRunId: exactRun,
     });
     assert(isFinalShortlistEligible(lowOverlapCand) === true,
-      `Verified-only gate still admits low-skill-overlap PDL candidate with valid LinkedIn URL + accepted decision`);
+      `Verified-only gate still admits low-skill-overlap Apollo candidate with valid LinkedIn URL + accepted decision`);
     // And gate still rejects when decision flips to review
     lowOverlapCand.scoutDecision = 'review';
     assert(isFinalShortlistEligible(lowOverlapCand) === false,
@@ -3357,8 +3367,17 @@ async function main() {
   STUB_ADZUNA_RESULTS = null;
   STUB_APOLLO_PEOPLE = null;
 
-  // ── 31. Commit C — PDL module (Person Search + Resolve + Lookup) + Hunter on candidates ──
-  const { pdlPersonSearch, pdlProfileLookup, pdlProfileResolve, pdlResolveIdentifiersFromName } = _internals;
+  // ── 31. PDL Person Enrichment — accepted/in-market only, capped, scoring input only ──
+  const {
+    pdlPersonSearch,
+    pdlProfileLookup,
+    pdlProfileResolve,
+    pdlResolveIdentifiersFromName,
+    pdlParsePersonEnrichmentPayload,
+    pdlProfileParamFromLinkedInUrl,
+    runPdlCandidateEnrichment,
+    initProviderRunDiagnostics,
+  } = _internals;
 
   // (a) PDL helpers DORMANT when PDL_API_KEY missing
   delete process.env.PDL_API_KEY;
@@ -3390,7 +3409,8 @@ async function main() {
   assert(typeof dormScout === 'object' && Array.isArray(dormScout.candidates),
     `runScout still returns normal shape with PDL dormant`);
 
-  // (c) PDL Person Search — proactive source
+  // (c) PDL Person Search helper still forms a safe query, but scout/pipeline do
+  // not use PDL as discovery.
   process.env.PDL_API_KEY = 'commit-c-pdl-key';
   PDL_CALLS.length = 0;
   STUB_PDL_SEARCH = {
@@ -3407,14 +3427,9 @@ async function main() {
       { linkedin_url: 'attacker.com/spoof', first_name: 'Spoof', last_name: 'Try' },  // invalid URL → rejected
     ],
   };
-  const pdlNeed = createNeed({
-    companyId: coApollo.id, title: 'Cloud Security Engineer',
-    requiredSkills: ['Azure','Sentinel'], seniority: 'Mid', locationType: 'Remote', confirmed: true,
-  });
-  const pdlRun = 'pdl_search_' + Date.now().toString(36);
-  const pdlScout = await runScout({ needId: pdlNeed.id, pipelineRunId: pdlRun });
+  const directPdlSearch = await pdlPersonSearch({ role: 'Cloud Security Engineer', keywords: 'Azure Sentinel KQL' });
   assert(PDL_CALLS.includes('search/person'),
-    `Scout calls PDL Person Search endpoint`);
+    `PDL Person Search helper calls search endpoint`);
   assert(LAST_PDL_REQUEST_HEADERS && LAST_PDL_REQUEST_HEADERS['x-api-key'] === 'commit-c-pdl-key',
     `PDL request includes X-Api-Key header (got ${JSON.stringify(LAST_PDL_REQUEST_HEADERS)})`);
   assert(LAST_PDL_SEARCH_BODY && LAST_PDL_SEARCH_BODY.query && LAST_PDL_SEARCH_BODY.query.bool,
@@ -3440,208 +3455,186 @@ async function main() {
     assert(bool.minimum_should_match === undefined,
       `PDL bool.minimum_should_match is NOT sent (PDL rejects it with HTTP 400) — got ${JSON.stringify(bool.minimum_should_match)}`);
   }
-  assert(pdlScout.pdlRaw === 4, `pdlRaw counts all 4 results (got ${pdlScout.pdlRaw})`);
-  assert(pdlScout.acceptedBySource.pdl === 3,
-    `acceptedBySource.pdl === 3 (got ${pdlScout.acceptedBySource.pdl})`);
-  assert(pdlScout.rejectedBySource.pdl === 1,
-    `rejectedBySource.pdl === 1 (spoofed URL; got ${pdlScout.rejectedBySource.pdl})`);
-  const pdl1 = DB.candidates.find(c => c.pipelineRunId === pdlRun && c.name === 'PDL Person One');
-  assert(pdl1 && pdl1.source === 'PDL' && pdl1.scoutDecision === 'accepted',
-    `PDL candidate stored with source='PDL' / accepted (got ${pdl1 && pdl1.source}/${pdl1 && pdl1.scoutDecision})`);
-  assert(pdl1 && pdl1.identityVerificationStatus === 'verified',
-    `PDL candidate identityVerificationStatus === 'verified' (LinkedIn /in/)`);
-  assert(pdl1 && isFinalShortlistEligible(pdl1) === true,
-    `PDL candidate IS final-shortlist eligible`);
+  assert(directPdlSearch.ok === true && directPdlSearch.items.length === 4,
+    `PDL helper returns search items without wiring discovery (got ${directPdlSearch.items.length})`);
 
-  // Verified-only gate: an unverified PDL candidate MUST NOT pass the gate.
-  {
-    const savedUrl = pdl1.linkedinUrl;
-    const savedStatus = pdl1.identityVerificationStatus;
-    pdl1.linkedinUrl = '';
-    pdl1.identityVerificationStatus = 'unverified';
-    assert(isFinalShortlistEligible(pdl1) === false,
-      `Unverified PDL candidate (no LinkedIn URL) is NOT final-shortlist eligible`);
-    pdl1.linkedinUrl = savedUrl;
-    pdl1.identityVerificationStatus = savedStatus;
-  }
-
-  // (d) Profile Resolve — rescues Apollo-no-LinkedIn review-pool candidate
-  STUB_PDL_SEARCH = { data: [] };
-  STUB_APOLLO_PEOPLE = [
-    { id: 'rescue-1', name: 'Rescue Candidate', title: 'Security Engineer',
-      organization: { name: 'RescueCo' },  // no linkedin_url → goes to review
-    },
-  ];
-  STUB_PDL_RESOLVE = {
-    'Rescue Candidate': { data: {
-      linkedin_url: 'linkedin.com/in/rescue-candidate',
-      location_country: 'United States',
-      job_title: 'Security Engineer',
-      job_company_name: 'RescueCo',
-    }, likelihood: 8 },
-  };
-  const rescueNeed = createNeed({
-    companyId: coApollo.id, title: 'Security Engineer',
-    requiredSkills: ['Azure'], seniority: 'Mid', locationType: 'Remote', confirmed: true,
-  });
-  const rescueRun = 'pdl_resolve_' + Date.now().toString(36);
-  const rescueScout = await runScout({ needId: rescueNeed.id, pipelineRunId: rescueRun });
-  const rescued = DB.candidates.find(c => c.pipelineRunId === rescueRun && c.name === 'Rescue Candidate');
-  assert(rescued, `rescue candidate exists in DB`);
-  assert(rescued && /linkedin\.com\/in\/rescue-candidate/.test(rescued.linkedinUrl || ''),
-    `Profile Resolve filled missing LinkedIn URL (got "${rescued && rescued.linkedinUrl}")`);
-  assert(rescued && rescued.identityVerificationStatus === 'verified',
-    `Resolved candidate flipped to identityVerificationStatus='verified' (got "${rescued && rescued.identityVerificationStatus}")`);
-  assert(rescued && rescued.identityVerificationSource === 'pdl-resolved',
-    `identityVerificationSource === 'pdl-resolved' (got "${rescued && rescued.identityVerificationSource}")`);
-  assert(rescued && rescued.scoutDecision === 'accepted',
-    `Rescued candidate scoutDecision flipped from review → accepted`);
-  assert(rescued && isFinalShortlistEligible(rescued) === true,
-    `Rescued candidate IS final-shortlist eligible`);
-
-  // (d2) PDL Resolve guard — insufficient identifiers skip enrich, no noisy provider error.
-  STUB_PDL_SEARCH = { data: [] };
-  STUB_PDL_LOOKUP = null;
-  STUB_PDL_RESOLVE = {};
-  STUB_PDL_RESOLVE_HTTP = null;
   PDL_CALLS.length = 0;
-  STUB_APOLLO_PEOPLE = [
-    { id: 'single-token-1', name: 'Mononym', title: 'Security Engineer',
-      organization: { name: 'SoloCo' },
-    },
-  ];
-  const singleTokenNeed = createNeed({
-    companyId: coApollo.id, title: 'Security Engineer',
-    requiredSkills: ['Azure'], seniority: 'Mid', locationType: 'Remote', confirmed: true,
+  const pdlNeed = createNeed({
+    companyId: coApollo.id, title: 'Cloud Security Engineer',
+    requiredSkills: ['Azure','Sentinel'], seniority: 'Mid', locationType: 'Remote', confirmed: true,
   });
-  const singleTokenRun = 'pdl_single_token_' + Date.now().toString(36);
-  const singleTokenScout = await runScout({ needId: singleTokenNeed.id, pipelineRunId: singleTokenRun });
-  const singleToken = DB.candidates.find(c => c.pipelineRunId === singleTokenRun && c.name === 'Mononym');
-  assert(!PDL_CALLS.includes('enrich/resolve'),
-    `single-token Apollo name does NOT call PDL enrich/resolve (calls=${JSON.stringify(PDL_CALLS)})`);
-  const singleTokenIdentifiers = pdlResolveIdentifiersFromName('Mononym');
-  assert(singleTokenIdentifiers.ok === false &&
-    singleTokenIdentifiers.reason === 'PDL_ENRICH_SKIPPED_INSUFFICIENT_IDENTIFIERS',
-    `single-token Apollo candidate records PDL_ENRICH_SKIPPED_INSUFFICIENT_IDENTIFIERS`);
-  assert(singleToken && singleToken.scoutDecision === 'review' &&
-    singleToken.resolution_status === 'unresolved' && isFinalShortlistEligible(singleToken) === false,
-    `single-token unresolved candidate stays in review/recoverable path`);
-  assert(singleTokenScout.providerDiagnostics.pdl.error === false,
-    `single-token PDL enrich skip does not mark provider failed`);
+  const pdlRun = 'pdl_no_discovery_' + Date.now().toString(36);
+  const pdlScout = await runScout({ needId: pdlNeed.id, pipelineRunId: pdlRun });
+  assert(!PDL_CALLS.includes('search/person') && pdlScout.pdlRaw === 0 && pdlScout.acceptedBySource.pdl === 0,
+    `Scout does NOT use PDL for discovery (calls=${JSON.stringify(PDL_CALLS)}, pdlRaw=${pdlScout.pdlRaw})`);
 
-  // (d3) PDL Resolve 404 — no match, not fatal, candidate stays review/recoverable.
+  // (d) Parser and profile parameter are safe for populated, empty, and missing fields.
+  const profileParam = pdlProfileParamFromLinkedInUrl('https://www.linkedin.com/in/some-slug/?trk=public');
+  assert(profileParam === 'linkedin.com/in/some-slug',
+    `PDL profile param uses LinkedIn slug form (got ${profileParam})`);
+  const parsedFull = pdlParsePersonEnrichmentPayload({ data: { skills: ['Python','SQL'], experience: [{ title: 'Engineer' }] } });
+  const parsedEmpty = pdlParsePersonEnrichmentPayload({ data: { skills: [], experience: [] } });
+  const parsedMissing = pdlParsePersonEnrichmentPayload({});
+  assert(parsedFull.skills.length === 2 && parsedFull.experience.length === 1,
+    `PDL parser reads populated skills/experience`);
+  assert(parsedEmpty.skills.length === 0 && parsedMissing.skills.length === 0 && parsedMissing.experience.length === 0,
+    `PDL parser handles empty/missing skills and experience`);
+
+  // (e) Enrichment runs only for accepted/in-market candidates and respects cap.
   STUB_PDL_SEARCH = { data: [] };
-  STUB_PDL_RESOLVE = {};
-  STUB_PDL_RESOLVE_HTTP = { status: 404, body: { error: 'not_found' } };
-  PDL_CALLS.length = 0;
-  STUB_APOLLO_PEOPLE = [
-    { id: 'no-match-1', name: 'No Match', title: 'Security Engineer',
-      organization: { name: 'NoMatchCo' },
-    },
-  ];
-  const noMatchNeed = createNeed({
-    companyId: coApollo.id, title: 'Security Engineer',
-    requiredSkills: ['Azure'], seniority: 'Mid', locationType: 'Remote', confirmed: true,
-  });
-  const noMatchRun = 'pdl_no_match_' + Date.now().toString(36);
-  const noMatchScout = await runScout({ needId: noMatchNeed.id, pipelineRunId: noMatchRun });
-  const noMatch = DB.candidates.find(c => c.pipelineRunId === noMatchRun && c.name === 'No Match');
-  assert(PDL_CALLS.includes('enrich/resolve'),
-    `two-token Apollo name calls PDL enrich/resolve for 404 no-match case`);
-  assert(noMatch && Array.isArray(noMatch.provider_trace) &&
-    noMatch.provider_trace.some(t => t.provider === 'pdl' && t.called === true &&
-      t.returned === false && t.skip_reason === 'PDL_ENRICH_NO_MATCH'),
-    `PDL 404 records PDL_ENRICH_NO_MATCH trace`);
-  assert(noMatch && noMatch.scoutDecision === 'review' &&
-    noMatch.resolution_status === 'unresolved' && isFinalShortlistEligible(noMatch) === false,
-    `PDL 404 no-match candidate remains NEEDS_REVIEW/recoverable`);
-  assert(noMatchScout.providerDiagnostics.pdl.error === false,
-    `PDL 404 no-match does not mark provider failed globally`);
-
-  // (d4) PDL Resolve 200 thin match — not structurally resolved.
-  STUB_PDL_SEARCH = { data: [] };
-  STUB_PDL_RESOLVE_HTTP = null;
-  STUB_PDL_RESOLVE = {
-    'Thin Match': { data: { linkedin_url: 'linkedin.com/in/thin-match' }, likelihood: 7 },
-  };
-  PDL_CALLS.length = 0;
-  STUB_APOLLO_PEOPLE = [
-    { id: 'thin-match-1', name: 'Thin Match', title: 'Security Engineer',
-      organization: { name: 'ThinCo' },
-    },
-  ];
-  const thinNeed = createNeed({
-    companyId: coApollo.id, title: 'Security Engineer',
-    requiredSkills: ['Azure'], seniority: 'Mid', locationType: 'Remote', confirmed: true,
-  });
-  const thinRun = 'pdl_thin_match_' + Date.now().toString(36);
-  const thinScout = await runScout({ needId: thinNeed.id, pipelineRunId: thinRun });
-  const thin = DB.candidates.find(c => c.pipelineRunId === thinRun && c.name === 'Thin Match');
-  assert(thin && !/linkedin\.com\/in\/thin-match/.test(thin.linkedinUrl || '') &&
-    thin.identityVerificationStatus !== 'verified' && thin.resolution_status === 'unresolved',
-    `PDL 200 thin match does not mark candidate resolved/verified`);
-  assert(thin && Array.isArray(thin.provider_trace) &&
-    thin.provider_trace.some(t => t.provider === 'pdl' && t.called === true &&
-      t.returned === false && t.skip_reason === 'PDL_ENRICH_THIN_MATCH'),
-    `PDL 200 thin match records PDL_ENRICH_THIN_MATCH`);
-  assert(thinScout.providerDiagnostics.pdl.error === false,
-    `PDL 200 thin match does not mark provider failed globally`);
-
-  // (d5) PDL Resolve non-200/non-404 classifications avoid unknown-error.
-  async function assertPdlResolveHttpClassification(status, reason, errorType) {
-    STUB_PDL_SEARCH = { data: [] };
-    STUB_PDL_RESOLVE = {};
-    STUB_PDL_RESOLVE_HTTP = { status, body: { error: reason } };
-    STUB_APOLLO_PEOPLE = [
-      { id: `pdl-http-${status}`, name: `Http ${status}`, title: 'Security Engineer',
-        organization: { name: `Http${status}Co` },
-      },
-    ];
-    const httpNeed = createNeed({
-      companyId: coApollo.id, title: 'Security Engineer',
-      requiredSkills: ['Azure'], seniority: 'Mid', locationType: 'Remote', confirmed: true,
-    });
-    const httpRun = `pdl_http_${status}_` + Date.now().toString(36);
-    const scout = await runScout({ needId: httpNeed.id, pipelineRunId: httpRun });
-    assert(scout.providerDiagnostics.pdl.error === true,
-      `PDL HTTP ${status} marks provider diagnostic error`);
-    assert(scout.providerDiagnostics.pdl.sanitized_error_message === reason,
-      `PDL HTTP ${status} sanitized reason is ${reason}`);
-    assert(scout.providerDiagnostics.pdl.error_type === errorType,
-      `PDL HTTP ${status} is classified as ${errorType}, not unknown-error`);
-  }
-  await assertPdlResolveHttpClassification(429, 'PDL_RATE_LIMITED', 'rate-limited');
-  await assertPdlResolveHttpClassification(500, 'PDL_TEMPORARY_PROVIDER_ERROR', 'provider-error');
-
-  // (e) Profile Lookup — enriches accepted candidate with skills snapshot
-  STUB_PDL_SEARCH = {
-    data: [
-      { linkedin_url: 'linkedin.com/in/enrich-target',
-        full_name: 'Enrich Target', job_title: 'Engineer' },   // no skills initially
-    ],
-  };
+  STUB_PDL_LOOKUP_HTTP = null;
   STUB_PDL_LOOKUP = {
     data: {
-      skills: ['Kubernetes','Terraform','Helm','Prometheus','Grafana'],
-      summary: 'Detailed engineer summary.',
-      location_locality: 'London',
-      location_country: 'UK',
+      skills: ['Python','SQL','Snowflake','Docker','AWS'],
+      experience: [{ title: 'Senior Data Engineer' }],
+      summary: 'Data platform profile.',
     },
     likelihood: 9,
   };
-  STUB_PDL_RESOLVE = {};
-  STUB_APOLLO_PEOPLE = [];
-  const lookupNeed = createNeed({
-    companyId: coApollo.id, title: 'Cloud Security Engineer',
-    requiredSkills: ['Kubernetes'], seniority: 'Mid', locationType: 'Remote', confirmed: true,
+  const enrichNeed = createNeed({
+    companyId: coApollo.id, title: 'Senior Data Engineer',
+    requiredSkills: ['Python','SQL','Snowflake'], seniority: 'Senior', locationType: 'Remote', confirmed: true,
   });
-  const lookupRun = 'pdl_lookup_' + Date.now().toString(36);
-  await runScout({ needId: lookupNeed.id, pipelineRunId: lookupRun });
-  const enriched = DB.candidates.find(c => c.pipelineRunId === lookupRun && c.name === 'Enrich Target');
-  assert(enriched && Array.isArray(enriched.skills) && enriched.skills.includes('Kubernetes'),
-    `Profile Lookup enriched candidate.skills with Kubernetes (got ${JSON.stringify(enriched && enriched.skills)})`);
-  assert(enriched && Array.isArray(enriched.enrichedBy) && enriched.enrichedBy.includes('pdl-lookup'),
-    `enrichedBy includes 'pdl-lookup' (got ${JSON.stringify(enriched && enriched.enrichedBy)})`);
+  const enrichRun = 'pdl_enrich_' + Date.now().toString(36);
+  const acceptedA = findOrCreateCandidate({
+    name: 'Accepted One', title: 'Senior Data Engineer', company: 'DataCo',
+    skills: ['ApolloSkill'], linkedinUrl: 'https://www.linkedin.com/in/accepted-one',
+    source: 'Apollo', scoutDecision: 'accepted', provider_of_record: 'apollo', discovered_by: ['apollo'], pipelineRunId: enrichRun,
+  });
+  const acceptedB = findOrCreateCandidate({
+    name: 'Accepted Two', title: 'Senior Data Engineer', company: 'DataCo',
+    skills: ['ApolloSkill'], linkedinUrl: 'https://www.linkedin.com/in/accepted-two',
+    source: 'Apollo', scoutDecision: 'accepted', provider_of_record: 'apollo', discovered_by: ['apollo'], pipelineRunId: enrichRun,
+  });
+  const queuedC = findOrCreateCandidate({
+    name: 'Accepted Three', title: 'Senior Data Engineer', company: 'DataCo',
+    skills: ['ApolloSkill'], linkedinUrl: 'https://www.linkedin.com/in/accepted-three',
+    source: 'Apollo', scoutDecision: 'accepted', provider_of_record: 'apollo', discovered_by: ['apollo'], pipelineRunId: enrichRun,
+  });
+  const reviewCandidate = findOrCreateCandidate({
+    name: 'Review Only', title: 'Senior Data Engineer', company: 'DataCo',
+    skills: ['ApolloSkill'], linkedinUrl: 'https://www.linkedin.com/in/review-only',
+    source: 'Apollo', scoutDecision: 'review', provider_of_record: 'apollo', discovered_by: ['apollo'], pipelineRunId: enrichRun,
+  });
+  PDL_CALLS.length = 0;
+  const enrichDiag = initProviderRunDiagnostics();
+  const enrichResult = await runPdlCandidateEnrichment({
+    needId: enrichNeed.id,
+    pipelineRunId: enrichRun,
+    candidateIds: [acceptedA.id, acceptedB.id, queuedC.id, reviewCandidate.id],
+    pdlEnrichMaxPerRun: 2,
+    providerDiagnostics: enrichDiag,
+  });
+  assert(enrichResult.enriched === 2 && enrichResult.queued === 1 && PDL_CALLS.filter(x => x === 'enrich/profile').length === 2,
+    `PDL enrich caps accepted candidates only (result=${JSON.stringify(enrichResult)}, calls=${JSON.stringify(PDL_CALLS)})`);
+  assert(Array.isArray(acceptedA.skills) && acceptedA.skills.includes('Python') && acceptedA.skills.includes('ApolloSkill'),
+    `PDL skills merge with existing Apollo skills (got ${JSON.stringify(acceptedA.skills)})`);
+  assert(Array.isArray(acceptedA.skillEvidence) &&
+    acceptedA.skillEvidence.some(e => e.skill === 'ApolloSkill' && e.source === 'apollo') &&
+    acceptedA.skillEvidence.some(e => e.skill === 'Python' && e.source === 'pdl'),
+    `skillEvidence keeps Apollo and PDL provenance (got ${JSON.stringify(acceptedA.skillEvidence)})`);
+  assert(!reviewCandidate.skills.includes('Python') && queuedC.pdl_skipped === 'PDL_ENRICH_QUEUED_CAP_REACHED',
+    `review candidates are not enriched and cap-hit candidates stay queued`);
+
+  // (f) Merged PDL skills flow into existing scoring without changing math.
+  const scoreNeed = createNeed({
+    companyId: coApollo.id, title: 'Senior Data Engineer',
+    requiredSkills: ['Python','SQL','Snowflake'], seniority: 'Senior', locationType: 'Remote', confirmed: true,
+  });
+  const scoreRun = 'pdl_score_' + Date.now().toString(36);
+  const scoreCand = findOrCreateCandidate({
+    name: 'Score Lift', title: 'Senior Data Engineer', company: 'DataCo',
+    skills: ['Customer Support'], linkedinUrl: 'https://www.linkedin.com/in/score-lift',
+    source: 'Apollo', scoutDecision: 'accepted', provider_of_record: 'apollo', discovered_by: ['apollo'], pipelineRunId: scoreRun,
+  });
+  const beforeScore = scoreCandidateAgainstNeed(scoreCand, scoreNeed, scoreRun).score;
+  PDL_CALLS.length = 0;
+  await runPdlCandidateEnrichment({
+    needId: scoreNeed.id,
+    pipelineRunId: scoreRun,
+    candidateIds: [scoreCand.id],
+    pdlEnrichMaxPerRun: 1,
+    providerDiagnostics: initProviderRunDiagnostics(),
+  });
+  const afterScore = scoreCandidateAgainstNeed(scoreCand, scoreNeed, scoreRun).score;
+  assert(afterScore > beforeScore && scoreCand.skills.includes('Snowflake'),
+    `PDL skills flow into existing scoring (before=${beforeScore}, after=${afterScore}, skills=${scoreCand.skills.length})`);
+
+  // (g) Status classifications: 404 no-match, 402 plan, 429 rate, 5xx provider error.
+  async function assertPdlLookupClassification(status, expectedField, expectedSummaryField) {
+    const statusNeed = createNeed({
+      companyId: coApollo.id, title: 'Security Engineer',
+      requiredSkills: ['Azure'], seniority: 'Mid', locationType: 'Remote', confirmed: true,
+    });
+    const statusRun = `pdl_status_${status}_` + Date.now().toString(36);
+    const statusCand = findOrCreateCandidate({
+      name: `Status ${status}`, title: 'Security Engineer', company: 'StatusCo',
+      skills: ['Azure'], linkedinUrl: `https://www.linkedin.com/in/status-${status}`,
+      source: 'Apollo', scoutDecision: 'accepted', provider_of_record: 'apollo', discovered_by: ['apollo'], pipelineRunId: statusRun,
+    });
+    STUB_PDL_LOOKUP = null;
+    STUB_PDL_LOOKUP_HTTP = { status, body: { error: `status_${status}` } };
+    const diag = initProviderRunDiagnostics();
+    const result = await runPdlCandidateEnrichment({
+      needId: statusNeed.id,
+      pipelineRunId: statusRun,
+      candidateIds: [statusCand.id],
+      pdlEnrichMaxPerRun: 1,
+      providerDiagnostics: diag,
+    });
+    assert(diag.pdl[expectedField] === 1 && result[expectedSummaryField] === 1,
+      `PDL HTTP ${status} classified into ${expectedField} (diag=${JSON.stringify(diag.pdl)}, result=${JSON.stringify(result)})`);
+  }
+  await assertPdlLookupClassification(404, 'enrich_no_match_count', 'noMatch');
+  await assertPdlLookupClassification(402, 'enrich_plan_restricted_count', 'planRestricted');
+  await assertPdlLookupClassification(429, 'enrich_rate_limited_count', 'rateLimited');
+  await assertPdlLookupClassification(500, 'enrich_provider_error_count', 'errored');
+  STUB_PDL_LOOKUP_HTTP = null;
+
+  // (h) Fallback name+company enrich skips insufficient identifiers and parses skills from one call.
+  STUB_PDL_RESOLVE_HTTP = null;
+  STUB_PDL_RESOLVE = {
+    'Name Fallback': { data: {
+      linkedin_url: 'linkedin.com/in/name-fallback',
+      job_title: 'Security Engineer',
+      job_company_name: 'FallbackCo',
+      location_country: 'United States',
+      skills: ['Azure', 'KQL'],
+    }, likelihood: 8 },
+  };
+  const pdlFallbackNeed = createNeed({
+    companyId: coApollo.id, title: 'Security Engineer',
+    requiredSkills: ['Azure','KQL'], seniority: 'Mid', locationType: 'Remote', confirmed: true,
+  });
+  const pdlFallbackRun = 'pdl_fallback_' + Date.now().toString(36);
+  const pdlFallbackCand = findOrCreateCandidate({
+    name: 'Name Fallback', title: 'Security Engineer', company: 'FallbackCo',
+    skills: [], github: 'https://github.com/name-fallback',
+    source: 'GitHub', scoutDecision: 'accepted', provider_of_record: 'github', discovered_by: ['github'], pipelineRunId: pdlFallbackRun,
+  });
+  const pdlMononymCand = findOrCreateCandidate({
+    name: 'Mononym', title: 'Security Engineer', company: 'FallbackCo',
+    skills: [], github: 'https://github.com/mononym',
+    source: 'GitHub', scoutDecision: 'accepted', provider_of_record: 'github', discovered_by: ['github'], pipelineRunId: pdlFallbackRun,
+  });
+  PDL_CALLS.length = 0;
+  const fallbackDiag = initProviderRunDiagnostics();
+  const fallbackResult = await runPdlCandidateEnrichment({
+    needId: pdlFallbackNeed.id,
+    pipelineRunId: pdlFallbackRun,
+    candidateIds: [pdlFallbackCand.id, pdlMononymCand.id],
+    pdlEnrichMaxPerRun: 5,
+    providerDiagnostics: fallbackDiag,
+  });
+  assert(pdlFallbackCand.skills.includes('Azure') && PDL_CALLS.filter(x => x === 'enrich/resolve').length === 1,
+    `name+company fallback enriches from one PDL call (calls=${JSON.stringify(PDL_CALLS)}, skills=${JSON.stringify(pdlFallbackCand.skills)})`);
+  assert(fallbackResult.skippedNoIdentifier === 1 && pdlMononymCand.pdl_skipped === 'PDL_ENRICH_SKIPPED_INSUFFICIENT_IDENTIFIERS',
+    `missing identifiers are skipped without crashing`);
+
+  const diagJson = JSON.stringify(enrichDiag.pdl);
+  assert(!diagJson.includes('commit-c-pdl-key') && !diagJson.includes('linkedin.com/in') && !diagJson.includes('Python') &&
+    !diagJson.includes('accepted-one'),
+    `PDL diagnostics expose no secrets, raw payloads, LinkedIn URLs, or candidate PII`);
 
   // (f) Hunter on candidates — fill missing email
   STUB_PDL_SEARCH = { data: [] };
@@ -3671,6 +3664,7 @@ async function main() {
   // Reset
   STUB_PDL_SEARCH = null;
   STUB_PDL_LOOKUP = null;
+  STUB_PDL_LOOKUP_HTTP = null;
   STUB_PDL_RESOLVE = null;
   STUB_PDL_RESOLVE_HTTP = null;
   STUB_HUNTER_EMAIL = null;
