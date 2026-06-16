@@ -17,6 +17,7 @@ try { require('dotenv').config(); } catch { /* dotenv optional */ }
 const PORT = parseInt(process.env.PORT, 10) || 8080;
 const HOST = '0.0.0.0';
 const CLIENT_REPORT_CANDIDATE_LIMIT = 5;
+const PDL_ENRICH_DEFAULT_MAX_PER_RUN = 15;
 // DATA_PATH may point at either the persistent data directory (/data) or the
 // JSON file itself (/data/data.json). Support both so production keeps loading
 // existing Railway volume data even if the variable was set to the file path.
@@ -126,6 +127,15 @@ function emptyProviderRunDiagnostic(provider) {
     firecrawl_only_count: 0,
     resolved_by_pdl_count: 0,
     resolved_by_apollo_count: 0,
+    enrich_cap: 0,
+    enrich_called_count: 0,
+    enrich_enriched_count: 0,
+    enrich_queued_count: 0,
+    enrich_no_match_count: 0,
+    enrich_skipped_no_identifier_count: 0,
+    enrich_plan_restricted_count: 0,
+    enrich_rate_limited_count: 0,
+    enrich_provider_error_count: 0,
   };
 }
 
@@ -359,6 +369,39 @@ function normalizeSet(values) {
 
 function mergeUniqueStrings(a = [], b = []) {
   return normalizeSet([...(Array.isArray(a) ? a : []), ...(Array.isArray(b) ? b : [])]);
+}
+
+function normalizeSkillKey(skill = '') {
+  return String(skill || '').toLowerCase().replace(/[^a-z0-9+#]/g, '');
+}
+
+function mergeCandidateSkillEvidence(c, skills = [], source = '') {
+  if (!c) return c;
+  const provider = normalizeProviderKey(source || c.provider_of_record || c.source || 'unknown') || 'unknown';
+  const incoming = normalizeSet(skills).slice(0, 100);
+  const existingSkills = normalizeSet(c.skills || []);
+  const evidence = Array.isArray(c.skillEvidence) ? c.skillEvidence.filter(Boolean) : [];
+  const evidenceKeys = new Set(evidence.map(e => `${normalizeSkillKey(e.skill)}:${normalizeProviderKey(e.source || '')}`));
+
+  for (const skill of existingSkills) {
+    const key = `${normalizeSkillKey(skill)}:${provider}`;
+    if (!evidenceKeys.has(key)) {
+      evidence.push({ skill, source: provider });
+      evidenceKeys.add(key);
+    }
+  }
+  for (const skill of incoming) {
+    const skillKey = normalizeSkillKey(skill);
+    const evidenceKey = `${skillKey}:${provider}`;
+    if (!evidenceKeys.has(evidenceKey)) {
+      evidence.push({ skill, source: provider });
+      evidenceKeys.add(evidenceKey);
+    }
+    if (!existingSkills.some(s => normalizeSkillKey(s) === skillKey)) existingSkills.push(skill);
+  }
+  c.skills = existingSkills.slice(0, 150);
+  c.skillEvidence = evidence.slice(0, 250);
+  return c;
 }
 
 function mergeUniqueObjects(a = [], b = [], keyFn = item => JSON.stringify(item)) {
@@ -1400,14 +1443,14 @@ function findOrCreateCandidate(input) {
   if (c) {
     const fields = ['name','currentTitle','currentCompany','location','github','linkedinUrl','portfolioUrl','resumeUrl','profileUrl','sourceProfile','email','phone','summary','avatarUrl','sourceUrl','sourceType','scoutDecision','scoutReason','sourceDomain','sourceChannel','scoutScore','scoutScoreReasons','scoutSourceLabel','scoutQuery','experienceScore','experienceSignals','privateProfileWarning','seniority_signal','experience_level_guess','work_experience_evidence','entry_level_warning','reviewStatus','visibility_state','reason_code','signals_snapshot','recoverable','confidence_modifier','security_months_cumulative','most_recent_security_role_at','provider_of_record','resolution_status','source_confidence','location_confidence','work_history_confidence'];
     for (const f of fields) if (input[f] && !c[f]) c[f] = input[f];
-    for (const f of ['workHistory','work_history','experience','experiences','positions','employmentHistory','employment_history','repositories','repos','githubEvidence','discovered_by','resolved_by','provider_trace']) {
+    for (const f of ['workHistory','work_history','experience','experiences','positions','employmentHistory','employment_history','repositories','repos','githubEvidence','discovered_by','resolved_by','provider_trace','skillEvidence']) {
       if (input[f] && !c[f]) c[f] = input[f];
     }
     if (input.linkedin && !c.linkedinUrl) c.linkedinUrl = input.linkedin;
     if (input.githubUrl && !c.github) c.github = input.githubUrl;
     if (input.profileUrl && !c.sourceProfile) c.sourceProfile = input.profileUrl;
     if (Array.isArray(input.skills) && input.skills.length) {
-      c.skills = Array.from(new Set([...(c.skills||[]), ...input.skills]));
+      mergeCandidateSkillEvidence(c, input.skills, input.provider_of_record || input.source || c.provider_of_record || c.source || '');
     }
     if (input.pipelineRunId) c.pipelineRunId = input.pipelineRunId;
     // First-touch attribution: do NOT overwrite scout source fields when another
@@ -1426,6 +1469,7 @@ function findOrCreateCandidate(input) {
       currentCompany: input.currentCompany || input.company || '',
       location: input.location || '',
       skills: Array.isArray(input.skills) ? input.skills : [],
+      skillEvidence: [],
       github: input.github || input.githubUrl || '',
       linkedinUrl: input.linkedinUrl || input.linkedin || (input.profileUrl && input.profileUrl.includes('linkedin.com') ? input.profileUrl : ''),
       portfolioUrl: input.portfolioUrl || input.website || '',
@@ -1500,6 +1544,9 @@ function findOrCreateCandidate(input) {
   }
   mergeCandidateSourceMetadata(c, input);
   mergeCandidateProvenance(c, input);
+  if (Array.isArray(c.skills) && c.skills.length) {
+    mergeCandidateSkillEvidence(c, [], c.provider_of_record || input.provider_of_record || input.source || c.source || '');
+  }
   // Always re-compute identity verification on every touch so the candidate
   // record stays consistent with its current URL fields.
   refreshIdentityVerification(c);
@@ -2349,6 +2396,39 @@ function _pdlRedact(s) {
     .slice(0, 600);
 }
 
+function resolvePdlEnrichMaxPerRun(value = undefined) {
+  const raw = value !== undefined && value !== null && value !== ''
+    ? value
+    : (process.env.PDL_ENRICH_MAX_PER_RUN || PDL_ENRICH_DEFAULT_MAX_PER_RUN);
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return PDL_ENRICH_DEFAULT_MAX_PER_RUN;
+  return Math.max(0, Math.min(Math.floor(n), 100));
+}
+
+function pdlProfileParamFromLinkedInUrl(linkedinUrl = '') {
+  if (!isLinkedInProfileUrl(linkedinUrl)) return '';
+  try {
+    const u = new URL(String(linkedinUrl));
+    const m = u.pathname.match(/^\/in\/([^/?#]+)/i);
+    if (!m) return '';
+    return `linkedin.com/in/${decodeURIComponent(m[1])}`;
+  } catch { return ''; }
+}
+
+function pdlParsePersonEnrichmentPayload(payload = {}) {
+  const data = payload && payload.data && typeof payload.data === 'object' ? payload.data : {};
+  const skills = normalizeSet(Array.isArray(data.skills) ? data.skills : []).slice(0, 100);
+  const experience = Array.isArray(data.experience) ? data.experience
+    : (Array.isArray(data.experiences) ? data.experiences : []);
+  return {
+    skills,
+    experience: experience.filter(e => e && typeof e === 'object').slice(0, 50),
+    summary: String(data.summary || data.job_title || '').slice(0, 500),
+    location: [data.location_locality || data.location_name, data.location_region, data.location_country].filter(Boolean).join(', '),
+    rawData: data,
+  };
+}
+
 async function pdlPersonSearch({ role, keywords = '', countries = [], pageSize = 25 } = {}) {
   if (!isConfigured('pdl')) return { ok: false, reason: 'PDL_API_KEY missing', items: [] };
   // ES bool query.
@@ -2397,7 +2477,9 @@ async function pdlPersonSearch({ role, keywords = '', countries = [], pageSize =
 async function pdlProfileLookup({ linkedinUrl } = {}) {
   if (!isConfigured('pdl')) return { ok: false, reason: 'PDL_API_KEY missing', profile: null };
   if (!isLinkedInProfileUrl(linkedinUrl)) return { ok: false, reason: 'invalid LinkedIn URL', profile: null };
-  const params = new URLSearchParams({ profile: linkedinUrl });
+  const profile = pdlProfileParamFromLinkedInUrl(linkedinUrl);
+  if (!profile) return { ok: false, reason: 'invalid LinkedIn URL', profile: null };
+  const params = new URLSearchParams({ profile });
   let res;
   try {
     res = await fetch(`${PDL_BASE}/v5/person/enrich?${params.toString()}`, {
@@ -2407,12 +2489,14 @@ async function pdlProfileLookup({ linkedinUrl } = {}) {
   } catch { return { ok: false, reason: 'PDL fetch error', profile: null }; }
   if (!res.ok) {
     let raw = ''; try { raw = await res.text(); } catch {}
-    return { ok: false, reason: `PDL HTTP ${res.status}`, status: res.status, endpoint: '/v5/person/enrich', body: _pdlRedact(raw), profile: null };
+    const reason = pdlEnrichStatusReason(res.status);
+    if (res.status === 404) return { ok: true, noMatch: true, reason, status: 404, endpoint: '/v5/person/enrich', profile: null };
+    return { ok: false, reason, status: res.status, endpoint: '/v5/person/enrich', body: _pdlRedact(raw), profile: null };
   }
   const data = await res.json();
   // PDL returns { status, likelihood, data: {...} }.
-  const profile = (data && data.data) || null;
-  return { ok: true, profile, likelihood: (data && data.likelihood) || 0 };
+  const parsed = pdlParsePersonEnrichmentPayload(data || {});
+  return { ok: true, profile: parsed.rawData || null, skills: parsed.skills, experience: parsed.experience, parsed, likelihood: (data && data.likelihood) || 0 };
 }
 
 function pdlEnrichStatusReason(status) {
@@ -2471,12 +2555,13 @@ async function pdlProfileResolve({ firstName, lastName, companyName } = {}) {
   const data = await res.json();
   // PDL returns { status, likelihood, data: { linkedin_url: "linkedin.com/in/..." | full url } }.
   const rec = (data && data.data) || {};
+  const parsed = pdlParsePersonEnrichmentPayload(data || {});
   let url = rec.linkedin_url || '';
   if (url && !/^https?:\/\//i.test(url)) url = `https://www.${url}`;
   if (!pdlHasUsefulResolutionEvidence(rec, url)) {
     return { ok: true, reason: 'PDL_ENRICH_THIN_MATCH', status: 200, endpoint: '/v5/person/enrich', linkedinUrl: '', thinMatch: true };
   }
-  return { ok: true, linkedinUrl: isLinkedInProfileUrl(url) ? url : '', likelihood: (data && data.likelihood) || 0 };
+  return { ok: true, linkedinUrl: isLinkedInProfileUrl(url) ? url : '', profile: rec, skills: parsed.skills, experience: parsed.experience, parsed, likelihood: (data && data.likelihood) || 0 };
 }
 
 async function hunterEmailFinder({ domain, fullName }) {
@@ -3275,6 +3360,153 @@ function refreshProviderDiagnosticsCounts(diags, { pipelineRunId = null, needId 
     d.resolved_by_apollo_count = owned.filter(c => (c.resolved_by || []).map(normalizeProviderKey).includes('apollo')).length;
   }
   return diags;
+}
+
+function pdlIncrementEnrichDiagnostic(diags, field, count = 1) {
+  const d = providerDiag(diags, 'pdl');
+  const n = Number(count);
+  d[field] = (d[field] || 0) + (Number.isFinite(n) ? n : 0);
+  return d;
+}
+
+function pdlEnrichIdentifierForCandidate(c = {}) {
+  if (isLinkedInProfileUrl(c.linkedinUrl)) return { type: 'profile', linkedinUrl: c.linkedinUrl };
+  const identifiers = pdlResolveIdentifiersFromName(c.name || '');
+  const companyName = (c.currentCompany || c.company || '').replace(/^@/, '').trim();
+  if (identifiers.ok && companyName) {
+    return { type: 'name_company', firstName: identifiers.firstName, lastName: identifiers.lastName, companyName };
+  }
+  return { type: 'none', reason: identifiers.reason || 'PDL_ENRICH_SKIPPED_INSUFFICIENT_IDENTIFIERS' };
+}
+
+function pdlRecordEnrichmentSkip(c, reason, called = false) {
+  addCandidateProviderTrace(c, {
+    provider: 'pdl',
+    stage: 'enrichment',
+    called,
+    returned: false,
+    confidence: 'low',
+    sourceLabel: 'pdl:person-enrich',
+    skip_reason: reason,
+  });
+  c.pdl_skipped = reason;
+  return c;
+}
+
+function pdlClassifyEnrichDiagnostic(diags, result = {}) {
+  const status = result.status;
+  const reason = result.reason || pdlEnrichStatusReason(status);
+  if (status === 404 || result.noMatch) {
+    pdlIncrementEnrichDiagnostic(diags, 'enrich_no_match_count');
+    return 'no-match';
+  }
+  if (status === 402) {
+    pdlIncrementEnrichDiagnostic(diags, 'enrich_plan_restricted_count');
+    return 'plan-restricted';
+  }
+  if (status === 429) {
+    pdlIncrementEnrichDiagnostic(diags, 'enrich_rate_limited_count');
+    return 'rate-limited';
+  }
+  if (typeof status === 'number' && status >= 500) {
+    pdlIncrementEnrichDiagnostic(diags, 'enrich_provider_error_count');
+    markProviderError(diags, 'pdl', { ...result, reason });
+    return 'provider-error';
+  }
+  return 'provider-error';
+}
+
+async function runPdlCandidateEnrichment({ needId, pipelineRunId = null, candidateIds = [], pdlEnrichMaxPerRun = PDL_ENRICH_DEFAULT_MAX_PER_RUN, providerDiagnostics = null } = {}) {
+  const need = DB.hiring_needs.find(n => n.id === needId);
+  const diags = providerDiagnostics || initProviderRunDiagnostics();
+  const d = providerDiag(diags, 'pdl');
+  const cap = resolvePdlEnrichMaxPerRun(pdlEnrichMaxPerRun);
+  d.enrich_cap = cap;
+
+  const allInRun = DB.candidates.filter(c => (!pipelineRunId || c.pipelineRunId === pipelineRunId) &&
+    (!candidateIds.length || candidateIds.includes(c.id)));
+  const pool = allInRun.filter(c => isClientReadyForNeed(c, need));
+
+  if (!isConfigured('pdl')) {
+    markProviderSkipped(diags, 'pdl', 'required env not set (PDL_API_KEY)');
+    for (const c of pool) pdlRecordEnrichmentSkip(c, 'PDL_API_KEY missing', false);
+    return { enriched: 0, noMatch: 0, skippedNoIdentifier: 0, planRestricted: 0, rateLimited: 0, errored: 0, queued: 0, attempted: 0, cap, providerDiagnostics: diags };
+  }
+
+  if (!pool.length || cap <= 0) {
+    markProviderSkipped(diags, 'pdl', cap <= 0 ? 'PDL enrichment cap is 0' : 'no accepted in-market candidates to enrich');
+    const queued = cap <= 0 ? pool.length : 0;
+    if (queued) pdlIncrementEnrichDiagnostic(diags, 'enrich_queued_count', queued);
+    for (const c of pool) pdlRecordEnrichmentSkip(c, cap <= 0 ? 'PDL_ENRICH_QUEUED_CAP_REACHED' : 'PDL_ENRICH_SKIPPED_NO_ELIGIBLE_CANDIDATE', false);
+    return { enriched: 0, noMatch: 0, skippedNoIdentifier: 0, planRestricted: 0, rateLimited: 0, errored: 0, queued, attempted: 0, cap, providerDiagnostics: diags };
+  }
+
+  markProviderStarted(diags, 'pdl');
+  const summary = { enriched: 0, noMatch: 0, skippedNoIdentifier: 0, planRestricted: 0, rateLimited: 0, errored: 0, queued: 0, attempted: 0, cap };
+  let calls = 0;
+  for (const c of pool) {
+    if (calls >= cap) {
+      summary.queued++;
+      pdlIncrementEnrichDiagnostic(diags, 'enrich_queued_count');
+      pdlRecordEnrichmentSkip(c, 'PDL_ENRICH_QUEUED_CAP_REACHED', false);
+      continue;
+    }
+
+    const identifier = pdlEnrichIdentifierForCandidate(c);
+    if (identifier.type === 'none') {
+      summary.skippedNoIdentifier++;
+      pdlIncrementEnrichDiagnostic(diags, 'enrich_skipped_no_identifier_count');
+      pdlRecordEnrichmentSkip(c, identifier.reason, false);
+      continue;
+    }
+
+    calls++;
+    summary.attempted++;
+    pdlIncrementEnrichDiagnostic(diags, 'enrich_called_count');
+    let result;
+    if (identifier.type === 'profile') {
+      result = await pdlProfileLookup({ linkedinUrl: identifier.linkedinUrl });
+    } else {
+      result = await pdlProfileResolve(identifier);
+    }
+
+    if (result.ok && result.profile) {
+      markProviderReturned(diags, 'pdl', 1);
+      const parsed = result.parsed || pdlParsePersonEnrichmentPayload({ data: result.profile });
+      mergeCandidateSkillEvidence(c, parsed.skills, 'pdl');
+      if (!c.summary && parsed.summary) c.summary = parsed.summary;
+      if (!c.location && parsed.location) c.location = parsed.location;
+      if (parsed.experience.length && (!Array.isArray(c.experience) || !c.experience.length)) c.experience = parsed.experience;
+      c.enrichedBy = mergeUniqueStrings(c.enrichedBy, ['pdl-person-enrich']);
+      c.enrichedAt = now();
+      c.pdl_skipped = '';
+      addCandidateProviderTrace(c, { provider: 'pdl', stage: 'enrichment', called: true, returned: true, confidence: parsed.skills.length ? 'high' : 'medium', sourceLabel: 'pdl:person-enrich' });
+      summary.enriched++;
+      pdlIncrementEnrichDiagnostic(diags, 'enrich_enriched_count');
+      continue;
+    }
+
+    const classification = pdlClassifyEnrichDiagnostic(diags, result);
+    if (classification === 'no-match') summary.noMatch++;
+    else if (classification === 'plan-restricted') summary.planRestricted++;
+    else if (classification === 'rate-limited') summary.rateLimited++;
+    else summary.errored++;
+    pdlRecordEnrichmentSkip(c, result.reason || pdlEnrichStatusReason(result.status), true);
+  }
+  markProviderFinished(diags, 'pdl');
+  await persistDB();
+  await logActivity('PDL', `Enriched ${summary.enriched}/${pool.length} accepted candidate(s)`, 'success', {
+    source: 'pdl',
+    enriched: summary.enriched,
+    no_match: summary.noMatch,
+    skipped_no_identifier: summary.skippedNoIdentifier,
+    plan_restricted: summary.planRestricted,
+    rate_limited: summary.rateLimited,
+    errored: summary.errored,
+    queued: summary.queued,
+    cap,
+  });
+  return { ...summary, providerDiagnostics: diags };
 }
 
 // Person-like signals heuristic — used when a root GitHub URL is encountered
@@ -4156,194 +4388,10 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
     markProviderSkipped(providerDiagnostics, 'adzuna', 'required env not set (ADZUNA_APP_ID, ADZUNA_API_KEY)');
   }
 
-  // ── PDL (People Data Labs): proactive source + Apollo-rescue + LinkedIn enrich ──
-  // Dormant when PDL_API_KEY missing. All calls are failure-safe.
+  // PDL intentionally does not run as a discovery source. Candidate enrichment
+  // happens after sourcing + market gate and before match scoring.
   if (isConfigured('pdl')) {
-    markProviderStarted(providerDiagnostics, 'pdl');
-    // (a) Proactive Person Search — fetch up to 25 real LinkedIn profiles
-    const pdlKeywords = (need.requiredSkills || []).slice(0, 5).join(' ');
-    const pdlPlans = expandCandidatePool
-      ? expansion.titleVariants.slice(0, 8).map(v => ({
-          role: v.title,
-          keywords: expansion.profileKeywords.slice(0, 5).join(' '),
-          sourceLabel: `pdl:expanded:${v.variant_type}`,
-          searchVariantMeta: [v],
-          expandCandidatePool: true,
-        }))
-      : [{ role: need.title || '', keywords: pdlKeywords, sourceLabel: 'pdl:person-search', searchVariantMeta: [], expandCandidatePool: false }];
-    for (const pdlPlan of pdlPlans) {
-    const pdlSearch = await pdlPersonSearch({
-      role: pdlPlan.role,
-      keywords: pdlPlan.keywords,
-      pageSize: 25,
-    });
-    markProviderReturned(providerDiagnostics, 'pdl', (pdlSearch.items || []).length);
-    if (pdlSearch.ok) {
-      for (const p of (pdlSearch.items || [])) {
-        sourcedRaw++;
-        rawResultsBySource.pdl++;
-        // PDL stores linkedin_url without scheme (e.g. "linkedin.com/in/jane").
-        let profileUrl = p.linkedin_url || '';
-        if (profileUrl && !/^https?:\/\//i.test(profileUrl)) profileUrl = `https://www.${profileUrl}`;
-        if (!isLinkedInProfileUrl(profileUrl)) {
-          recordReject({
-            sourceType: 'unknown',
-            scoutDecision: 'rejected',
-            scoutReason: 'PDL result missing real LinkedIn URL',
-            sourceDomain: 'pdl',
-            sourceUrl: '',
-            title: '',
-          }, 'pdl');
-          continue;
-        }
-        const fullName = (p.full_name || `${p.first_name || ''} ${p.last_name || ''}`.trim() || '').trim();
-        const locationParts = [p.location_locality || p.location_name, p.location_region, p.location_country].filter(Boolean);
-        const loc = locationParts.join(', ');
-        const profileText = [
-          fullName,
-          p.job_title || '',
-          p.job_company_name || '',
-          loc,
-          p.summary || '',
-          ...(Array.isArray(p.skills) ? p.skills : []),
-        ].join(' ');
-        const meta = sourceMetadata({
-          provider: 'pdl',
-          sourceLabel: pdlPlan.sourceLabel,
-          query: pdlPlan.keywords || pdlPlan.role,
-          variantMetas: pdlPlan.searchVariantMeta,
-          locationTier: inferLocationTier(loc, expansion.locationTiers),
-          profileText,
-          expansionEnabled: !!pdlPlan.expandCandidatePool,
-        });
-        const c = findOrCreateCandidate({
-          name: fullName || 'PDL candidate',
-          title: p.job_title || '',
-          company: p.job_company_name || '',
-          location: loc,
-          summary: p.summary || p.job_title || '',
-          skills: Array.isArray(p.skills) && p.skills.length
-            ? p.skills.map(s => String(s)).filter(Boolean).slice(0, 30)
-            : extractSkills(`${p.job_title || ''} ${p.summary || ''}`),
-          email: '',
-          linkedinUrl: profileUrl,
-          sourceUrl: profileUrl,
-          source: 'PDL',
-          sourceType: 'candidate_profile',
-          scoutDecision: 'accepted',
-          scoutReason: 'PDL Person Search candidate result',
-          sourceDomain: 'linkedin.com',
-          scoutSourceLabel: pdlPlan.sourceLabel,
-          scoutQuery: pdlPlan.keywords || pdlPlan.role,
-          pipelineRunId,
-          ...meta,
-        });
-        applyReviewMetadata(c, need, meta);
-        recordCandidateByGate(c, 'pdl');
-      }
-      await logActivity('Scout', `PDL Person Search: ${(pdlSearch.items || []).length} returned`, (pdlSearch.items || []).length ? 'success' : 'warn', { source: 'pdl', returned: (pdlSearch.items || []).length });
-    } else {
-      markProviderError(providerDiagnostics, 'pdl', pdlSearch);
-      await logActivity('Scout', `PDL Person Search skipped: ${pdlSearch.reason}`, 'warn',
-        { source: 'pdl', reason: pdlSearch.reason, status: pdlSearch.status || null, endpoint: pdlSearch.endpoint || null, body: pdlSearch.body || '' });
-    }
-    if (!expandCandidatePool && pdlSearch.ok) break;
-    }
-
-    // (b) Profile Resolve — rescue Apollo-no-LinkedIn review-pool candidates
-    //     by filling missing LinkedIn URL via /v5/person/enrich with
-    //     first_name + last_name + company. On success, refresh identity
-    //     verification → candidate flips to 'verified' / 'pdl-resolved' →
-    //     enters final shortlist.
-    const apolloReviewCandidates = review.filter(c => {
-      const discovered = Array.isArray(c.discovered_by) ? c.discovered_by.map(normalizeProviderKey) : [];
-      return (c.source === 'Apollo' || c.sourceChannel === 'Apollo' ||
-        normalizeProviderKey(c.provider_of_record || '') === 'apollo' || discovered.includes('apollo')) &&
-        !isLinkedInProfileUrl(c.linkedinUrl) && c.name;
-    });
-    const markPdlEnrichNote = (reason) => {
-      const d = providerDiag(providerDiagnostics, 'pdl');
-      const clean = sanitizeProviderMessage(reason);
-      if (!d.skip_reason) d.skip_reason = clean;
-      if (!d.sanitized_error_message) d.sanitized_error_message = clean;
-    };
-    // Parallel + capped at 15 to avoid Cloudflare 520 on /api/pipeline/run.
-    await Promise.all(apolloReviewCandidates.slice(0, 15).map(async (c) => {
-      const identifiers = pdlResolveIdentifiersFromName(c.name);
-      if (!identifiers.ok) {
-        markPdlEnrichNote(identifiers.reason);
-        addCandidateProviderTrace(c, {
-          provider: 'pdl',
-          stage: 'resolution',
-          called: false,
-          returned: false,
-          confidence: 'low',
-          sourceLabel: 'pdl:profile-resolve',
-          skip_reason: identifiers.reason,
-        });
-        return;
-      }
-      const { firstName, lastName } = identifiers;
-      const companyName = (c.currentCompany || '').replace(/^@/, '');
-      const resolved = await pdlProfileResolve({ firstName, lastName, companyName });
-      if (resolved.ok && resolved.linkedinUrl) {
-        markProviderReturned(providerDiagnostics, 'pdl', 1);
-        c.linkedinUrl = resolved.linkedinUrl;
-        c.sourceUrl = c.sourceUrl || resolved.linkedinUrl;
-        c.identityVerificationStatus = 'verified';
-        c.identityVerificationSource = 'pdl-resolved';
-        c.identityVerificationReason = `PDL Profile Resolve found LinkedIn for ${firstName} ${lastName}`;
-        c.verifiedProfileUrl = resolved.linkedinUrl;
-        c.verifiedAt = now();
-        c.scoutDecision = 'accepted';
-        c.sourceType = 'candidate_profile';
-        c.resolved_by = mergeUniqueStrings(c.resolved_by, ['pdl']);
-        c.resolution_status = 'resolved';
-        addCandidateProviderTrace(c, { provider: 'pdl', stage: 'resolution', called: true, returned: true, confidence: 'high', sourceLabel: 'pdl:profile-resolve' });
-        applySourcingQualityGate(c, need);
-      } else if (resolved.noMatch || resolved.thinMatch) {
-        addCandidateProviderTrace(c, {
-          provider: 'pdl',
-          stage: 'resolution',
-          called: true,
-          returned: false,
-          confidence: 'low',
-          sourceLabel: 'pdl:profile-resolve',
-          skip_reason: resolved.reason || 'PDL_ENRICH_NO_MATCH',
-        });
-        markPdlEnrichNote(resolved.reason || 'PDL_ENRICH_NO_MATCH');
-      } else if (!resolved.ok) {
-        markProviderError(providerDiagnostics, 'pdl', resolved);
-      }
-    }));
-
-    // (c) Profile Lookup — enrich accepted candidates with LinkedIn URLs
-    //     using snapshot data (skills, summary, location). Pulls richer
-    //     skill set for matchmaker scoring. Cap at 10 to control credits.
-    const enrichable = accepted
-      .filter(c => isLinkedInProfileUrl(c.linkedinUrl) && (!c.skills || c.skills.length < 3))
-      .slice(0, 10);
-    await Promise.all(enrichable.map(async (c) => {
-      const lookup = await pdlProfileLookup({ linkedinUrl: c.linkedinUrl });
-      if (lookup.ok && lookup.profile) {
-        markProviderReturned(providerDiagnostics, 'pdl', 1);
-        const p = lookup.profile;
-        if (Array.isArray(p.skills) && p.skills.length) {
-          const newSkills = p.skills.map(s => String(s)).filter(Boolean);
-          c.skills = Array.from(new Set([...(c.skills || []), ...newSkills])).slice(0, 30);
-        }
-        if (!c.summary && (p.summary || p.job_title)) c.summary = (p.summary || p.job_title || '').slice(0, 500);
-        if (!c.location && (p.location_name || p.location_country)) {
-          c.location = [p.location_locality || p.location_name, p.location_region, p.location_country].filter(Boolean).join(', ');
-        }
-        c.enrichedBy = Array.from(new Set([...(c.enrichedBy || []), 'pdl-lookup']));
-        c.enrichedAt = now();
-        addCandidateProviderTrace(c, { provider: 'pdl', stage: 'enrichment', called: true, returned: true, confidence: 'medium', sourceLabel: 'pdl:profile-lookup' });
-      } else if (!lookup.ok) {
-        markProviderError(providerDiagnostics, 'pdl', lookup);
-      }
-    }));
-    markProviderFinished(providerDiagnostics, 'pdl');
+    markProviderSkipped(providerDiagnostics, 'pdl', 'PDL discovery disabled; enrichment runs after market gate');
   } else {
     markProviderSkipped(providerDiagnostics, 'pdl', 'required env not set (PDL_API_KEY)');
   }
@@ -4940,7 +4988,7 @@ function newPipelineRunId() {
   return 'run_' + Date.now().toString(36) + '_' + crypto.randomBytes(3).toString('hex');
 }
 
-async function runPipeline({ company, role, skills = [], location = '', seniority = 'Mid', expandCandidatePool = false, apolloMaxEnrichPerRun = APOLLO_MATCH_DEFAULT_MAX_PER_RUN }) {
+async function runPipeline({ company, role, skills = [], location = '', seniority = 'Mid', expandCandidatePool = false, apolloMaxEnrichPerRun = APOLLO_MATCH_DEFAULT_MAX_PER_RUN, pdlEnrichMaxPerRun = PDL_ENRICH_DEFAULT_MAX_PER_RUN }) {
   const pipelineRunId = newPipelineRunId();
   console.log(`[pipeline] start runId=${pipelineRunId} role="${role}" company="${company}"`);
   await logActivity('Pipeline', `Pipeline start ${pipelineRunId}: ${role} @ ${company}`, 'running', { pipelineRunId });
@@ -5007,12 +5055,33 @@ async function runPipeline({ company, role, skills = [], location = '', seniorit
     validated: val.validated,
   });
 
-  // 6. Match only this run's candidates against this run's need
+  // 6. Enrich accepted in-market candidates with PDL skills before scoring
+  const pdlEnrichmentResult = await runPdlCandidateEnrichment({
+    needId: need.id,
+    pipelineRunId,
+    candidateIds: scoutIds,
+    pdlEnrichMaxPerRun,
+    providerDiagnostics: scout.providerDiagnostics,
+  });
+  const { providerDiagnostics: _pdlProviderDiagnostics, ...pdlEnrichment } = pdlEnrichmentResult;
+  result.steps.push({
+    step: 'pdl_enrich',
+    enriched: pdlEnrichment.enriched,
+    noMatch: pdlEnrichment.noMatch,
+    skippedNoIdentifier: pdlEnrichment.skippedNoIdentifier,
+    planRestricted: pdlEnrichment.planRestricted,
+    rateLimited: pdlEnrichment.rateLimited,
+    errored: pdlEnrichment.errored,
+    queued: pdlEnrichment.queued,
+    cap: pdlEnrichment.cap,
+  });
+
+  // 7. Match only this run's candidates against this run's need
   const mm = await runMatchmaker({ needId: need.id, pipelineRunId });
   result.steps.push({ step: 'match', visible: mm.visible, dropped: mm.dropped });
   refreshProviderDiagnosticsCounts(scout.providerDiagnostics, { pipelineRunId, needId: need.id });
 
-  // 7. Generate client report from this run's matches (with scout context)
+  // 8. Generate client report from this run's matches (with scout context)
   const scoutStats = {
     sourcedRaw: scout.sourcedRaw,
     acceptedCandidates: scout.acceptedCandidates,
@@ -5045,6 +5114,7 @@ async function runPipeline({ company, role, skills = [], location = '', seniorit
     needsReview: val.needsReview,
     insufficientData: val.insufficientData,
     validated: val.validated,
+    pdlEnrichment,
     matchmakerInput: mm.matched,
     visible: mm.visible,
     dropped: mm.dropped,
@@ -5081,6 +5151,7 @@ async function runPipeline({ company, role, skills = [], location = '', seniorit
     needsReview: val.needsReview,
     insufficientData: val.insufficientData,
     validated: val.validated,
+    pdlEnrichment,
     visible: mm.visible,
     dropped: mm.dropped,
     reportId: rep.report?.id || null,
@@ -5381,8 +5452,13 @@ module.exports = {
     pickReposForRole,
     pdlPersonSearch,
     pdlProfileLookup,
+    pdlProfileParamFromLinkedInUrl,
+    pdlParsePersonEnrichmentPayload,
     pdlResolveIdentifiersFromName,
     pdlProfileResolve,
+    resolvePdlEnrichMaxPerRun,
+    runPdlCandidateEnrichment,
+    mergeCandidateSkillEvidence,
     openaiParseCandidateItem,
     refineMatchScoresWithOpenAI,
     isPersonLikeSignal,
