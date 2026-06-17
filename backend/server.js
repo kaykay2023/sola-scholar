@@ -259,7 +259,8 @@ function providerDiagnostics() {
    ════════════════════════════════════════════════════════════════════ */
 const COLLECTIONS = [
   'companies', 'hiring_managers', 'hiring_needs', 'candidates',
-  'candidate_validations', 'matches', 'outreach', 'client_reports', 'activity_logs',
+  'candidate_validations', 'matches', 'outreach', 'client_reports',
+  'candidate_outcomes', 'agent_learning_summaries', 'activity_logs',
 ];
 function emptyDB() { return Object.fromEntries(COLLECTIONS.map(c => [c, []])); }
 
@@ -306,6 +307,215 @@ async function logActivity(agent, message, status = 'info', meta = null) {
   if (DB.activity_logs.length > 500) DB.activity_logs.length = 500;
   await persistDB();
   return entry;
+}
+
+const CLIENT_VERDICTS = new Set(['accepted', 'rejected', 'interview', 'offer', 'hired', 'declined', 'no_response']);
+const FINAL_OUTCOMES = new Set(['hired', 'rejected', 'declined', 'no_show', 'still_in_process', 'unknown']);
+const OUTCOME_PATCH_FIELDS = [
+  'clientVerdict', 'clientReason', 'finalOutcome', 'outcomeDate',
+  'feedbackFromClient', 'feedbackFromCandidate', 'hiredDate',
+];
+
+function normalizeNullableEnum(value, allowed, field) {
+  if (value === undefined) return undefined;
+  if (value === null || value === '') return null;
+  const clean = String(value).trim().toLowerCase();
+  if (!allowed.has(clean)) {
+    const err = new Error(`${field} must be one of: ${Array.from(allowed).join(', ')}`);
+    err.status = 400;
+    throw err;
+  }
+  return clean;
+}
+
+function candidateSourceLabel(c = {}) {
+  const providers = Array.isArray(c.providersFound) ? c.providersFound.filter(Boolean) : [];
+  const discovered = Array.isArray(c.discovered_by) ? c.discovered_by.filter(Boolean) : [];
+  return c.provider_of_record || providers[0] || discovered[0] || c.source || c.sourceChannel || '';
+}
+
+function snapshotOutcomeFields({ candidate = null, match = null, pipelineRunId = null } = {}) {
+  const runId = pipelineRunId || match?.pipelineRunId || candidate?.pipelineRunId || null;
+  const validation = candidate ? latestValidation(candidate.id, runId) || latestValidation(candidate.id) : null;
+  return {
+    pipelineRunId: runId,
+    sourcedBy: candidateSourceLabel(candidate || {}),
+    validatorVerdict: validation?.tier || '',
+    validatorReason: validation?.evidenceNotes || '',
+    matchScore: Number.isFinite(Number(match?.score)) ? Number(match.score) : null,
+    matchTier: match?.tier || '',
+  };
+}
+
+function duplicateCandidateOutcome(candidateId, needId, pipelineRunId, ignoreId = null) {
+  if (!pipelineRunId) return null;
+  return (DB.candidate_outcomes || []).find(o =>
+    o.id !== ignoreId &&
+    o.candidateId === candidateId &&
+    o.needId === needId &&
+    o.pipelineRunId === pipelineRunId
+  ) || null;
+}
+
+function createCandidateOutcome(input = {}) {
+  const candidateId = String(input.candidateId || '').trim();
+  const needId = String(input.needId || '').trim();
+  if (!candidateId) {
+    const err = new Error('candidateId required');
+    err.status = 400;
+    throw err;
+  }
+  if (!needId) {
+    const err = new Error('needId required');
+    err.status = 400;
+    throw err;
+  }
+
+  const match = input.matchId ? DB.matches.find(m => m.id === input.matchId) : null;
+  const candidate = DB.candidates.find(c => c.id === candidateId) || (match ? DB.candidates.find(c => c.id === match.candidateId) : null);
+  const snapshot = snapshotOutcomeFields({
+    candidate,
+    match,
+    pipelineRunId: input.pipelineRunId || match?.pipelineRunId || null,
+  });
+  const pipelineRunId = input.pipelineRunId || snapshot.pipelineRunId || null;
+  if (duplicateCandidateOutcome(candidateId, needId, pipelineRunId)) {
+    const err = new Error('duplicate outcome for candidateId + needId + pipelineRunId');
+    err.status = 409;
+    throw err;
+  }
+
+  const at = now();
+  const outcome = {
+    id: uid(),
+    candidateId,
+    needId,
+    matchId: input.matchId || match?.id || '',
+    pipelineRunId,
+    sourcedBy: input.sourcedBy || snapshot.sourcedBy || '',
+    validatorVerdict: input.validatorVerdict || snapshot.validatorVerdict || '',
+    validatorReason: input.validatorReason || snapshot.validatorReason || '',
+    matchScore: input.matchScore !== undefined ? Number(input.matchScore) : snapshot.matchScore,
+    matchTier: input.matchTier || snapshot.matchTier || '',
+    clientVerdict: normalizeNullableEnum(input.clientVerdict, CLIENT_VERDICTS, 'clientVerdict') ?? null,
+    clientReason: input.clientReason || '',
+    finalOutcome: normalizeNullableEnum(input.finalOutcome, FINAL_OUTCOMES, 'finalOutcome') ?? null,
+    outcomeDate: input.outcomeDate || at,
+    feedbackFromClient: input.feedbackFromClient || '',
+    feedbackFromCandidate: input.feedbackFromCandidate || '',
+    hiredDate: input.hiredDate || '',
+    createdAt: at,
+    updatedAt: at,
+  };
+  if (!Number.isFinite(outcome.matchScore)) outcome.matchScore = null;
+  DB.candidate_outcomes.push(outcome);
+  return outcome;
+}
+
+function patchCandidateOutcome(outcome, input = {}) {
+  if (!outcome) return null;
+  const candidateId = outcome.candidateId;
+  for (const k of OUTCOME_PATCH_FIELDS) {
+    if (!(k in input)) continue;
+    if (k === 'clientVerdict') outcome[k] = normalizeNullableEnum(input[k], CLIENT_VERDICTS, k);
+    else if (k === 'finalOutcome') outcome[k] = normalizeNullableEnum(input[k], FINAL_OUTCOMES, k);
+    else outcome[k] = input[k];
+  }
+  outcome.candidateId = candidateId;
+  outcome.updatedAt = now();
+  return outcome;
+}
+
+function textList(items, limit = 5) {
+  return (items || []).filter(Boolean).slice(0, limit).join('; ');
+}
+
+function countBy(items, keyFn) {
+  const counts = {};
+  for (const item of items || []) {
+    const key = keyFn(item) || 'unknown';
+    counts[key] = (counts[key] || 0) + 1;
+  }
+  return counts;
+}
+
+function buildDailyLearningSummary(input = {}) {
+  const date = input.date || new Date().toISOString().slice(0, 10);
+  const windowStart = input.windowStart || `${date}T00:00:00.000Z`;
+  const windowEnd = input.windowEnd || `${date}T23:59:59.999Z`;
+  const startMs = Date.parse(windowStart);
+  const endMs = Date.parse(windowEnd);
+  const inWindow = (o) => {
+    const t = Date.parse(o.outcomeDate || o.updatedAt || o.createdAt || '');
+    if (!Number.isFinite(t)) return true;
+    if (Number.isFinite(startMs) && t < startMs) return false;
+    if (Number.isFinite(endMs) && t > endMs) return false;
+    return true;
+  };
+  const outcomes = (DB.candidate_outcomes || []).filter(inWindow);
+  const highScoreRejected = outcomes.filter(o => Number(o.matchScore) >= 70 && (o.clientVerdict === 'rejected' || o.finalOutcome === 'rejected'));
+  const lowScoreAccepted = outcomes.filter(o =>
+    Number(o.matchScore) < 60 &&
+    (['accepted', 'interview', 'offer', 'hired'].includes(o.clientVerdict || '') || o.finalOutcome === 'hired')
+  );
+  const hired = outcomes.filter(o => o.clientVerdict === 'hired' || o.finalOutcome === 'hired');
+  const rejected = outcomes.filter(o => o.clientVerdict === 'rejected' || o.finalOutcome === 'rejected');
+  const clientReasons = countBy(rejected, o => String(o.clientReason || o.feedbackFromClient || '').trim().toLowerCase());
+
+  const providerSignals = Object.entries(countBy(outcomes, o => o.sourcedBy || 'unknown')).map(([provider, total]) => {
+    const providerOutcomes = outcomes.filter(o => (o.sourcedBy || 'unknown') === provider);
+    const providerRejected = providerOutcomes.filter(o => o.clientVerdict === 'rejected' || o.finalOutcome === 'rejected').length;
+    const providerHired = providerOutcomes.filter(o => o.clientVerdict === 'hired' || o.finalOutcome === 'hired').length;
+    return { provider, total, rejected: providerRejected, hired: providerHired };
+  });
+  const validatorSignals = Object.entries(countBy(outcomes, o => o.validatorVerdict || 'unknown')).map(([verdict, total]) => {
+    const verdictOutcomes = outcomes.filter(o => (o.validatorVerdict || 'unknown') === verdict);
+    return {
+      verdict,
+      total,
+      rejected: verdictOutcomes.filter(o => o.clientVerdict === 'rejected' || o.finalOutcome === 'rejected').length,
+      acceptedOrHired: verdictOutcomes.filter(o => ['accepted', 'interview', 'offer', 'hired'].includes(o.clientVerdict || '') || o.finalOutcome === 'hired').length,
+    };
+  });
+  const scoringSignals = {
+    highScoreRejected: highScoreRejected.map(o => ({ candidateId: o.candidateId, needId: o.needId, matchScore: o.matchScore, reason: o.clientReason || o.feedbackFromClient || '' })),
+    lowScoreAccepted: lowScoreAccepted.map(o => ({ candidateId: o.candidateId, needId: o.needId, matchScore: o.matchScore, verdict: o.clientVerdict, finalOutcome: o.finalOutcome })),
+  };
+  const suggestedRuleAdjustments = [];
+  if (highScoreRejected.length) suggestedRuleAdjustments.push('Review high-score client rejections before changing scoring weights.');
+  if (lowScoreAccepted.length) suggestedRuleAdjustments.push('Review lower-score accepted or hired candidates for positive signals missing from scoring.');
+  for (const [reason, count] of Object.entries(clientReasons)) {
+    if (reason && reason !== 'unknown' && count >= 2) suggestedRuleAdjustments.push(`Client rejection reason repeated ${count}x: ${reason}`);
+  }
+  if (!suggestedRuleAdjustments.length) suggestedRuleAdjustments.push('No rule changes recommended yet; continue collecting outcomes.');
+
+  const summaryText = outcomes.length
+    ? [
+        `Reviewed ${outcomes.length} candidate outcome${outcomes.length === 1 ? '' : 's'} for ${date}.`,
+        `${hired.length} hired, ${rejected.length} rejected.`,
+        highScoreRejected.length ? `${highScoreRejected.length} high-score rejection signal${highScoreRejected.length === 1 ? '' : 's'} found.` : '',
+        lowScoreAccepted.length ? `${lowScoreAccepted.length} lower-score acceptance/hire signal${lowScoreAccepted.length === 1 ? '' : 's'} found.` : '',
+        textList(suggestedRuleAdjustments, 3),
+      ].filter(Boolean).join(' ')
+    : `Not enough data yet for ${date}; no candidate outcomes were available in the selected window.`;
+
+  return {
+    id: uid(),
+    date,
+    windowStart,
+    windowEnd,
+    totalOutcomesReviewed: outcomes.length,
+    highScoreRejectedCount: highScoreRejected.length,
+    lowScoreAcceptedCount: lowScoreAccepted.length,
+    hiredCount: hired.length,
+    rejectedCount: rejected.length,
+    providerSignals,
+    validatorSignals,
+    scoringSignals,
+    suggestedRuleAdjustments,
+    summary: summaryText,
+    createdAt: now(),
+  };
 }
 
 const norm = {
@@ -5290,6 +5500,8 @@ app.get('/api/dashboard/stats', (req, res) => {
     matches_visible: DB.matches.filter(isVisibleMatch).length,
     outreach: DB.outreach.length,
     client_reports: DB.client_reports.length,
+    candidate_outcomes: DB.candidate_outcomes.length,
+    agent_learning_summaries: DB.agent_learning_summaries.length,
     activity_logs: DB.activity_logs.length,
   });
 });
@@ -5311,6 +5523,13 @@ app.get('/api/matches', (req, res) => {
 });
 app.get('/api/outreach',         (req, res) => res.json(DB.outreach));
 app.get('/api/client-reports',   (req, res) => res.json(DB.client_reports));
+app.get('/api/candidate-outcomes', (req, res) => res.json(DB.candidate_outcomes));
+app.get('/api/candidate-outcomes/:id', (req, res) => {
+  const outcome = DB.candidate_outcomes.find(x => x.id === req.params.id);
+  if (!outcome) return res.status(404).json({ error: 'Not found' });
+  res.json(outcome);
+});
+app.get('/api/agent-learning/summaries', (req, res) => res.json(DB.agent_learning_summaries));
 app.get('/api/activity-logs',    (req, res) => res.json(DB.activity_logs.slice(0, 100)));
 
 // ── Mutation: small CRUD helpers used by the UI ──
@@ -5350,6 +5569,37 @@ app.delete('/api/hiring-needs/:id', async (req, res) => {
   DB.hiring_needs.splice(i, 1);
   await persistDB();
   res.json({ ok: true });
+});
+app.post('/api/candidate-outcomes', async (req, res) => {
+  try {
+    const outcome = createCandidateOutcome(req.body || {});
+    await persistDB();
+    await logActivity('Learning', `Candidate outcome created for candidate ${outcome.candidateId}`, 'info', {
+      candidateId: outcome.candidateId,
+      needId: outcome.needId,
+      pipelineRunId: outcome.pipelineRunId || null,
+    });
+    res.json(outcome);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message || 'Unable to create outcome' });
+  }
+});
+app.patch('/api/candidate-outcomes/:id', async (req, res) => {
+  const outcome = DB.candidate_outcomes.find(x => x.id === req.params.id);
+  if (!outcome) return res.status(404).json({ error: 'Not found' });
+  try {
+    patchCandidateOutcome(outcome, req.body || {});
+    await persistDB();
+    await logActivity('Learning', `Candidate outcome updated for candidate ${outcome.candidateId}`, 'info', {
+      outcomeId: outcome.id,
+      candidateId: outcome.candidateId,
+      needId: outcome.needId,
+      pipelineRunId: outcome.pipelineRunId || null,
+    });
+    res.json(outcome);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message || 'Unable to update outcome' });
+  }
 });
 app.patch('/api/candidates/:id/manual-skills', async (req, res) => {
   const c = DB.candidates.find(x => x.id === req.params.id);
@@ -5411,6 +5661,23 @@ app.post('/api/outreach/draft', async (req, res) => {
 app.post('/api/client-report/generate', async (req, res) => {
   try { res.json(await generateClientReport(req.body || {})); }
   catch (e) { console.error('client-report', e); res.status(500).json({ error: e.message }); }
+});
+app.post('/api/agent-learning/daily-summary', async (req, res) => {
+  try {
+    const summary = buildDailyLearningSummary(req.body || {});
+    DB.agent_learning_summaries.unshift(summary);
+    if (DB.agent_learning_summaries.length > 365) DB.agent_learning_summaries.length = 365;
+    await persistDB();
+    await logActivity('Learning', `Daily learning summary created for ${summary.date}`, 'info', {
+      summaryId: summary.id,
+      date: summary.date,
+      totalOutcomesReviewed: summary.totalOutcomesReviewed,
+    });
+    res.json(summary);
+  } catch (e) {
+    console.error('agent-learning/daily-summary', e);
+    res.status(500).json({ error: e.message || 'Unable to create learning summary' });
+  }
 });
 app.post('/api/pipeline/run', async (req, res) => {
   const { company, role } = req.body || {};
@@ -5519,6 +5786,9 @@ module.exports = {
     mergeCandidateSkillEvidence,
     applyManualSkillEdit,
     displaySkillBucketsForMatch,
+    createCandidateOutcome,
+    patchCandidateOutcome,
+    buildDailyLearningSummary,
     openaiParseCandidateItem,
     refineMatchScoresWithOpenAI,
     isPersonLikeSignal,

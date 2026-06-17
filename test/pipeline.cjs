@@ -285,6 +285,7 @@ const {
   apolloPeopleMatch, resolveApolloMaxEnrichPerRun, resolveApolloVolumeConfig, APOLLO_MATCH_DEFAULT_MAX_PER_RUN, APOLLO_MAX_RESULTS_PER_VARIANT_DEFAULT, APOLLO_MAX_VARIANTS_PER_RUN_DEFAULT, APOLLO_MAX_CANDIDATES_PER_RUN_DEFAULT, apolloSearchLocationFromNeed,
   selectedMarketFromNeed, isApolloOutsideSelectedMarket,
   applyManualSkillEdit, displaySkillBucketsForMatch,
+  createCandidateOutcome, patchCandidateOutcome, buildDailyLearningSummary,
 } = _internals;
 
 // NOTE: do NOT call loadDB() — it reassigns the module-internal `DB` binding
@@ -722,6 +723,194 @@ async function main() {
       `Internal match record keeps score/tier/reasoning for View Matches`);
     assert(beforeMatch.rank === 1,
       `Manual skill edits do not change existing candidate ordering/rank`);
+  }
+
+  // ── 7e. Candidate outcomes + daily learning summaries are passive ──
+  {
+    assert(Array.isArray(DB.candidate_outcomes) && Array.isArray(DB.agent_learning_summaries),
+      'candidate_outcomes and agent_learning_summaries initialize safely for old data files');
+    const emptyLearning = buildDailyLearningSummary({ date: '2026-06-17' });
+    assert(emptyLearning.totalOutcomesReviewed === 0 && /Not enough data yet/i.test(emptyLearning.summary),
+      `Daily learning summary handles no outcomes (summary=${JSON.stringify(emptyLearning.summary)})`);
+
+    const learnRun = 'learning_outcomes_' + Date.now().toString(36);
+    const learnNeed = createNeed({
+      companyId: coA.id,
+      title: 'Learning Outcomes Role',
+      requiredSkills: ['Azure', 'KQL'],
+      seniority: 'Mid',
+      locationType: 'Remote',
+      location: 'Remote',
+      confirmed: true,
+      pipelineRunId: learnRun,
+    });
+    const highRejectedCand = findOrCreateCandidate({
+      name: 'High Score Rejected',
+      currentTitle: 'Cloud Security Engineer',
+      currentCompany: 'Learning Co',
+      location: 'Remote',
+      skills: ['Azure', 'KQL', 'Sentinel'],
+      linkedinUrl: 'https://www.linkedin.com/in/high-score-rejected',
+      source: 'Apollo',
+      provider_of_record: 'apollo',
+      discovered_by: ['apollo'],
+      scoutDecision: 'accepted',
+      pipelineRunId: learnRun,
+    });
+    const lowAcceptedCand = findOrCreateCandidate({
+      name: 'Lower Score Accepted',
+      currentTitle: 'Security Analyst',
+      currentCompany: 'Learning Co',
+      location: 'Remote',
+      skills: ['Azure'],
+      linkedinUrl: 'https://www.linkedin.com/in/lower-score-accepted',
+      source: 'Firecrawl',
+      provider_of_record: 'firecrawl',
+      discovered_by: ['firecrawl'],
+      scoutDecision: 'accepted',
+      pipelineRunId: learnRun,
+    });
+    createValidation(highRejectedCand.id, { pipelineRunId: learnRun, tier: 'Verified Active', evidenceNotes: 'Strong technical evidence' });
+    createValidation(lowAcceptedCand.id, { pipelineRunId: learnRun, tier: 'Needs Review', evidenceNotes: 'Sparse but relevant evidence' });
+    const highBeforeScore = scoreCandidateAgainstNeed(highRejectedCand, learnNeed, learnRun).score;
+    const lowBeforeScore = scoreCandidateAgainstNeed(lowAcceptedCand, learnNeed, learnRun).score;
+    const highMatch = createOrUpdateMatch({
+      needId: learnNeed.id,
+      candidateId: highRejectedCand.id,
+      pipelineRunId: learnRun,
+      score: 88,
+      tier: 'Strong Match',
+      matchedSkills: ['Azure', 'KQL'],
+      missingSkills: [],
+      reasoning: ['Matches 2/2 required skills'],
+      rank: 1,
+    });
+    const lowMatch = createOrUpdateMatch({
+      needId: learnNeed.id,
+      candidateId: lowAcceptedCand.id,
+      pipelineRunId: learnRun,
+      score: 55,
+      tier: 'Weak Match',
+      matchedSkills: ['Azure'],
+      missingSkills: ['KQL'],
+      reasoning: ['Matches 1/2 required skills'],
+      rank: 2,
+    });
+
+    const highOutcome = createCandidateOutcome({
+      candidateId: highRejectedCand.id,
+      needId: learnNeed.id,
+      matchId: highMatch.id,
+      clientVerdict: 'rejected',
+      finalOutcome: 'rejected',
+      clientReason: 'too senior for budget',
+      outcomeDate: '2026-06-17T12:00:00.000Z',
+    });
+    assert(highOutcome.matchScore === 88 && highOutcome.matchTier === 'Strong Match' && highOutcome.pipelineRunId === learnRun,
+      `Outcome snapshots match score/tier/run from match (outcome=${JSON.stringify(highOutcome)})`);
+    assert(highOutcome.sourcedBy === 'apollo' && highOutcome.validatorVerdict === 'Verified Active',
+      `Outcome snapshots provider and validator fields (source=${highOutcome.sourcedBy}, validator=${highOutcome.validatorVerdict})`);
+    assert(highOutcome.validatorReason === 'Strong technical evidence',
+      `Outcome snapshots validator reason`);
+
+    let duplicateBlocked = false;
+    try {
+      createCandidateOutcome({ candidateId: highRejectedCand.id, needId: learnNeed.id, pipelineRunId: learnRun });
+    } catch (e) {
+      duplicateBlocked = e.status === 409;
+    }
+    assert(duplicateBlocked, 'Duplicate active outcome is blocked for candidateId + needId + pipelineRunId');
+
+    let invalidClientVerdictBlocked = false;
+    try {
+      createCandidateOutcome({ candidateId: lowAcceptedCand.id, needId: learnNeed.id, clientVerdict: 'maybe' });
+    } catch (e) {
+      invalidClientVerdictBlocked = e.status === 400;
+    }
+    assert(invalidClientVerdictBlocked, 'Invalid clientVerdict is rejected');
+
+    const lowOutcome = createCandidateOutcome({
+      candidateId: lowAcceptedCand.id,
+      needId: learnNeed.id,
+      matchId: lowMatch.id,
+      clientVerdict: 'accepted',
+      finalOutcome: 'hired',
+      clientReason: 'hands-on detection experience',
+      outcomeDate: '2026-06-17T13:00:00.000Z',
+    });
+    const oldId = lowOutcome.id;
+    const oldCandidateId = lowOutcome.candidateId;
+    const oldNeedId = lowOutcome.needId;
+    const oldPipelineRunId = lowOutcome.pipelineRunId;
+    const oldMatchId = lowOutcome.matchId;
+    const oldSourcedBy = lowOutcome.sourcedBy;
+    const oldValidatorVerdict = lowOutcome.validatorVerdict;
+    const oldValidatorReason = lowOutcome.validatorReason;
+    const oldMatchScore = lowOutcome.matchScore;
+    const oldMatchTier = lowOutcome.matchTier;
+    const oldCreatedAt = lowOutcome.createdAt;
+    patchCandidateOutcome(lowOutcome, {
+      feedbackFromClient: 'client liked practical Azure depth',
+      finalOutcome: 'hired',
+      needId: 'bad-need',
+      pipelineRunId: 'bad-run',
+      matchId: 'bad-match',
+      sourcedBy: 'bad-source',
+      validatorVerdict: 'bad-validator',
+      validatorReason: 'bad-reason',
+      matchScore: 999,
+      matchTier: 'bad-tier',
+      candidateSnapshot: { bad: true },
+      matchSnapshot: { bad: true },
+      validationSnapshot: { bad: true },
+      id: 'bad-id',
+      candidateId: 'bad-candidate',
+      createdAt: '1900-01-01T00:00:00.000Z',
+    });
+    assert(lowOutcome.id === oldId &&
+      lowOutcome.candidateId === oldCandidateId &&
+      lowOutcome.needId === oldNeedId &&
+      lowOutcome.pipelineRunId === oldPipelineRunId &&
+      lowOutcome.matchId === oldMatchId &&
+      lowOutcome.sourcedBy === oldSourcedBy &&
+      lowOutcome.validatorVerdict === oldValidatorVerdict &&
+      lowOutcome.validatorReason === oldValidatorReason &&
+      lowOutcome.matchScore === oldMatchScore &&
+      lowOutcome.matchTier === oldMatchTier &&
+      lowOutcome.createdAt === oldCreatedAt &&
+      !lowOutcome.candidateSnapshot &&
+      !lowOutcome.matchSnapshot &&
+      !lowOutcome.validationSnapshot &&
+      lowOutcome.feedbackFromClient === 'client liked practical Azure depth',
+      'PATCH outcome updates allowed fields but cannot change identity, snapshots, or history fields');
+
+    let invalidFinalOutcomeBlocked = false;
+    try {
+      patchCandidateOutcome(lowOutcome, { finalOutcome: 'maybe_later' });
+    } catch (e) {
+      invalidFinalOutcomeBlocked = e.status === 400;
+    }
+    assert(invalidFinalOutcomeBlocked, 'Invalid finalOutcome is rejected');
+
+    const learning = buildDailyLearningSummary({
+      date: '2026-06-17',
+      windowStart: '2026-06-17T00:00:00.000Z',
+      windowEnd: '2026-06-17T23:59:59.999Z',
+    });
+    assert(learning.totalOutcomesReviewed === 2 && learning.highScoreRejectedCount === 1 && learning.lowScoreAcceptedCount === 1,
+      `Learning summary detects score/outcome mismatches (summary=${JSON.stringify(learning)})`);
+    assert(learning.hiredCount === 1 && learning.rejectedCount === 1,
+      `Learning summary counts hired/rejected outcomes`);
+    assert(learning.providerSignals.some(s => s.provider === 'apollo' && s.rejected === 1) &&
+      learning.validatorSignals.some(s => s.verdict === 'Verified Active' && s.rejected === 1),
+      `Learning summary includes provider and validator signals`);
+    assert(scoreCandidateAgainstNeed(highRejectedCand, learnNeed, learnRun).score === highBeforeScore &&
+      scoreCandidateAgainstNeed(lowAcceptedCand, learnNeed, learnRun).score === lowBeforeScore,
+      'Candidate outcomes and learning summaries do not change scoring math');
+    assert(isClientReadyForNeed(highRejectedCand, learnNeed) === true && isClientReadyForNeed(lowAcceptedCand, learnNeed) === true,
+      'Candidate outcomes and learning summaries do not change visible/client-ready gates');
+    assert(highMatch.rank === 1 && lowMatch.rank === 2,
+      'Candidate outcomes and learning summaries do not change candidate ordering');
   }
 
   // Re-stamp sharedCand under runB and run matchmaker to materialize a runB match record
