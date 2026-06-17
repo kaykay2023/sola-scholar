@@ -284,6 +284,7 @@ const {
   sourcingRejectionStub,
   apolloPeopleMatch, resolveApolloMaxEnrichPerRun, resolveApolloVolumeConfig, APOLLO_MATCH_DEFAULT_MAX_PER_RUN, APOLLO_MAX_RESULTS_PER_VARIANT_DEFAULT, APOLLO_MAX_VARIANTS_PER_RUN_DEFAULT, APOLLO_MAX_CANDIDATES_PER_RUN_DEFAULT, apolloSearchLocationFromNeed,
   selectedMarketFromNeed, isApolloOutsideSelectedMarket,
+  applyManualSkillEdit, displaySkillBucketsForMatch,
 } = _internals;
 
 // NOTE: do NOT call loadDB() — it reassigns the module-internal `DB` binding
@@ -640,6 +641,87 @@ async function main() {
       assert(csv && csv.includes(guarded),
         `CSV formula guard prefixes unsafe value ${JSON.stringify(guarded)} (csv=${JSON.stringify(csv)})`);
     }
+  }
+
+  // ── 7d. Client report is client-clean + manual skill edits are display-only ──
+  {
+    const manualRun = 'manual_skill_report_' + Date.now().toString(36);
+    const manualNeed = createNeed({
+      companyId: coA.id,
+      title: 'Manual Skill Report Role',
+      requiredSkills: ['Azure', 'KQL', 'Sentinel'],
+      seniority: 'Mid',
+      locationType: 'Remote',
+      location: 'Remote',
+      confirmed: true,
+      pipelineRunId: manualRun,
+    });
+    const manualCand = findOrCreateCandidate({
+      name: 'Manual Skill Candidate',
+      currentTitle: 'Cloud Security Engineer',
+      currentCompany: 'Manual Skill Co',
+      location: 'Remote',
+      skills: ['Azure', 'KQL'],
+      linkedinUrl: 'https://www.linkedin.com/in/manual-skill-candidate',
+      source: 'Manual',
+      scoutDecision: 'accepted',
+      pipelineRunId: manualRun,
+    });
+    const blockedCand = findOrCreateCandidate({
+      name: 'Manual Skill Blocked',
+      currentTitle: 'Cloud Security Engineer',
+      currentCompany: 'Manual Skill Co',
+      location: 'Remote',
+      skills: [],
+      source: 'Manual',
+      scoutDecision: 'review',
+      pipelineRunId: manualRun,
+    });
+    const beforeScore = scoreCandidateAgainstNeed(manualCand, manualNeed, manualRun);
+    const beforeVisible = isClientReadyForNeed(blockedCand, manualNeed);
+    await runMatchmaker({ needId: manualNeed.id, pipelineRunId: manualRun });
+    const beforeMatch = DB.matches.find(m => m.pipelineRunId === manualRun && m.candidateId === manualCand.id);
+    applyManualSkillEdit(manualCand, { action: 'add', skill: 'Sentinel' });
+    applyManualSkillEdit(manualCand, { action: 'remove', skill: 'KQL' });
+    applyManualSkillEdit(blockedCand, { action: 'add', skill: 'Azure' });
+    const displayBuckets = displaySkillBucketsForMatch(manualCand, beforeMatch, manualNeed);
+    assert(displayBuckets.matchedSkills.includes('Sentinel'),
+      `Manually added skill appears as confirmed/display matched (matched=${JSON.stringify(displayBuckets.matchedSkills)})`);
+    assert(!displayBuckets.matchedSkills.includes('KQL') && displayBuckets.missingSkills.includes('KQL'),
+      `Manually removed skill no longer shows as matched (matched=${JSON.stringify(displayBuckets.matchedSkills)}, missing=${JSON.stringify(displayBuckets.missingSkills)})`);
+    assert(manualCand.manualSkillEdits && manualCand.manualSkillEdits.provenance.some(e => e.source === 'manual' && e.action === 'add' && e.skill === 'Sentinel'),
+      `Manual skill additions persist with manual provenance`);
+    assert(manualCand.manualSkillEdits && manualCand.manualSkillEdits.provenance.some(e => e.source === 'manual' && e.action === 'remove' && e.skill === 'KQL'),
+      `Manual skill removals persist with manual provenance`);
+    assert(scoreCandidateAgainstNeed(manualCand, manualNeed, manualRun).score === beforeScore.score,
+      `Manual skill edits do not change scoring math until matchmaker is intentionally rerun (before=${beforeScore.score}, after=${scoreCandidateAgainstNeed(manualCand, manualNeed, manualRun).score})`);
+    assert(isClientReadyForNeed(blockedCand, manualNeed) === beforeVisible,
+      `Manual skill edits do not change candidate visibility/client-ready status`);
+    assert(isClientReadyForNeed(blockedCand, manualNeed) === false,
+      `Manual skill edits do not bypass verified-only/review gates`);
+
+    const manualReport = await generateClientReport({ needId: manualNeed.id, pipelineRunId: manualRun });
+    const reportCandidate = manualReport.report && manualReport.report.candidates && manualReport.report.candidates.find(c => c.name === 'Manual Skill Candidate');
+    const reportJson = JSON.stringify(manualReport.report || {});
+    const reportText = [manualReport.report?.summary, manualReport.report?.emailDraft, manualReport.report?.csv, reportJson].join('\n');
+    assert(reportCandidate && reportCandidate.currentTitle === 'Cloud Security Engineer' && reportCandidate.currentCompany === 'Manual Skill Co' && reportCandidate.location === 'Remote',
+      `Client report still includes name/title/company/location`);
+    assert(reportCandidate && reportCandidate.links && /linkedin\.com\/in\/manual-skill-candidate/.test(reportCandidate.links.linkedin || ''),
+      `Client report still includes LinkedIn link`);
+    assert(reportCandidate && reportCandidate.matchedSkills.includes('Azure') && reportCandidate.matchedSkills.includes('Sentinel'),
+      `Client report includes confirmed/manual matched skills (matched=${JSON.stringify(reportCandidate && reportCandidate.matchedSkills)})`);
+    assert(reportCandidate && !reportCandidate.matchedSkills.includes('KQL') && reportCandidate.missingSkills.includes('KQL'),
+      `Client report uses manual edits for matched-vs-missing required skills`);
+    assert(reportCandidate && reportCandidate.locationMatch,
+      `Client report keeps location match`);
+    for (const forbidden of ['Match score', '/100', 'Weak Match', 'Provider:', 'Found through:', 'Validation:', 'Review status:', 'Review note:', 'Evidence:', 'Next step:', 'Needs Review']) {
+      assert(!reportText.includes(forbidden),
+        `Client report output excludes internal field "${forbidden}"`);
+    }
+    assert(beforeMatch && Number.isFinite(beforeMatch.score) && beforeMatch.tier && Array.isArray(beforeMatch.reasoning),
+      `Internal match record keeps score/tier/reasoning for View Matches`);
+    assert(beforeMatch.rank === 1,
+      `Manual skill edits do not change existing candidate ordering/rank`);
   }
 
   // Re-stamp sharedCand under runB and run matchmaker to materialize a runB match record
