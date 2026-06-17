@@ -404,6 +404,92 @@ function mergeCandidateSkillEvidence(c, skills = [], source = '') {
   return c;
 }
 
+function normalizeManualSkillEdits(c) {
+  if (!c) return { added: [], removed: [], provenance: [] };
+  const raw = c.manualSkillEdits && typeof c.manualSkillEdits === 'object' ? c.manualSkillEdits : {};
+  const added = normalizeSet(raw.added || raw.addedSkills || []);
+  const removed = normalizeSet(raw.removed || raw.removedSkills || []);
+  const provenance = Array.isArray(raw.provenance) ? raw.provenance.filter(Boolean) : [];
+  c.manualSkillEdits = {
+    added: added.slice(0, 100),
+    removed: removed.slice(0, 100),
+    provenance: provenance.slice(-250),
+  };
+  return c.manualSkillEdits;
+}
+
+function applyManualSkillEdit(c, { action, skill }) {
+  if (!c) return null;
+  const cleanSkill = String(skill || '').trim();
+  const skillKey = normalizeSkillKey(cleanSkill);
+  if (!skillKey) return null;
+  const edits = normalizeManualSkillEdits(c);
+  const removeKey = list => list.filter(s => normalizeSkillKey(s) !== skillKey);
+  const entry = {
+    skill: cleanSkill,
+    action,
+    source: 'manual',
+    at: now(),
+  };
+  if (action === 'add') {
+    edits.removed = removeKey(edits.removed);
+    if (!edits.added.some(s => normalizeSkillKey(s) === skillKey)) edits.added.push(cleanSkill);
+  } else if (action === 'remove') {
+    edits.added = removeKey(edits.added);
+    if (!edits.removed.some(s => normalizeSkillKey(s) === skillKey)) edits.removed.push(cleanSkill);
+  } else {
+    return null;
+  }
+  edits.provenance.push(entry);
+  edits.added = edits.added.slice(0, 100);
+  edits.removed = edits.removed.slice(0, 100);
+  edits.provenance = edits.provenance.slice(-250);
+  return edits;
+}
+
+function displaySkillBucketsForMatch(candidate = {}, match = {}, need = {}) {
+  const edits = normalizeManualSkillEdits(candidate);
+  const addedKeys = new Set(edits.added.map(normalizeSkillKey));
+  const removedKeys = new Set(edits.removed.map(normalizeSkillKey));
+  const required = Array.isArray(need.requiredSkills) ? need.requiredSkills : [];
+  const baseMatched = Array.isArray(match.matchedSkills) ? match.matchedSkills : [];
+  const baseMissing = Array.isArray(match.missingSkills) ? match.missingSkills : [];
+  const matched = [];
+  const missing = [];
+
+  const pushUnique = (list, skill) => {
+    const key = normalizeSkillKey(skill);
+    if (!key || list.some(s => normalizeSkillKey(s) === key)) return;
+    list.push(skill);
+  };
+
+  if (required.length) {
+    for (const skill of required) {
+      const key = normalizeSkillKey(skill);
+      if (removedKeys.has(key)) pushUnique(missing, skill);
+      else if (addedKeys.has(key) || baseMatched.some(s => normalizeSkillKey(s) === key)) pushUnique(matched, skill);
+      else pushUnique(missing, skill);
+    }
+  } else {
+    for (const skill of baseMatched) {
+      const key = normalizeSkillKey(skill);
+      if (!removedKeys.has(key)) pushUnique(matched, skill);
+    }
+  }
+
+  for (const skill of baseMissing) {
+    const key = normalizeSkillKey(skill);
+    if (!addedKeys.has(key) && !removedKeys.has(key) && !matched.some(s => normalizeSkillKey(s) === key)) pushUnique(missing, skill);
+  }
+  for (const skill of edits.added) {
+    const key = normalizeSkillKey(skill);
+    if (required.length && !required.some(s => normalizeSkillKey(s) === key)) continue;
+    if (!removedKeys.has(key)) pushUnique(matched, skill);
+  }
+
+  return { matchedSkills: matched, missingSkills: missing };
+}
+
 function mergeUniqueObjects(a = [], b = [], keyFn = item => JSON.stringify(item)) {
   const out = [];
   const seen = new Set();
@@ -1443,7 +1529,7 @@ function findOrCreateCandidate(input) {
   if (c) {
     const fields = ['name','currentTitle','currentCompany','location','github','linkedinUrl','portfolioUrl','resumeUrl','profileUrl','sourceProfile','email','phone','summary','avatarUrl','sourceUrl','sourceType','scoutDecision','scoutReason','sourceDomain','sourceChannel','scoutScore','scoutScoreReasons','scoutSourceLabel','scoutQuery','experienceScore','experienceSignals','privateProfileWarning','seniority_signal','experience_level_guess','work_experience_evidence','entry_level_warning','reviewStatus','visibility_state','reason_code','signals_snapshot','recoverable','confidence_modifier','security_months_cumulative','most_recent_security_role_at','provider_of_record','resolution_status','source_confidence','location_confidence','work_history_confidence'];
     for (const f of fields) if (input[f] && !c[f]) c[f] = input[f];
-    for (const f of ['workHistory','work_history','experience','experiences','positions','employmentHistory','employment_history','repositories','repos','githubEvidence','discovered_by','resolved_by','provider_trace','skillEvidence']) {
+    for (const f of ['workHistory','work_history','experience','experiences','positions','employmentHistory','employment_history','repositories','repos','githubEvidence','discovered_by','resolved_by','provider_trace','skillEvidence','manualSkillEdits']) {
       if (input[f] && !c[f]) c[f] = input[f];
     }
     if (input.linkedin && !c.linkedinUrl) c.linkedinUrl = input.linkedin;
@@ -1470,6 +1556,7 @@ function findOrCreateCandidate(input) {
       location: input.location || '',
       skills: Array.isArray(input.skills) ? input.skills : [],
       skillEvidence: [],
+      manualSkillEdits: { added: [], removed: [], provenance: [] },
       github: input.github || input.githubUrl || '',
       linkedinUrl: input.linkedinUrl || input.linkedin || (input.profileUrl && input.profileUrl.includes('linkedin.com') ? input.profileUrl : ''),
       portfolioUrl: input.portfolioUrl || input.website || '',
@@ -1547,6 +1634,7 @@ function findOrCreateCandidate(input) {
   if (Array.isArray(c.skills) && c.skills.length) {
     mergeCandidateSkillEvidence(c, [], c.provider_of_record || input.provider_of_record || input.source || c.source || '');
   }
+  normalizeManualSkillEdits(c);
   // Always re-compute identity verification on every touch so the candidate
   // record stays consistent with its current URL fields.
   refreshIdentityVerification(c);
@@ -4840,58 +4928,20 @@ async function generateClientReport({ needId, pipelineRunId = null, scoutStats =
     })
     .slice(0, CLIENT_REPORT_CANDIDATE_LIMIT);
 
-  const nextStep = tier =>
-    tier === 'Strong Match' ? 'Schedule intro call this week'
-    : tier === 'Review' ? 'Phone screen in next 7 days'
-    : tier === 'Weak Match' ? 'Review profile to assess fit — borderline'
-    : 'Review profile to assess fit';
-
   const candidates = matches.map(m => {
     const c = DB.candidates.find(x => x.id === m.candidateId);
-    const v = c ? latestValidation(c.id, pipelineRunId) : null;
-    const displayLabel = matchDisplayLabel(m.score, c, m, v);
-    // Keep the Needs Review guardrail visible in the client report: when evidence
-    // is incomplete, the recommended action is manual review, never a direct
-    // client submission. This does NOT change the score, label, or ordering.
-    const needsManualReview = (v?.tier || '') === 'Needs Review';
     const links = collectCandidateProfileLinks(c || {});
-    const profileLinkCount = Object.values(links).filter(Boolean).length;
+    const displaySkills = displaySkillBucketsForMatch(c || {}, m, need);
+    const locationMatch = (m.reasoning || []).find(r => /^Location match:|^Remote-friendly$/i.test(String(r || ''))) || '';
     return {
       name: c?.name || '',
       currentTitle: c?.currentTitle || '',
       currentCompany: c?.currentCompany || '',
       location: c?.location || '',
-      score: m.score,
-      tier: m.tier,
-      displayLabel,
-      displayHelper: matchDisplayHelper(m.score, displayLabel),
-      matchedSkills: m.matchedSkills || [],
-      missingSkills: m.missingSkills || [],
-      validationTier: v?.tier || 'Not Validated',
-      needsManualReview,
-      reviewStatus: c?.reviewStatus || (needsManualReview ? 'Needs Manual Review' : ''),
-      evidenceNotes: v?.evidenceNotes || '',
-      whyFits: (m.reasoning || []).join(' · '),
-      reviewReason: m.reviewReason || '',
-      recommendedNextStep: needsManualReview
-        ? 'Manual review required — confirm evidence before client submission'
-        : nextStep(m.tier),
+      matchedSkills: displaySkills.matchedSkills,
+      missingSkills: displaySkills.missingSkills,
+      locationMatch,
       links,
-      hasUsableProfileLink: profileLinkCount > 0,
-      profileLinkWarning: profileLinkCount ? '' : 'No usable profile link — manual review required',
-      sourceVariants: c?.searchVariantsFound || [],
-      searchVariantMeta: c?.searchVariantMeta || [],
-      providersFound: c?.providersFound || [],
-      locationTiersMatched: c?.locationTiersMatched || [],
-      proximity_tier: c?.proximity_tier || '',
-      proximity_rank: c?.proximity_rank || null,
-      profileKeywordSignals: c?.profileKeywordSignals || [],
-      privateProfileWarning: c?.privateProfileWarning || '',
-      seniority_signal: c?.seniority_signal || '',
-      experience_level_guess: c?.experience_level_guess || '',
-      work_experience_evidence: c?.work_experience_evidence || '',
-      entry_level_warning: c?.entry_level_warning || '',
-      sourceProvider: (c?.providersFound || [c?.source || '']).filter(Boolean)[0] || '',
     };
   });
 
@@ -4919,13 +4969,13 @@ async function generateClientReport({ needId, pipelineRunId = null, scoutStats =
     summary = `No real verified candidates found.`;
   } else if (isConfigured('openai') && candidates.length) {
     const sys = 'You are a recruiting analyst writing a concise (3 sentence) executive summary of a candidate shortlist for a client. Plain prose, factual, value-focused.';
-    const usr = `Role: ${need.title} at ${company?.name || 'the company'}. Required skills: ${(need.requiredSkills || []).join(', ') || 'unspecified'}. Top candidate: ${candidates[0].name} (${candidates[0].score}/100, label: ${candidates[0].displayLabel || candidates[0].tier}). ${candidates.length} candidates total. Tone: factual.`;
+    const usr = `Role: ${need.title} at ${company?.name || 'the company'}. Required skills: ${(need.requiredSkills || []).join(', ') || 'unspecified'}. Top candidate: ${candidates[0].name}. ${candidates.length} candidates total. Tone: factual.`;
     summary = (await openaiComplete(sys, usr, { maxTokens: 250 })) || '';
   }
   if (!summary) {
     const top = candidates[0];
     summary = candidates.length
-      ? `Shortlist of ${candidates.length} vetted candidate${candidates.length > 1 ? 's' : ''} for the ${need.title} role${company ? ` at ${company.name}` : ''}. Top match: ${top?.name || '—'} (${top?.score || 0}/100, ${top?.displayLabel || top?.tier || ''}). All candidates have been validated against the required skill set.`
+      ? `Shortlist of ${candidates.length} vetted candidate${candidates.length > 1 ? 's' : ''} for the ${need.title} role${company ? ` at ${company.name}` : ''}. Top candidate: ${top?.name || '—'}.`
       : `No qualifying candidates available yet for the ${need.title} role.`;
   }
 
@@ -4938,16 +4988,10 @@ ${summary}
 
 Top candidates:
 ${candidates.map((c, i) => `${i + 1}. ${c.name} — ${c.currentTitle}${c.currentCompany ? ` (${c.currentCompany})` : ''}
-   Match score: ${c.score}/100 (${c.displayLabel || c.tier})
    Strong on: ${c.matchedSkills.join(', ') || '—'}
    Gaps: ${c.missingSkills.join(', ') || 'none'}
-   Validation: ${c.validationTier}
-   Source: ${(c.providersFound || []).join(', ') || c.sourceProvider || 'unknown'}${c.proximity_tier ? ` · ${c.proximity_tier}` : ''}
-   Found through: ${(c.sourceVariants || []).slice(0, 3).join(', ') || 'not captured'}
-   Profile links: ${Object.values(c.links || {}).filter(Boolean).join(' | ') || c.profileLinkWarning}
-   Review warnings: ${[c.privateProfileWarning, c.entry_level_warning].filter(Boolean).join(' · ') || 'none'}
-   Why fits: ${c.whyFits}
-   Next step: ${c.recommendedNextStep}`).join('\n\n')}
+   Location match: ${c.locationMatch || c.location || '—'}
+   LinkedIn: ${c.links?.linkedin || '—'}`).join('\n\n')}
 
 Happy to set up intro calls with any of the above. Just let me know which to prioritise.
 
@@ -4962,8 +5006,8 @@ Sola Scholar
     return '"' + s.replace(/"/g, '""') + '"';
   };
   const csvRows = [
-    ['Rank','Name','Title','Company','Location','Match Score','Tier','Matched Skills','Missing Skills','Validation','Review Status','Source Variants','Variant Metadata','Proximity Tier','Profile Keywords','Private Profile Warning','Entry-Level Warning','Why Fits','Next Step','GitHub','LinkedIn','Source Profile','Portfolio','Resume'].map(esc).join(','),
-    ...candidates.map((c, i) => [i+1, c.name, c.currentTitle, c.currentCompany, c.location, c.score, c.displayLabel || c.tier, c.matchedSkills.join(';'), c.missingSkills.join(';'), c.validationTier, c.reviewStatus, c.sourceVariants.join(';'), (c.searchVariantMeta || []).map(v => `${v.title}:${v.variant_type}:${v.specificity_weight}`).join(';'), c.proximity_tier, c.profileKeywordSignals.join(';'), c.privateProfileWarning, c.entry_level_warning, c.whyFits, c.recommendedNextStep, c.links.github, c.links.linkedin, c.links.source, c.links.portfolio, c.links.resume].map(esc).join(',')),
+    ['Rank','Name','Title','Company','Location','Matched Skills','Missing Skills','Location Match','LinkedIn'].map(esc).join(','),
+    ...candidates.map((c, i) => [i+1, c.name, c.currentTitle, c.currentCompany, c.location, c.matchedSkills.join(';'), c.missingSkills.join(';'), c.locationMatch, c.links.linkedin].map(esc).join(',')),
   ];
   const csv = csvRows.join('\n');
 
@@ -5307,6 +5351,20 @@ app.delete('/api/hiring-needs/:id', async (req, res) => {
   await persistDB();
   res.json({ ok: true });
 });
+app.patch('/api/candidates/:id/manual-skills', async (req, res) => {
+  const c = DB.candidates.find(x => x.id === req.params.id);
+  if (!c) return res.status(404).json({ error: 'Not found' });
+  const body = req.body || {};
+  const action = String(body.action || '').trim().toLowerCase();
+  const skill = String(body.skill || '').trim();
+  if (!['add', 'remove'].includes(action) || !skill) {
+    return res.status(400).json({ error: 'action add/remove and skill required' });
+  }
+  const edits = applyManualSkillEdit(c, { action, skill });
+  if (!edits) return res.status(400).json({ error: 'invalid skill edit' });
+  await persistDB();
+  res.json({ ok: true, candidate: c, manualSkillEdits: edits });
+});
 app.patch('/api/matches/:id', async (req, res) => {
   const m = DB.matches.find(x => x.id === req.params.id);
   if (!m) return res.status(404).json({ error: 'Not found' });
@@ -5459,6 +5517,8 @@ module.exports = {
     resolvePdlEnrichMaxPerRun,
     runPdlCandidateEnrichment,
     mergeCandidateSkillEvidence,
+    applyManualSkillEdit,
+    displaySkillBucketsForMatch,
     openaiParseCandidateItem,
     refineMatchScoresWithOpenAI,
     isPersonLikeSignal,
