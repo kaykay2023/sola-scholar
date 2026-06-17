@@ -767,6 +767,8 @@ async function main() {
       source: 'Firecrawl',
       provider_of_record: 'firecrawl',
       discovered_by: ['firecrawl'],
+      resolved_by: ['pdl'],
+      resolution_status: 'resolved',
       scoutDecision: 'accepted',
       pipelineRunId: learnRun,
     });
@@ -1241,9 +1243,9 @@ async function main() {
 
   assert(scoutResult.sourcedRaw === 6,                       `scout sourcedRaw === 6 (got ${scoutResult.sourcedRaw})`);
   assert(scoutResult.rejectedNonCandidates === 4,            `4 rejected non-candidates (got ${scoutResult.rejectedNonCandidates})`);
-  assert(scoutResult.acceptedCandidates === 2,               `2 accepted candidates (got ${scoutResult.acceptedCandidates})`);
-  assert(scoutResult.needsScoutReview === 0,                 `0 review (got ${scoutResult.needsScoutReview})`);
-  assert(scoutResult.sourced === 2,                          `scout.sourced (validator-input) === 2 (got ${scoutResult.sourced})`);
+  assert(scoutResult.acceptedCandidates === 0,               `0 accepted Firecrawl-only unresolved candidates (got ${scoutResult.acceptedCandidates})`);
+  assert(scoutResult.needsScoutReview === 2,                 `2 Firecrawl-only unresolved profiles held for review (got ${scoutResult.needsScoutReview})`);
+  assert(scoutResult.sourced === 2,                          `scout.sourced retains 2 candidate-like profiles for internal review (got ${scoutResult.sourced})`);
 
   // Rejected samples carry the right sourceType
   const rejTypes = scoutResult.rejectedSamples.map(r => r.sourceType).sort();
@@ -1270,17 +1272,18 @@ async function main() {
   const learnDocCand = DB.candidates.find(c => (c.sourceUrl || '').includes('learn.microsoft.com'));
   assert(!learnDocCand, `No candidate record carries a Microsoft Learn URL`);
 
-  // Validator only sees accepted candidates — pipeline-style call
+  // Validator can still see retained review candidates for internal QA, but
+  // matchmaker/client-visible paths must not include them.
   const scoutCandIds = scoutResult.candidates.map(c => c.id);
-  assert(scoutCandIds.length === 2, `Validator receives exactly 2 candidate ids (got ${scoutCandIds.length})`);
+  assert(scoutCandIds.length === 2, `Validator receives 2 retained unresolved Firecrawl-only candidate ids (got ${scoutCandIds.length})`);
   const scoutValRes = await runValidator({ candidateIds: scoutCandIds, pipelineRunId: scoutRunId });
   assert(scoutValRes.validated === 2,
-    `Validator processed 2 candidates only — rejected items skipped (got validated=${scoutValRes.validated})`);
+    `Validator processed 2 retained review candidates for internal QA (got validated=${scoutValRes.validated})`);
 
-  // Matchmaker pool is run-scoped — equals accepted candidates
+  // Matchmaker pool is run-scoped — equals accepted/client-visible candidates
   const scoutMm = await runMatchmaker({ needId: scoutNeed.id, pipelineRunId: scoutRunId });
-  assert(scoutMm.matched === 2,
-    `Matchmaker scored 2 candidates only — rejected pages excluded (got ${scoutMm.matched})`);
+  assert(scoutMm.matched === 0,
+    `Matchmaker scored 0 unresolved Firecrawl-only candidates (got ${scoutMm.matched})`);
   // No match record should reference a ZipRecruiter/MS-blog/Learn URL
   for (const m of DB.matches.filter(m => m.pipelineRunId === scoutRunId)) {
     const c = DB.candidates.find(x => x.id === m.candidateId);
@@ -1453,10 +1456,12 @@ async function main() {
   const verifyRunId = 'verify_run_' + Date.now().toString(36);
   const verifyScout = await runScout({ needId: verifyNeed.id, pipelineRunId: verifyRunId });
 
-  // real-individual → upgraded to accepted (API User)
+  // real-individual → person-like, but still review until Apollo/PDL structural resolution
   const realIndCand = DB.candidates.find(c => (c.sourceUrl || '').includes('github.com/real-individual'));
-  assert(realIndCand && realIndCand.scoutDecision === 'accepted',
-    `GitHub API type=User → candidate accepted (got scoutDecision="${realIndCand && realIndCand.scoutDecision}", scoutReason="${realIndCand && realIndCand.scoutReason}")`);
+  assert(realIndCand && realIndCand.scoutDecision === 'review' &&
+    realIndCand.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW &&
+    realIndCand.reason_code === 'FIRECRAWL_ONLY_UNRESOLVED_LOCAL_HYBRID',
+    `GitHub API type=User remains review until Apollo/PDL resolution (got scoutDecision="${realIndCand && realIndCand.scoutDecision}", visibility="${realIndCand && realIndCand.visibility_state}", reason="${realIndCand && realIndCand.reason_code}")`);
   assert(realIndCand && /API verified type=User/.test(realIndCand.scoutReason || ''),
     `scoutReason mentions API verification (got "${realIndCand && realIndCand.scoutReason}")`);
   // acme-security → demoted to rejected (API Organization)
@@ -1469,10 +1474,12 @@ async function main() {
   assert(randomRej && /no person-like signals/.test(randomRej.scoutReason || ''),
     `random-thing rejected reason mentions no-person-signals (got "${randomRej && randomRej.scoutReason}")`);
 
-  // Control LinkedIn /in/ → accepted (still works alongside GH verification)
+  // Control LinkedIn /in/ → candidate-like, but still review until Apollo/PDL structural resolution
   const ctrlCand = DB.candidates.find(c => (c.sourceUrl || '').includes('linkedin.com/in/control'));
-  assert(ctrlCand && ctrlCand.scoutDecision === 'accepted',
-    `Control LinkedIn /in/ still accepted (got scoutDecision="${ctrlCand && ctrlCand.scoutDecision}")`);
+  assert(ctrlCand && ctrlCand.scoutDecision === 'review' &&
+    ctrlCand.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW &&
+    ctrlCand.reason_code === 'FIRECRAWL_ONLY_UNRESOLVED_LOCAL_HYBRID',
+    `Control LinkedIn /in/ remains review until Apollo/PDL resolution (got scoutDecision="${ctrlCand && ctrlCand.scoutDecision}", visibility="${ctrlCand && ctrlCand.visibility_state}", reason="${ctrlCand && ctrlCand.reason_code}")`);
 
   // ── 16f. API unavailable → stays review (do NOT blindly accept) ──
   STUB_FIRECRAWL_ITEMS = [
@@ -1551,14 +1558,18 @@ async function main() {
   assert(apolloScout.acceptedBySource.apollo === 3,
     `acceptedBySource.apollo === 3 (got ${apolloScout.acceptedBySource.apollo})`);
   // (d) Dedupe — Bob's LinkedIn URL appears in both Apollo and Firecrawl;
-  //     only Apollo gets credit (first-touch). Firecrawl gets credit for the
-  //     unique fresh-firecrawl LinkedIn person.
-  assert(apolloScout.acceptedBySource.firecrawl === 1,
-    `acceptedBySource.firecrawl === 1 (Bob deduped, only fresh-firecrawl counted; got ${apolloScout.acceptedBySource.firecrawl})`);
+  //     only Apollo gets credit (first-touch). The unique fresh-firecrawl
+  //     LinkedIn person is preserved for review until Apollo/PDL resolution.
+  assert((apolloScout.acceptedBySource.firecrawl || 0) === 0,
+    `acceptedBySource.firecrawl === 0 for unresolved Firecrawl-only candidates (got ${apolloScout.acceptedBySource.firecrawl})`);
+  assert(apolloScout.reviewBySource.firecrawl === 1,
+    `reviewBySource.firecrawl === 1 for fresh-firecrawl (got ${apolloScout.reviewBySource.firecrawl})`);
 
-  // (e) Total accepted = 4 unique (Alice, Bob, Charlie, fresh-firecrawl)
-  assert(apolloScout.acceptedCandidates === 4,
-    `acceptedCandidates === 4 unique after dedupe (got ${apolloScout.acceptedCandidates})`);
+  // (e) Total accepted = 3 Apollo-resolved unique candidates (Alice, Bob, Charlie)
+  assert(apolloScout.acceptedCandidates === 3,
+    `acceptedCandidates === 3 Apollo-resolved unique candidates after dedupe (got ${apolloScout.acceptedCandidates})`);
+  assert(apolloScout.needsScoutReview === 1,
+    `needsScoutReview === 1 unresolved Firecrawl-only profile (got ${apolloScout.needsScoutReview})`);
   // (f) Rejected non-candidates still excluded
   assert(apolloScout.rejectedNonCandidates === 1,
     `1 rejected (ZipRecruiter) — non-candidates still excluded (got ${apolloScout.rejectedNonCandidates})`);
@@ -1571,8 +1582,8 @@ async function main() {
   assert(apolloVal.validated >= 3,
     `Validator processed Apollo candidates (validated=${apolloVal.validated})`);
   const apolloMm = await runMatchmaker({ needId: apolloNeed.id, pipelineRunId: apolloRunId });
-  assert(apolloMm.matched === 4,
-    `Matchmaker scored all 4 accepted Apollo+Firecrawl candidates (got ${apolloMm.matched})`);
+  assert(apolloMm.matched === 3,
+    `Matchmaker scored all 3 accepted Apollo-resolved candidates (got ${apolloMm.matched})`);
 
   // (h) Apollo missing/disabled → no crash, falls back to Firecrawl/GitHub
   delete process.env.APOLLO_API_KEY;
@@ -1591,8 +1602,8 @@ async function main() {
     fallbackScout = await runScout({ needId: fallbackNeed.id, pipelineRunId: fallbackRunId });
   } catch (e) { fallbackErr = e; }
   assert(!fallbackErr, `Apollo missing does not crash runScout (err=${fallbackErr && fallbackErr.message})`);
-  assert(fallbackScout && fallbackScout.acceptedCandidates >= 1,
-    `Pipeline continues with Firecrawl when Apollo missing (accepted=${fallbackScout && fallbackScout.acceptedCandidates})`);
+  assert(fallbackScout && fallbackScout.acceptedCandidates === 0 && fallbackScout.needsScoutReview >= 1,
+    `Pipeline preserves Firecrawl-only fallback candidates for review when Apollo missing (accepted=${fallbackScout && fallbackScout.acceptedCandidates}, review=${fallbackScout && fallbackScout.needsScoutReview})`);
   assert(fallbackScout && fallbackScout.rawResultsBySource.apollo === 0,
     `rawResultsBySource.apollo === 0 when Apollo missing (got ${fallbackScout && fallbackScout.rawResultsBySource.apollo})`);
 
@@ -2724,12 +2735,14 @@ async function main() {
     locationType: 'Remote',
     confirmed: true,
   });
-  const fcProfileScout = await runScout({ needId: fcProfileNeed.id, pipelineRunId: 'fc_profile_' + Date.now().toString(36) });
+  const fcProfileRunId = 'fc_profile_' + Date.now().toString(36);
+  const fcProfileScout = await runScout({ needId: fcProfileNeed.id, pipelineRunId: fcProfileRunId });
   assert(FIRECRAWL_QUERIES[0] && FIRECRAWL_QUERIES[0].includes('site:linkedin.com/in/'),
     `runScout uses LinkedIn-profile Firecrawl query first (got "${FIRECRAWL_QUERIES[0]}")`);
-  assert(fcProfileScout.acceptedBySource.firecrawl === 1,
-    `Profile-targeted Firecrawl LinkedIn result accepted (got ${fcProfileScout.acceptedBySource.firecrawl})`);
-  const fcProfileCand = fcProfileScout.candidates.find(c => (c.linkedinUrl || '').includes('profile-person'));
+  assert((fcProfileScout.acceptedBySource.firecrawl || 0) === 0 &&
+    fcProfileScout.reviewBySource.firecrawl === 1,
+    `Profile-targeted Firecrawl LinkedIn result held for review until structural resolution (accepted=${fcProfileScout.acceptedBySource.firecrawl}, review=${fcProfileScout.reviewBySource.firecrawl})`);
+  const fcProfileCand = DB.candidates.find(c => c.pipelineRunId === fcProfileRunId && (c.linkedinUrl || '').includes('profile-person'));
   assert(fcProfileCand && fcProfileCand.scoutScore >= 30 && fcProfileCand.scoutSourceLabel,
     `Firecrawl candidate carries score/source diagnostics`);
 
@@ -4245,6 +4258,23 @@ async function main() {
     locationType: 'Remote',
     confirmed: true,
   });
+  const remoteUsQualityNeed = createNeed({
+    companyId: coApollo.id,
+    title: 'SOC Analyst',
+    requiredSkills: ['Microsoft Sentinel', 'KQL', 'SIEM'],
+    seniority: 'Mid',
+    locationType: 'Remote',
+    location: 'Remote US',
+    confirmed: true,
+  });
+  const softwareRemoteNeed = createNeed({
+    companyId: coApollo.id,
+    title: 'Software Engineer',
+    requiredSkills: ['React', 'Node.js'],
+    seniority: 'Mid',
+    locationType: 'Remote',
+    confirmed: true,
+  });
   const detectionNeed = createNeed({
     companyId: coApollo.id,
     title: 'Detection Engineer',
@@ -4403,9 +4433,24 @@ async function main() {
   assert(isFirecrawlOnlyUnresolved(ghFirecrawlDetection, detectionNeed) === true,
     'Firecrawl-only unresolved is identified independently of role type');
   applySourcingQualityGate(ghFirecrawlDetection, detectionNeed);
-  assert(ghFirecrawlDetection.visibility_state === VISIBILITY_STATE.VISIBLE &&
-    ghFirecrawlDetection.reason_code !== 'FIRECRAWL_ONLY_UNRESOLVED_LOCAL_HYBRID',
-    `Remote Detection/SIEM GitHub evidence remains allowed (state=${ghFirecrawlDetection.visibility_state}, reason=${ghFirecrawlDetection.reason_code})`);
+  assert(ghFirecrawlDetection.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW &&
+    ghFirecrawlDetection.reason_code === 'FIRECRAWL_ONLY_UNRESOLVED_LOCAL_HYBRID' &&
+    isClientReadyForNeed(ghFirecrawlDetection, detectionNeed) === false,
+    `Remote/no-location Firecrawl-only unresolved candidate becomes NEEDS_REVIEW (state=${ghFirecrawlDetection.visibility_state}, reason=${ghFirecrawlDetection.reason_code})`);
+
+  const ghFirecrawlRemoteUs = mkGithubVerifiedFirecrawlOnly('GH Firecrawl Remote US');
+  applySourcingQualityGate(ghFirecrawlRemoteUs, remoteUsQualityNeed);
+  assert(ghFirecrawlRemoteUs.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW &&
+    ghFirecrawlRemoteUs.reason_code === 'FIRECRAWL_ONLY_UNRESOLVED_LOCAL_HYBRID' &&
+    isClientReadyForNeed(ghFirecrawlRemoteUs, remoteUsQualityNeed) === false,
+    `Remote US Firecrawl-only unresolved candidate becomes NEEDS_REVIEW (state=${ghFirecrawlRemoteUs.visibility_state}, reason=${ghFirecrawlRemoteUs.reason_code})`);
+
+  const ghFirecrawlSoftwareRemote = mkGithubVerifiedFirecrawlOnly('GH Firecrawl Software Remote');
+  applySourcingQualityGate(ghFirecrawlSoftwareRemote, softwareRemoteNeed);
+  assert(ghFirecrawlSoftwareRemote.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW &&
+    ghFirecrawlSoftwareRemote.reason_code === 'FIRECRAWL_ONLY_UNRESOLVED_LOCAL_HYBRID' &&
+    isClientReadyForNeed(ghFirecrawlSoftwareRemote, softwareRemoteNeed) === false,
+    `Non-security remote Firecrawl-only unresolved candidate becomes NEEDS_REVIEW despite GATE_NOT_APPLICABLE path (state=${ghFirecrawlSoftwareRemote.visibility_state}, reason=${ghFirecrawlSoftwareRemote.reason_code})`);
 
   const ghFirecrawlSoc = mkGithubVerifiedFirecrawlOnly('GH Firecrawl SOC');
   applySourcingQualityGate(ghFirecrawlSoc, michiganHybridNeed);
@@ -4456,6 +4501,24 @@ async function main() {
   assert(apolloTexasVisible.visibility_state === VISIBILITY_STATE.VISIBLE &&
     isClientReadyForNeed(apolloTexasVisible, texasHybridNeed) === true,
     `Apollo-resolved Texas candidate is client-ready for Texas hybrid (state=${apolloTexasVisible.visibility_state})`);
+
+  const pdlResolvedRemote = gateCandidate({
+    name: 'PDL Resolved Remote Visible',
+    title: 'SOC Analyst',
+    currentTitle: 'SOC Analyst',
+    currentCompany: 'SecurityCo',
+    skills: ['Microsoft Sentinel', 'KQL', 'SIEM'],
+    source: 'Firecrawl',
+    sourceType: 'candidate_profile',
+    provider_of_record: 'firecrawl',
+    discovered_by: ['firecrawl'],
+    resolved_by: ['pdl'],
+    resolution_status: 'resolved',
+    workHistory: [work('SOC Analyst', 24)],
+  }, qualityNeed);
+  assert(pdlResolvedRemote.visibility_state === VISIBILITY_STATE.VISIBLE &&
+    isClientReadyForNeed(pdlResolvedRemote, qualityNeed) === true,
+    `PDL-resolved Firecrawl-discovered remote candidate remains VISIBLE (state=${pdlResolvedRemote.visibility_state}, reason=${pdlResolvedRemote.reason_code})`);
 
   const liveGateRun = 'live_firecrawl_gate_' + Date.now().toString(36);
   const liveNeed = createNeed({

@@ -1541,10 +1541,11 @@ function evaluateSourcingQuality(c = {}, need = {}) {
   const structurallyResolved = hasStructuralResolver(c);
   const signals = result.signals_snapshot || sourcingSignalsSnapshot(c, need);
 
+  if (!structurallyResolved && isFirecrawlOnlyUnresolved(c, need)) {
+    return reviewGateResult(result, c, 'FIRECRAWL_ONLY_UNRESOLVED_LOCAL_HYBRID');
+  }
+
   if (localHybridGateApplies && !structurallyResolved) {
-    if (isFirecrawlOnlyUnresolved(c, need)) {
-      return reviewGateResult(result, c, 'FIRECRAWL_ONLY_UNRESOLVED_LOCAL_HYBRID');
-    }
     if (isApolloUnresolvedCandidate(c)) {
       return reviewGateResult(result, c, apolloUnresolvedReason(c));
     }
@@ -3608,6 +3609,7 @@ function isFinalShortlistEligible(c) {
 
 function isClientReadyForNeed(c, need = {}) {
   if (!isFinalShortlistEligible(c)) return false;
+  if (isFirecrawlOnlyUnresolved(c, need)) return false;
   const market = selectedMarketFromNeed(need);
   if (market.mode !== 'concrete') return true;
   return evaluateSourcingQuality(c, need).visibility_state === VISIBILITY_STATE.VISIBLE;
