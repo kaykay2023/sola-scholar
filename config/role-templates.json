@@ -1,6 +1,121 @@
 {
-  "_comment": "Editable saved role templates for the Sola Scholar pipeline. Add/edit roles here; the server loads this file at startup and exposes it at GET /api/role-templates. No code changes needed to add a role. 'scoringProfileId' links to config/scoring-profiles.json (structure only — does NOT change score math while scoring-profiles.enabled is false).",
-  "version": 1,
+  "_comment": "Editable saved role templates for the Sola Scholar pipeline. Add/edit roles here; the server loads this file at startup and exposes it at GET /api/role-templates. No code changes needed to add a role. 'scoringProfileId' links to config/scoring-profiles.json (structure only — does NOT change score math while scoring-profiles.enabled is false). 'rolePacks' drive provider title expansion: each pack lists clean standalone provider-safe title variants for one primary role (no slashes, no keyword stuffing); roles without a pack fall back to the built-in keyword expansion.",
+  "version": 2,
+  "rolePacks": [
+    {
+      "primary": "SOC Analyst",
+      "family": "security-operations",
+      "variants": [
+        "SOC Analyst",
+        "Security Operations Analyst",
+        "Security Operations Center Analyst",
+        "Cyber Defense Analyst",
+        "Security Analyst",
+        "Incident Response Analyst",
+        "Threat Detection Analyst",
+        "SIEM Analyst",
+        "Cybersecurity Analyst",
+        "Information Security Analyst"
+      ]
+    },
+    {
+      "primary": "Cloud Security Engineer",
+      "family": "cloud-security",
+      "variants": [
+        "Cloud Security Engineer",
+        "Azure Security Engineer",
+        "AWS Security Engineer",
+        "Security Engineer",
+        "Cloud Security Architect",
+        "DevSecOps Engineer",
+        "Infrastructure Security Engineer",
+        "Cybersecurity Engineer",
+        "Platform Security Engineer"
+      ]
+    },
+    {
+      "primary": "Cybersecurity Analyst",
+      "family": "security-operations",
+      "variants": [
+        "Cybersecurity Analyst",
+        "Information Security Analyst",
+        "Security Analyst",
+        "Cyber Security Analyst",
+        "SOC Analyst",
+        "Threat Intelligence Analyst",
+        "Vulnerability Analyst",
+        "Incident Response Analyst"
+      ]
+    },
+    {
+      "primary": "GRC Analyst",
+      "family": "grc",
+      "variants": [
+        "GRC Analyst",
+        "Governance Risk and Compliance Analyst",
+        "IT Risk Analyst",
+        "Compliance Analyst",
+        "Information Security Risk Analyst",
+        "IT Auditor",
+        "Security Compliance Analyst",
+        "Third Party Risk Analyst"
+      ]
+    },
+    {
+      "primary": "Data Engineer",
+      "family": "data",
+      "variants": [
+        "Data Engineer",
+        "Senior Data Engineer",
+        "Analytics Engineer",
+        "Data Platform Engineer",
+        "ETL Developer",
+        "Big Data Engineer",
+        "Data Infrastructure Engineer",
+        "Machine Learning Engineer"
+      ]
+    },
+    {
+      "primary": "Analytics Engineer",
+      "family": "data",
+      "variants": [
+        "Analytics Engineer",
+        "Data Engineer",
+        "Business Intelligence Engineer",
+        "BI Developer",
+        "Data Analyst",
+        "Data Platform Engineer",
+        "Analytics Developer"
+      ]
+    },
+    {
+      "primary": "Marketing Specialist",
+      "family": "marketing",
+      "variants": [
+        "Marketing Specialist",
+        "Digital Marketing Specialist",
+        "Marketing Coordinator",
+        "Growth Marketing Specialist",
+        "Content Marketing Specialist",
+        "Marketing Manager",
+        "Demand Generation Specialist",
+        "Email Marketing Specialist"
+      ]
+    },
+    {
+      "primary": "Sales Development Representative",
+      "family": "sales",
+      "variants": [
+        "Sales Development Representative",
+        "SDR",
+        "Business Development Representative",
+        "BDR",
+        "Inside Sales Representative",
+        "Account Development Representative",
+        "Outbound Sales Representative"
+      ]
+    }
+  ],
   "templates": [
     {
       "id": "ms-sentinel-soc-analyst",

@@ -261,6 +261,9 @@ const COLLECTIONS = [
   'companies', 'hiring_managers', 'hiring_needs', 'candidates',
   'candidate_validations', 'matches', 'outreach', 'client_reports',
   'candidate_outcomes', 'agent_learning_summaries', 'activity_logs',
+  // Persistent cross-run structured-resolution queue (Firecrawl/weak-web
+  // discoveries waiting for Apollo/PDL structural resolution).
+  'resolution_queue',
 ];
 function emptyDB() { return Object.fromEntries(COLLECTIONS.map(c => [c, []])); }
 
@@ -531,6 +534,11 @@ const norm = {
   name: s => (s || '').trim().toLowerCase().replace(/\s+/g, ' '),
 };
 
+// Layered identity keys, strongest first. LinkedIn/GitHub/email are
+// vendor-canonical; stable provider person-IDs (Apollo/PDL) come next; the
+// weak name-based layers are last and are additionally guarded by a
+// location-conflict check in findOrCreateCandidate so two distinct people who
+// merely share a name+company are not silently merged.
 function candidateDedupeKey(c) {
   const profile = c.profileUrl || c.sourceProfile || c.sourceUrl || c.portfolioUrl || c.resumeUrl || '';
   const li = norm.linkedin(c.linkedinUrl || c.linkedin || profile || '');
@@ -539,6 +547,10 @@ function candidateDedupeKey(c) {
   if (gh) return 'gh:' + gh;
   const em = norm.email(c.email || '');
   if (em) return 'em:' + em;
+  const apolloId = String(c.apollo_person_id || '').trim();
+  if (apolloId) return 'pid:apollo:' + apolloId;
+  const pdlId = String(c.pdl_person_id || '').trim();
+  if (pdlId) return 'pid:pdl:' + pdlId;
   const nm = norm.name(c.name || '');
   const co = norm.name(c.currentCompany || c.company || '');
   if (nm && co) return 'nc:' + nm + '|' + co;
@@ -546,6 +558,22 @@ function candidateDedupeKey(c) {
   const src = norm.url(profile || '');
   if (nm && loc && src) return 'nls:' + nm + '|' + loc + '|' + src;
   return 'rand:' + uid();
+}
+
+// Weak-key merge guard: for the name-based 'nc:' layer only, refuse to merge
+// two records that BOTH carry concrete, incompatible locations — that shape is
+// far more likely two distinct people with the same name+company than one
+// person. Compatible = either side missing, or one contains the other.
+function dedupeLocationsConflict(a = '', b = '') {
+  const la = norm.name(a);
+  const lb = norm.name(b);
+  if (!la || !lb) return false;
+  if (la === lb) return false;
+  if (la.includes(lb) || lb.includes(la)) return false;
+  // Shared city/state token (e.g. "detroit, michigan" vs "detroit, mi area")
+  const tokensA = new Set(la.split(/[\s,]+/).filter(t => t.length > 2));
+  for (const t of lb.split(/[\s,]+/)) if (t.length > 2 && tokensA.has(t)) return false;
+  return true;
 }
 
 const SENTINEL_PROFILE_KEYWORDS = [
@@ -1780,10 +1808,17 @@ function createNeed(input) {
 }
 
 function findOrCreateCandidate(input) {
-  const key = candidateDedupeKey(input);
+  let key = candidateDedupeKey(input);
   let c = DB.candidates.find(x => x.dedupeKey === key);
+  // Weak-key (name+company) collision guard: both records carrying concrete,
+  // incompatible locations = treat as two distinct people. The incoming record
+  // gets a location-suffixed key so it never re-collides with the first.
+  if (c && key.startsWith('nc:') && dedupeLocationsConflict(c.location, input.location)) {
+    key = key.replace(/^nc:/, 'nc2:') + '|' + norm.name(input.location || '');
+    c = DB.candidates.find(x => x.dedupeKey === key) || null;
+  }
   if (c) {
-    const fields = ['name','currentTitle','currentCompany','location','github','linkedinUrl','portfolioUrl','resumeUrl','profileUrl','sourceProfile','email','phone','summary','avatarUrl','sourceUrl','sourceType','scoutDecision','scoutReason','sourceDomain','sourceChannel','scoutScore','scoutScoreReasons','scoutSourceLabel','scoutQuery','experienceScore','experienceSignals','privateProfileWarning','seniority_signal','experience_level_guess','work_experience_evidence','entry_level_warning','reviewStatus','visibility_state','reason_code','signals_snapshot','recoverable','confidence_modifier','security_months_cumulative','most_recent_security_role_at','provider_of_record','resolution_status','source_confidence','location_confidence','work_history_confidence'];
+    const fields = ['name','currentTitle','currentCompany','location','github','linkedinUrl','portfolioUrl','resumeUrl','profileUrl','sourceProfile','email','phone','summary','avatarUrl','sourceUrl','sourceType','scoutDecision','scoutReason','sourceDomain','sourceChannel','scoutScore','scoutScoreReasons','scoutSourceLabel','scoutQuery','experienceScore','experienceSignals','privateProfileWarning','seniority_signal','experience_level_guess','work_experience_evidence','entry_level_warning','reviewStatus','visibility_state','reason_code','signals_snapshot','recoverable','confidence_modifier','security_months_cumulative','most_recent_security_role_at','provider_of_record','resolution_status','source_confidence','location_confidence','work_history_confidence','apollo_person_id','pdl_person_id'];
     for (const f of fields) if (input[f] && !c[f]) c[f] = input[f];
     for (const f of ['workHistory','work_history','experience','experiences','positions','employmentHistory','employment_history','repositories','repos','githubEvidence','discovered_by','resolved_by','provider_trace','skillEvidence','manualSkillEdits']) {
       if (input[f] && !c[f]) c[f] = input[f];
@@ -1868,6 +1903,10 @@ function findOrCreateCandidate(input) {
       resolved_by: Array.isArray(input.resolved_by) ? input.resolved_by.map(normalizeProviderKey).filter(Boolean) : [],
       provider_of_record: normalizeProviderKey(input.provider_of_record || ''),
       resolution_status: input.resolution_status || 'unresolved',
+      // Stable provider person-IDs — strongest dedupe layer after LinkedIn/
+      // GitHub/email. Set only from real provider payloads.
+      apollo_person_id: String(input.apollo_person_id || '').trim(),
+      pdl_person_id: String(input.pdl_person_id || '').trim(),
       provider_trace: Array.isArray(input.provider_trace) ? input.provider_trace.map(cleanProviderTraceEntry).filter(Boolean) : [],
       source_confidence: input.source_confidence || '',
       location_confidence: input.location_confidence || '',
@@ -2034,6 +2073,10 @@ function createClientReport(input) {
     visibleMatchCount: input.visibleMatchCount || null,
     emailDraft: input.emailDraft || '',
     csv: input.csv || '',
+    // Internal ledger for already-submitted suppression (candidate IDs only —
+    // never rendered in the client-facing report body).
+    submittedCandidateIds: Array.isArray(input.submittedCandidateIds) ? input.submittedCandidateIds : [],
+    suppressedAlreadySubmittedCount: Number(input.suppressedAlreadySubmittedCount) || 0,
     createdAt: now(),
   };
   DB.client_reports.push(r);
@@ -2116,13 +2159,19 @@ function normalizeApolloTitles(titles) {
   const seen = new Set();
   const out = [];
   for (const raw of titles) {
-    const t = String(raw == null ? '' : raw).trim();
-    if (!t) continue;
-    const key = t.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(t);
-    if (out.length >= APOLLO_PERSON_TITLES_MAX) break;
+    // Never send slash-combined role strings to a provider — split
+    // "IAM / PAM Analyst" into clean standalone titles ("IAM Analyst" callers
+    // should provide directly; here we split defensively at the last boundary).
+    const parts = String(raw == null ? '' : raw).split(/\s*\/\s*/);
+    for (const part of parts) {
+      const t = part.trim();
+      if (!t) continue;
+      const key = t.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(t);
+      if (out.length >= APOLLO_PERSON_TITLES_MAX) return out;
+    }
   }
   return out;
 }
@@ -2228,6 +2277,11 @@ function resolveApolloMaxEnrichPerRun(value) {
   return resolveBoundedPositiveInt(value, APOLLO_MATCH_DEFAULT_MAX_PER_RUN, { min: 0, max: 100 });
 }
 
+// Default 1 page (today's behavior). Page 2 only runs when the volume config
+// explicitly allows it (env APOLLO_MAX_PAGES_PER_ATTEMPT or override) AND the
+// first page came back full — normal searches never silently double spend.
+const APOLLO_MAX_PAGES_PER_ATTEMPT_DEFAULT = 1;
+
 function resolveApolloVolumeConfig(overrides = {}) {
   return {
     maxResultsPerVariant: resolveBoundedPositiveInt(
@@ -2238,12 +2292,17 @@ function resolveApolloVolumeConfig(overrides = {}) {
     maxVariantsPerRun: resolveBoundedPositiveInt(
       overrides.maxVariantsPerRun ?? process.env.APOLLO_MAX_VARIANTS_PER_RUN,
       APOLLO_MAX_VARIANTS_PER_RUN_DEFAULT,
-      { min: 1, max: 10 },
+      { min: 1, max: 20 },
     ),
     maxCandidatesPerRun: resolveBoundedPositiveInt(
       overrides.maxCandidatesPerRun ?? process.env.APOLLO_MAX_CANDIDATES_PER_RUN,
       APOLLO_MAX_CANDIDATES_PER_RUN_DEFAULT,
       { min: 1, max: 100 },
+    ),
+    maxPagesPerAttempt: resolveBoundedPositiveInt(
+      overrides.maxPagesPerAttempt ?? process.env.APOLLO_MAX_PAGES_PER_ATTEMPT,
+      APOLLO_MAX_PAGES_PER_ATTEMPT_DEFAULT,
+      { min: 1, max: 3 },
     ),
   };
 }
@@ -2411,11 +2470,45 @@ function buildFirecrawlBoardQueries(need) {
 
 // Generate Apollo title variants from a free-text role string. Keyword-driven
 // expansion — no LLM call. Used only for candidate sourcing.
+// Config-driven role title packs (config/role-templates.json → rolePacks).
+// Each pack maps a primary role to clean standalone provider-safe title
+// variants. Slash-combined variants are split defensively; roles without a
+// configured pack fall back to the built-in keyword expansion (back-compat).
+function buildRolePackMap(config = ROLE_TEMPLATES) {
+  const map = new Map();
+  for (const pack of Array.isArray(config && config.rolePacks) ? config.rolePacks : []) {
+    const primary = String(pack && pack.primary || '').trim().toLowerCase();
+    if (!primary) continue;
+    const variants = uniqStrings(
+      (Array.isArray(pack.variants) ? pack.variants : [])
+        .flatMap(v => String(v || '').split(/\s*\/\s*/))
+        .map(v => v.trim())
+        .filter(Boolean),
+      20,
+    );
+    if (variants.length) map.set(primary, { primary: pack.primary, family: pack.family || '', variants });
+  }
+  return map;
+}
+let ROLE_PACK_MAP = null;
+function rolePackForRole(role = '') {
+  if (!ROLE_PACK_MAP) ROLE_PACK_MAP = buildRolePackMap();
+  return ROLE_PACK_MAP.get(String(role || '').trim().toLowerCase()) || null;
+}
+// TEST-ONLY hook — install deterministic packs without touching config.
+function __setRolePacksForTest(packs = null) {
+  ROLE_PACK_MAP = packs === null ? null : buildRolePackMap({ rolePacks: packs });
+}
+
 function expandRoleToTitles(role) {
   const rawTitles = splitRoleTitleLabel(role);
   const r = String(role || '').toLowerCase().trim();
   const set = new Set();
   rawTitles.forEach(t => set.add(t));
+  // Config pack first: exact primary-role match gets its curated variants
+  // ahead of the generic keyword families (still deduped + capped at 20).
+  const pack = rolePackForRole(role);
+  if (pack) pack.variants.forEach(t => set.add(t));
   // Security / cloud-security focused set (highest priority for current ICP).
   // 15 titles — fits well under Apollo's max-25 person_titles cap even when
   // combined with the input role itself.
@@ -2639,6 +2732,13 @@ async function firecrawlSearch(query, limit = 10) {
   return { ok: true, items };
 }
 
+// G2E: Adzuna discovery is OFF by default (zero-yield across audit + recent
+// production runs; no code defect found). Opt back in via env flag only —
+// no Railway variable is changed by this code.
+function adzunaDiscoveryEnabled() {
+  return /^(1|true|yes|on)$/i.test(String(process.env.ADZUNA_DISCOVERY_ENABLED || '').trim());
+}
+
 async function adzunaSearch({ what, where = '' }) {
   if (!isConfigured('adzuna')) return { ok: false, reason: 'Adzuna not configured', results: [] };
   const url = new URL('https://api.adzuna.com/v1/api/jobs/us/search/1');
@@ -2682,18 +2782,36 @@ async function githubRepos(login) {
 // must pass downstream type==='User' + non-org + non-reserved filters before
 // becoming a candidate.
 async function githubContributors({ owner, repo, perPage = 30 }) {
-  if (!owner || !repo) return { ok: false, items: [] };
+  if (!owner || !repo) return { ok: false, reason: 'owner and repo required', items: [] };
   const headers = { Accept: 'application/vnd.github.v3+json' };
   if (process.env.GITHUB_TOKEN) headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+  const boundedPerPage = Math.min(Math.max(Number(perPage) || 30, 1), 100);
   let res;
   try {
     res = await fetch(
-      `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contributors?per_page=${perPage}`,
+      `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contributors?per_page=${boundedPerPage}`,
       { headers },
     );
-  } catch { return { ok: false, items: [] }; }
-  if (!res.ok) return { ok: false, status: res.status, items: [] };
-  const data = await res.json();
+  } catch (e) { return { ok: false, reason: 'GitHub contributors fetch error', items: [] }; }
+  // 204 No Content: GitHub's documented response for an EMPTY repository —
+  // previously fell through to res.json() which throws on an empty body and
+  // crashed out of this function. Treat as a valid empty contributor list.
+  if (res.status === 204) return { ok: true, items: [], empty: true };
+  if (!res.ok) {
+    // Capture GitHub's sanitized error message so bad-request/forbidden causes
+    // are diagnosable from activity logs instead of a bare status code.
+    let raw = '';
+    try { raw = await res.text(); } catch { raw = ''; }
+    let message = '';
+    try { message = JSON.parse(raw).message || ''; } catch { message = String(raw || '').slice(0, 120); }
+    const reason = res.status === 403 && /rate limit/i.test(message)
+      ? `GitHub contributors rate-limited: ${sanitizeProviderMessage(message)}`
+      : `GitHub contributors HTTP ${res.status}${message ? `: ${sanitizeProviderMessage(message)}` : ''}`;
+    return { ok: false, status: res.status, reason, items: [] };
+  }
+  // Malformed / non-array bodies must not crash the scout loop.
+  let data;
+  try { data = await res.json(); } catch { return { ok: false, status: res.status, reason: 'GitHub contributors malformed response body', items: [] }; }
   return { ok: true, items: Array.isArray(data) ? data : [] };
 }
 
@@ -2747,6 +2865,36 @@ function resolvePdlEnrichMaxPerRun(value = undefined) {
   const n = Number(raw);
   if (!Number.isFinite(n)) return PDL_ENRICH_DEFAULT_MAX_PER_RUN;
   return Math.max(0, Math.min(Math.floor(n), 100));
+}
+
+// G2A: separate, conservative cap for BORDERLINE (Needs Review) enrichment —
+// independent from the client-ready cap so rescuing borderline candidates can
+// never eat the client-ready enrichment budget (or vice versa).
+const PDL_BORDERLINE_ENRICH_DEFAULT_MAX_PER_RUN = 5;
+function resolvePdlBorderlineEnrichMaxPerRun(value = undefined) {
+  const raw = value !== undefined && value !== null && value !== ''
+    ? value
+    : (process.env.PDL_BORDERLINE_ENRICH_MAX_PER_RUN || PDL_BORDERLINE_ENRICH_DEFAULT_MAX_PER_RUN);
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return PDL_BORDERLINE_ENRICH_DEFAULT_MAX_PER_RUN;
+  return Math.max(0, Math.min(Math.floor(n), 50));
+}
+
+// Deterministic evidence-priority for choosing WHICH borderline candidates get
+// the limited PDL budget. No randomness, no scoring-math reuse: pure evidence
+// shape. Higher = enrich first.
+function pdlBorderlinePriority(c = {}, need = {}) {
+  let p = 0;
+  if (isLinkedInProfileUrl(c.linkedinUrl || '')) p += 4;                     // structured identity → safe profile lookup
+  if (String(c.currentTitle || '').trim() && String(c.currentCompany || c.company || '').trim()) p += 2; // credible title+company
+  const needTokens = String(need.title || '').toLowerCase().split(/\s+/).filter(t => t.length > 2);
+  const candTitle = String(c.currentTitle || '').toLowerCase();
+  if (needTokens.length && needTokens.some(t => candTitle.includes(t))) p += 2; // partial role alignment
+  if (String(c.location || '').trim()) p += 1;
+  const skillCount = Array.isArray(c.skills) ? c.skills.length : 0;
+  const hasExperience = Array.isArray(c.experience) && c.experience.length > 0;
+  if (skillCount < 3 || !hasExperience) p += 1;                              // missing evidence PDL can realistically fill
+  return p;
 }
 
 function pdlProfileParamFromLinkedInUrl(linkedinUrl = '') {
@@ -3761,60 +3909,80 @@ function pdlClassifyEnrichDiagnostic(diags, result = {}) {
   return 'provider-error';
 }
 
-async function runPdlCandidateEnrichment({ needId, pipelineRunId = null, candidateIds = [], pdlEnrichMaxPerRun = PDL_ENRICH_DEFAULT_MAX_PER_RUN, providerDiagnostics = null } = {}) {
+async function runPdlCandidateEnrichment({ needId, pipelineRunId = null, candidateIds = [], pdlEnrichMaxPerRun = PDL_ENRICH_DEFAULT_MAX_PER_RUN, pdlBorderlineEnrichMaxPerRun = PDL_BORDERLINE_ENRICH_DEFAULT_MAX_PER_RUN, providerDiagnostics = null } = {}) {
   const need = DB.hiring_needs.find(n => n.id === needId);
   const diags = providerDiagnostics || initProviderRunDiagnostics();
   const d = providerDiag(diags, 'pdl');
   const cap = resolvePdlEnrichMaxPerRun(pdlEnrichMaxPerRun);
+  const borderlineCap = resolvePdlBorderlineEnrichMaxPerRun(pdlBorderlineEnrichMaxPerRun);
   d.enrich_cap = cap;
+  d.enrich_cap_borderline = borderlineCap;
 
   const allInRun = DB.candidates.filter(c => (!pipelineRunId || c.pipelineRunId === pipelineRunId) &&
     (!candidateIds.length || candidateIds.includes(c.id)));
+  // Phase 1 pool — client-ready enrichment (existing behavior, unchanged).
   const pool = allInRun.filter(c => isClientReadyForNeed(c, need));
+  // Phase 2 pool (G2A) — BORDERLINE: promising Needs-Review candidates with a
+  // safe PDL identifier. Firecrawl-only-unresolved candidates qualify ONLY
+  // when they carry a real LinkedIn profile URL (a safe, structured lookup).
+  // Obvious non-candidates never qualify. Deterministic evidence-priority
+  // order decides who gets the limited budget.
+  const poolIds = new Set(pool.map(c => c.id));
+  const borderlinePool = allInRun
+    .filter(c => !poolIds.has(c.id))
+    .filter(c => c.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW)
+    .filter(c => isRealCandidateLike(c))
+    .filter(c => ['candidate_profile', 'possible_candidate'].includes(c.sourceType || ''))
+    .filter(c => pdlEnrichIdentifierForCandidate(c).type !== 'none')
+    .filter(c => !isFirecrawlOnlyUnresolved(c, need) || isLinkedInProfileUrl(c.linkedinUrl || ''))
+    .map(c => ({ c, priority: pdlBorderlinePriority(c, need) }))
+    .sort((a, b) => (b.priority - a.priority) || String(a.c.id).localeCompare(String(b.c.id)))
+    .map(x => x.c);
+
+  const emptySummary = () => ({
+    enriched: 0, noMatch: 0, skippedNoIdentifier: 0, planRestricted: 0, rateLimited: 0, errored: 0, queued: 0, attempted: 0, cap,
+    borderline: { cap: borderlineCap, attempted: 0, enriched: 0, noMatch: 0, planRestricted: 0, rateLimited: 0, errored: 0, queued: 0, poolSize: borderlinePool.length },
+  });
 
   if (!isConfigured('pdl')) {
     markProviderSkipped(diags, 'pdl', 'required env not set (PDL_API_KEY)');
     for (const c of pool) pdlRecordEnrichmentSkip(c, 'PDL_API_KEY missing', false);
-    return { enriched: 0, noMatch: 0, skippedNoIdentifier: 0, planRestricted: 0, rateLimited: 0, errored: 0, queued: 0, attempted: 0, cap, providerDiagnostics: diags };
+    return { ...emptySummary(), providerDiagnostics: diags };
   }
 
-  if (!pool.length || cap <= 0) {
-    markProviderSkipped(diags, 'pdl', cap <= 0 ? 'PDL enrichment cap is 0' : 'no accepted in-market candidates to enrich');
-    const queued = cap <= 0 ? pool.length : 0;
-    if (queued) pdlIncrementEnrichDiagnostic(diags, 'enrich_queued_count', queued);
-    for (const c of pool) pdlRecordEnrichmentSkip(c, cap <= 0 ? 'PDL_ENRICH_QUEUED_CAP_REACHED' : 'PDL_ENRICH_SKIPPED_NO_ELIGIBLE_CANDIDATE', false);
-    return { enriched: 0, noMatch: 0, skippedNoIdentifier: 0, planRestricted: 0, rateLimited: 0, errored: 0, queued, attempted: 0, cap, providerDiagnostics: diags };
+  if ((!pool.length && !borderlinePool.length) || (cap <= 0 && borderlineCap <= 0)) {
+    markProviderSkipped(diags, 'pdl', (cap <= 0 && borderlineCap <= 0) ? 'PDL enrichment caps are 0' : 'no eligible candidates to enrich');
+    const summary = emptySummary();
+    if (cap <= 0 && pool.length) {
+      summary.queued = pool.length;
+      pdlIncrementEnrichDiagnostic(diags, 'enrich_queued_count', pool.length);
+      for (const c of pool) pdlRecordEnrichmentSkip(c, 'PDL_ENRICH_QUEUED_CAP_REACHED', false);
+    }
+    return { ...summary, providerDiagnostics: diags };
   }
 
   markProviderStarted(diags, 'pdl');
-  const summary = { enriched: 0, noMatch: 0, skippedNoIdentifier: 0, planRestricted: 0, rateLimited: 0, errored: 0, queued: 0, attempted: 0, cap };
-  let calls = 0;
-  for (const c of pool) {
-    if (calls >= cap) {
-      summary.queued++;
-      pdlIncrementEnrichDiagnostic(diags, 'enrich_queued_count');
-      pdlRecordEnrichmentSkip(c, 'PDL_ENRICH_QUEUED_CAP_REACHED', false);
-      continue;
-    }
+  const summary = emptySummary();
 
+  // One enrichment attempt — shared by both phases. `phase` only routes the
+  // bookkeeping (summary bucket + diagnostics counter prefix).
+  const attemptEnrich = async (c, phase) => {
+    const bucket = phase === 'borderline' ? summary.borderline : summary;
+    const diagPrefix = phase === 'borderline' ? 'enrich_borderline' : 'enrich';
     const identifier = pdlEnrichIdentifierForCandidate(c);
     if (identifier.type === 'none') {
-      summary.skippedNoIdentifier++;
-      pdlIncrementEnrichDiagnostic(diags, 'enrich_skipped_no_identifier_count');
+      if (phase === 'client-ready') { summary.skippedNoIdentifier++; pdlIncrementEnrichDiagnostic(diags, 'enrich_skipped_no_identifier_count'); }
       pdlRecordEnrichmentSkip(c, identifier.reason, false);
-      continue;
+      return 'skipped';
     }
-
-    calls++;
-    summary.attempted++;
-    pdlIncrementEnrichDiagnostic(diags, 'enrich_called_count');
+    bucket.attempted++;
+    pdlIncrementEnrichDiagnostic(diags, `${diagPrefix}_called_count`);
     let result;
     if (identifier.type === 'profile') {
       result = await pdlProfileLookup({ linkedinUrl: identifier.linkedinUrl });
     } else {
       result = await pdlProfileResolve(identifier);
     }
-
     if (result.ok && result.profile) {
       markProviderReturned(diags, 'pdl', 1);
       const parsed = result.parsed || pdlParsePersonEnrichmentPayload({ data: result.profile });
@@ -3825,22 +3993,69 @@ async function runPdlCandidateEnrichment({ needId, pipelineRunId = null, candida
       c.enrichedBy = mergeUniqueStrings(c.enrichedBy, ['pdl-person-enrich']);
       c.enrichedAt = now();
       c.pdl_skipped = '';
-      addCandidateProviderTrace(c, { provider: 'pdl', stage: 'enrichment', called: true, returned: true, confidence: parsed.skills.length ? 'high' : 'medium', sourceLabel: 'pdl:person-enrich' });
-      summary.enriched++;
-      pdlIncrementEnrichDiagnostic(diags, 'enrich_enriched_count');
+      addCandidateProviderTrace(c, { provider: 'pdl', stage: 'enrichment', called: true, returned: true, confidence: parsed.skills.length ? 'high' : 'medium', sourceLabel: phase === 'borderline' ? 'pdl:person-enrich-borderline' : 'pdl:person-enrich' });
+      bucket.enriched++;
+      pdlIncrementEnrichDiagnostic(diags, `${diagPrefix}_enriched_count`);
+      if (phase === 'borderline') {
+        // CRITICAL SAFETY (G2A): enrichment NEVER sets visibility directly.
+        // Explicitly re-run identity verification + the sourcing-quality gates;
+        // they alone decide whether the new evidence changes the state. The
+        // Firecrawl-only-unresolved gate stays active inside
+        // evaluateSourcingQuality until real structural resolution exists.
+        refreshIdentityVerification(c);
+        applySourcingQualityGate(c, need || {});
+      }
+      return 'enriched';
+    }
+    const classification = pdlClassifyEnrichDiagnostic(diags, result);
+    if (classification === 'no-match') bucket.noMatch++;
+    else if (classification === 'plan-restricted') bucket.planRestricted++;
+    else if (classification === 'rate-limited') bucket.rateLimited++;
+    else bucket.errored++;
+    pdlRecordEnrichmentSkip(c, result.reason || pdlEnrichStatusReason(result.status), true);
+    // A plan/credit restriction affects every subsequent call — stop burning.
+    return classification === 'plan-restricted' ? 'stop' : 'failed';
+  };
+
+  // Phase 1: client-ready pool (existing path, existing cap).
+  let calls = 0;
+  let creditStop = false;
+  for (const c of pool) {
+    if (creditStop || calls >= cap) {
+      summary.queued++;
+      pdlIncrementEnrichDiagnostic(diags, 'enrich_queued_count');
+      pdlRecordEnrichmentSkip(c, 'PDL_ENRICH_QUEUED_CAP_REACHED', false);
       continue;
     }
-
-    const classification = pdlClassifyEnrichDiagnostic(diags, result);
-    if (classification === 'no-match') summary.noMatch++;
-    else if (classification === 'plan-restricted') summary.planRestricted++;
-    else if (classification === 'rate-limited') summary.rateLimited++;
-    else summary.errored++;
-    pdlRecordEnrichmentSkip(c, result.reason || pdlEnrichStatusReason(result.status), true);
+    const identifier = pdlEnrichIdentifierForCandidate(c);
+    if (identifier.type === 'none') {
+      summary.skippedNoIdentifier++;
+      pdlIncrementEnrichDiagnostic(diags, 'enrich_skipped_no_identifier_count');
+      pdlRecordEnrichmentSkip(c, identifier.reason, false);
+      continue;
+    }
+    calls++;
+    const outcome = await attemptEnrich(c, 'client-ready');
+    if (outcome === 'stop') creditStop = true;
   }
+
+  // Phase 2: borderline pool — separate cap; never spends client-ready budget.
+  let borderlineCalls = 0;
+  for (const c of borderlinePool) {
+    if (creditStop || borderlineCalls >= borderlineCap) {
+      summary.borderline.queued++;
+      pdlIncrementEnrichDiagnostic(diags, 'enrich_borderline_queued_count');
+      pdlRecordEnrichmentSkip(c, 'PDL_BORDERLINE_ENRICH_QUEUED_CAP_REACHED', false);
+      continue;
+    }
+    borderlineCalls++;
+    const outcome = await attemptEnrich(c, 'borderline');
+    if (outcome === 'stop') creditStop = true;
+  }
+
   markProviderFinished(diags, 'pdl');
   await persistDB();
-  await logActivity('PDL', `Enriched ${summary.enriched}/${pool.length} accepted candidate(s)`, 'success', {
+  await logActivity('PDL', `Enriched ${summary.enriched}/${pool.length} client-ready + ${summary.borderline.enriched}/${borderlinePool.length} borderline candidate(s)`, 'success', {
     source: 'pdl',
     enriched: summary.enriched,
     no_match: summary.noMatch,
@@ -3850,7 +4065,236 @@ async function runPdlCandidateEnrichment({ needId, pipelineRunId = null, candida
     errored: summary.errored,
     queued: summary.queued,
     cap,
+    borderline_enriched: summary.borderline.enriched,
+    borderline_attempted: summary.borderline.attempted,
+    borderline_queued: summary.borderline.queued,
+    borderline_cap: borderlineCap,
   });
+  return { ...summary, providerDiagnostics: diags };
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   STRUCTURED-RESOLUTION QUEUE (G2B) — persistent, cross-run
+   ════════════════════════════════════════════════════════════════════
+   Candidates discovered by Firecrawl (or another weak web source) that need
+   Apollo/PDL structural resolution are queued in DB.resolution_queue and
+   drained a capped number per run. The queue never changes visibility by
+   itself: after a successful resolution the normal gates are re-run and they
+   alone decide. Firecrawl-only unresolved blocking stays fully active until a
+   real structural resolution lands.
+
+   RESOLVER ABSTRACTION (G2H): drainResolutionQueue talks to resolvers only
+   through STRUCTURED_RESOLVERS below. Apollo is the active resolver today.
+   EXTENSION POINT: to add a second structured resolver (e.g. PDL person
+   resolve), append one entry { key, isConfigured, resolve } — no queue
+   rewrite. `resolve(entry, candidate)` must return
+   { ok, resolved, person?, workHistory?, reason, status?, fatal? }.        */
+const RESOLUTION_QUEUE_DRAIN_DEFAULT_MAX_PER_RUN = 5;
+const RESOLUTION_QUEUE_MAX_ATTEMPTS = 3;
+
+function resolveResolutionQueueDrainMax(value = undefined) {
+  const raw = value !== undefined && value !== null && value !== ''
+    ? value
+    : (process.env.RESOLUTION_QUEUE_DRAIN_MAX_PER_RUN || RESOLUTION_QUEUE_DRAIN_DEFAULT_MAX_PER_RUN);
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return RESOLUTION_QUEUE_DRAIN_DEFAULT_MAX_PER_RUN;
+  return Math.max(0, Math.min(Math.floor(n), 50));
+}
+
+async function apolloQueueResolver(entry = {}, candidate = {}) {
+  const person = {
+    name: entry.normalizedName || candidate.name || '',
+    linkedin_url: entry.profileUrl || candidate.linkedinUrl || '',
+    organization: entry.company || candidate.currentCompany || '',
+  };
+  const matched = await apolloPeopleMatch(person);
+  if (!matched.ok) {
+    return { ok: false, resolved: false, reason: matched.reason || 'APOLLO_MATCH_ERROR', status: matched.status, fatal: !!matched.fatal };
+  }
+  if (!matched.matched) {
+    return { ok: true, resolved: false, reason: matched.reason || 'APOLLO_MATCH_NO_MATCH', status: matched.status };
+  }
+  const resolution = apolloStructuredResolution(matched.person || {});
+  if (!resolution.ok) {
+    return { ok: true, resolved: false, reason: 'APOLLO_MATCH_NO_STRUCTURED_DATA', status: matched.status };
+  }
+  return { ok: true, resolved: true, person: matched.person, workHistory: resolution.workHistory || [], reason: 'APOLLO_MATCH_RESOLVED', status: matched.status };
+}
+
+const STRUCTURED_RESOLVERS = [
+  { key: 'apollo', isConfigured: () => isConfigured('apollo'), resolve: apolloQueueResolver },
+  // EXTENSION POINT: add a second structured resolver here (e.g. 'pdl' via
+  // pdlProfileResolve). Do NOT bypass this list — the queue must stay
+  // provider-agnostic.
+];
+function activeStructuredResolver() {
+  return STRUCTURED_RESOLVERS.find(r => { try { return r.isConfigured(); } catch { return false; } }) || null;
+}
+
+// Queue-eligibility: only real person-like records with enough SAFE identity
+// to attempt resolution (name with 2+ parts AND (company OR a real profile
+// URL)). Job postings / company pages / purged records never enter the queue.
+function resolutionQueueEligibility(c = {}) {
+  if (!c || !c.id) return { ok: false, reason: 'no candidate' };
+  if (!isRealCandidateLike(c)) return { ok: false, reason: 'not person-like' };
+  if (!['candidate_profile', 'possible_candidate'].includes(c.sourceType || '')) return { ok: false, reason: 'non-candidate sourceType' };
+  if ((c.resolved_by || []).length || c.resolution_status === 'resolved') return { ok: false, reason: 'already resolved' };
+  const nameParts = String(c.name || '').trim().split(/\s+/).filter(Boolean);
+  if (nameParts.length < 2) return { ok: false, reason: 'insufficient name' };
+  const hasCompany = !!String(c.currentCompany || c.company || '').trim();
+  const hasProfile = isLinkedInProfileUrl(c.linkedinUrl || '') || isLinkedInProfileUrl(c.sourceUrl || '');
+  if (!hasCompany && !hasProfile) return { ok: false, reason: 'insufficient identity (no company or profile URL)' };
+  return { ok: true };
+}
+
+function enqueueForStructuredResolution(c, need = {}, queuedReason = '') {
+  const eligibility = resolutionQueueEligibility(c);
+  if (!eligibility.ok) return { queued: false, reason: eligibility.reason };
+  const existing = (DB.resolution_queue || []).find(e =>
+    e.candidateId === c.id && ['pending', 'retryable'].includes(e.status));
+  if (existing) return { queued: false, duplicate: true, reason: 'already queued', entry: existing };
+  const entry = {
+    id: uid(),
+    candidateId: c.id,
+    needId: need.id || null,
+    source: c.provider_of_record || (c.discovered_by || [])[0] || c.source || '',
+    normalizedName: norm.name(c.name || ''),
+    company: String(c.currentCompany || c.company || '').trim(),
+    location: String(c.location || '').trim(),
+    profileUrl: isLinkedInProfileUrl(c.linkedinUrl || '') ? c.linkedinUrl : (isLinkedInProfileUrl(c.sourceUrl || '') ? c.sourceUrl : ''),
+    queuedReason: String(queuedReason || c.reason_code || 'STRUCTURAL_RESOLUTION_REQUIRED'),
+    attempts: 0,
+    lastAttemptAt: '',
+    status: 'pending',
+    resolvedProvider: '',
+    failureReason: '',
+    createdAt: now(),
+  };
+  DB.resolution_queue.push(entry);
+  return { queued: true, entry };
+}
+
+async function drainResolutionQueue({ needId = null, pipelineRunId = null, maxPerRun = undefined, providerDiagnostics = null } = {}) {
+  const diags = providerDiagnostics || initProviderRunDiagnostics();
+  const cap = resolveResolutionQueueDrainMax(maxPerRun);
+  const summary = {
+    pending: 0, attempted: 0, resolved: 0, noMatch: 0, budgetCapped: 0,
+    retryable: 0, failedPermanent: 0, duplicateSuppressed: 0, noResolver: false, cap,
+  };
+  const pendingEntries = (DB.resolution_queue || [])
+    .filter(e => ['pending', 'retryable'].includes(e.status))
+    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+  summary.pending = pendingEntries.length;
+  if (!pendingEntries.length) return { ...summary, providerDiagnostics: diags };
+
+  const resolver = activeStructuredResolver();
+  if (!resolver) {
+    // G2H: fail SAFELY and loudly — candidates stay in Needs Review; nothing
+    // becomes visible through weaker evidence.
+    summary.noResolver = true;
+    const d = providerDiag(diags, 'apollo');
+    d.resolution_no_resolver = true;
+    await logActivity('Resolver', `Structured-resolution queue has ${pendingEntries.length} pending entr${pendingEntries.length === 1 ? 'y' : 'ies'} but NO structured resolver is available (Apollo not configured). Candidates remain in Needs Review.`, 'warn', { source: 'apollo', pending: pendingEntries.length });
+    return { ...summary, providerDiagnostics: diags };
+  }
+  const d = providerDiag(diags, resolver.key);
+
+  for (const entry of pendingEntries) {
+    if (summary.attempted >= cap) {
+      summary.budgetCapped++;
+      d.resolution_queue_budget_capped_count = (d.resolution_queue_budget_capped_count || 0) + 1;
+      continue;
+    }
+    const candidate = DB.candidates.find(x => x.id === entry.candidateId);
+    if (!candidate) {
+      entry.status = 'failed';
+      entry.failureReason = 'candidate record no longer exists';
+      summary.failedPermanent++;
+      continue;
+    }
+    entry.attempts = (entry.attempts || 0) + 1;
+    entry.lastAttemptAt = now();
+    summary.attempted++;
+    d.resolution_queue_attempted_count = (d.resolution_queue_attempted_count || 0) + 1;
+
+    let result;
+    try { result = await resolver.resolve(entry, candidate); }
+    catch (e) { result = { ok: false, resolved: false, reason: `RESOLVER_EXCEPTION: ${String(e && e.message || e).slice(0, 120)}` }; }
+
+    if (result.resolved) {
+      // Attach structured provenance. Original discovery provenance
+      // (discovered_by / provider_of_record) is preserved untouched; only
+      // resolved_by / resolution_status / trace record the resolution.
+      candidate.resolved_by = mergeUniqueStrings(candidate.resolved_by, [resolver.key]);
+      candidate.resolution_status = 'resolved';
+      if (Array.isArray(result.workHistory) && result.workHistory.length && !(Array.isArray(candidate.workHistory) && candidate.workHistory.length)) {
+        candidate.workHistory = result.workHistory;
+        candidate.work_history_confidence = 'high';
+      }
+      if (result.person && result.person.linkedin_url && !isLinkedInProfileUrl(candidate.linkedinUrl || '')) {
+        const liUrl = String(result.person.linkedin_url);
+        if (isLinkedInProfileUrl(liUrl)) { candidate.linkedinUrl = liUrl; if (!candidate.sourceUrl) candidate.sourceUrl = liUrl; }
+      }
+      if (result.person && result.person.id && !candidate.apollo_person_id && resolver.key === 'apollo') {
+        candidate.apollo_person_id = String(result.person.id);
+      }
+      addCandidateProviderTrace(candidate, {
+        provider: resolver.key, stage: 'resolution', called: true, returned: true,
+        confidence: 'high', sourceLabel: `${resolver.key}:queue-people-match`,
+      });
+      // Visibility is decided ONLY by the existing gates, explicitly re-run
+      // here. Entering/exiting the queue never makes a candidate visible.
+      refreshIdentityVerification(candidate);
+      applySourcingQualityGate(candidate, DB.hiring_needs.find(n => n.id === (entry.needId || needId)) || {});
+      entry.status = 'resolved';
+      entry.resolvedProvider = resolver.key;
+      entry.failureReason = '';
+      summary.resolved++;
+      d.resolution_queue_resolved_count = (d.resolution_queue_resolved_count || 0) + 1;
+      continue;
+    }
+
+    if (result.fatal) {
+      // Auth/credit failure — stop the drain, keep entry retryable for a
+      // future run. Provider failure state is explicit, never silent.
+      entry.status = 'retryable';
+      entry.failureReason = result.reason || 'RESOLVER_FATAL';
+      summary.retryable++;
+      d.resolution_queue_retryable_count = (d.resolution_queue_retryable_count || 0) + 1;
+      markProviderError(diags, resolver.key, { reason: result.reason, status: result.status || null });
+      await logActivity('Resolver', `Structured resolution stopped: ${result.reason}`, 'error', { source: resolver.key, reason: result.reason, status: result.status || null });
+      break;
+    }
+    if (result.ok && !result.resolved) {
+      // Definitive provider no-match / no structured data.
+      if (entry.attempts >= RESOLUTION_QUEUE_MAX_ATTEMPTS || /NO_MATCH/i.test(result.reason || '')) {
+        entry.status = 'no-match';
+        entry.failureReason = result.reason || 'no match';
+        summary.noMatch++;
+        d.resolution_queue_no_match_count = (d.resolution_queue_no_match_count || 0) + 1;
+      } else {
+        entry.status = 'retryable';
+        entry.failureReason = result.reason || 'no structured data yet';
+        summary.retryable++;
+        d.resolution_queue_retryable_count = (d.resolution_queue_retryable_count || 0) + 1;
+      }
+      continue;
+    }
+    // Transient error path.
+    if (entry.attempts >= RESOLUTION_QUEUE_MAX_ATTEMPTS) {
+      entry.status = 'failed';
+      entry.failureReason = result.reason || 'resolver error';
+      summary.failedPermanent++;
+      d.resolution_queue_failed_count = (d.resolution_queue_failed_count || 0) + 1;
+    } else {
+      entry.status = 'retryable';
+      entry.failureReason = result.reason || 'resolver error';
+      summary.retryable++;
+      d.resolution_queue_retryable_count = (d.resolution_queue_retryable_count || 0) + 1;
+    }
+  }
+  await persistDB();
+  await logActivity('Resolver', `Resolution queue drain: ${summary.resolved} resolved, ${summary.noMatch} no-match, ${summary.retryable} retryable, ${summary.budgetCapped} over budget (cap ${cap})`, summary.resolved ? 'success' : 'info', { source: resolver.key, ...summary });
   return { ...summary, providerDiagnostics: diags };
 }
 
@@ -4096,14 +4540,51 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
       markProviderSkipped(providerDiagnostics, 'apollo', 'no Apollo candidate titles to search');
     } else {
     markProviderStarted(providerDiagnostics, 'apollo');
+    const apolloDiag = providerDiag(providerDiagnostics, 'apollo');
+    apolloDiag.pages_attempted_count = 0;
+    apolloDiag.titles_attempted_count = 0;
+    apolloDiag.duplicate_suppressed_count = apolloDiag.duplicate_suppressed_count || 0;
+    apolloDiag.volume_cap_reached = false;
+    apolloDiag.budget_cap_reached = false;
     for (const attempt of apolloAttempts) {
-      const ap = await apolloCandidateSearch({
-        titles: attempt.titles,
-        locations: attempt.locations,
-        keywords: attempt.keywords,
-        perPage: attempt.perPage || apolloVolumeConfig.maxResultsPerVariant,
-        page: 1,
-      });
+      // Page loop — page 2+ runs ONLY when the volume config explicitly allows
+      // it (maxPagesPerAttempt > 1) AND the previous page came back full AND
+      // the per-run candidate cap still has room. Default config = 1 page,
+      // byte-identical to prior behavior; no silent spend increase.
+      const attemptPerPage = attempt.perPage || apolloVolumeConfig.maxResultsPerVariant;
+      apolloDiag.titles_attempted_count += (attempt.titles || []).length;
+      let ap = { ok: true, people: [] };
+      const pageCounts = [];
+      for (let pageNo = 1; pageNo <= apolloVolumeConfig.maxPagesPerAttempt; pageNo++) {
+        if (pageNo > 1) {
+          const prevFull = pageCounts[pageCounts.length - 1] >= attemptPerPage;
+          const capRoom = apolloCandidatePullCount + (ap.people || []).length < apolloVolumeConfig.maxCandidatesPerRun;
+          if (!prevFull || !capRoom) break;
+        }
+        apolloDiag.pages_attempted_count++;
+        const pageResult = await apolloCandidateSearch({
+          titles: attempt.titles,
+          locations: attempt.locations,
+          keywords: attempt.keywords,
+          perPage: attemptPerPage,
+          page: pageNo,
+        });
+        if (!pageResult.ok) { ap = { ...pageResult, people: ap.people || [] }; break; }
+        const pageCount = (pageResult.people || []).length;
+        pageCounts.push(pageCount);
+        ap = { ok: true, people: [...(ap.people || []), ...(pageResult.people || [])] };
+        if (pageNo > 1) {
+          sourceQueryStats.apollo.push({
+            step: `${attempt.label}#page${pageNo}`,
+            titles: attempt.titles,
+            keywords: attempt.keywords,
+            locations: attempt.locations,
+            ok: true,
+            count: pageCount,
+            reason: '',
+          });
+        }
+      }
       const apolloReturned = (ap.people || []).length;
       markProviderReturned(providerDiagnostics, 'apollo', apolloReturned);
       sourceQueryStats.apollo.push({
@@ -4113,6 +4594,8 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
         locations: attempt.locations,
         ok: ap.ok,
         count: apolloReturned,
+        pages: pageCounts.length || 1,
+        countsByPage: pageCounts,
         reason: ap.reason || '',
       });
 
@@ -4138,7 +4621,7 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
 
       if (!apolloReturned) continue;
       const remainingApolloSlots = Math.max(0, apolloVolumeConfig.maxCandidatesPerRun - apolloCandidatePullCount);
-      if (remainingApolloSlots <= 0) break;
+      if (remainingApolloSlots <= 0) { apolloDiag.volume_cap_reached = true; break; }
       const apolloPeople = (ap.people || [])
         .map((person, index) => ({ person, index, priority: apolloResolutionPriority(person) }))
         .sort((a, b) => (b.priority - a.priority) || (a.index - b.index))
@@ -4174,6 +4657,7 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
         let apolloResolutionTrace = null;
         if (!apolloResolution.ok) {
           if (apolloEnrichCalls >= apolloEnrichCap) {
+            apolloDiag.budget_cap_reached = true;
             apolloResolutionTrace = {
               provider: 'apollo',
               stage: 'resolution',
@@ -4282,6 +4766,7 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
           sourceDomain,
           scoutSourceLabel: `apollo:${attempt.label}`,
           scoutQuery: attempt.keywords || '(title-only)',
+          apollo_person_id: String(apolloPerson.id || p.id || p.person_id || '').trim(),
           pipelineRunId,
           ...meta,
           workHistory: apolloResolution.ok ? apolloResolution.workHistory : [],
@@ -4292,9 +4777,10 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
           work_history_confidence: apolloResolution.ok ? 'high' : meta.work_history_confidence,
         });
         applyReviewMetadata(c, need, meta);
-        recordCandidateByGate(c, 'apollo');
+        if (!recordCandidateByGate(c, 'apollo')) apolloDiag.duplicate_suppressed_count++;
         if (apolloMatchFatal) break;
       }
+      if (apolloCandidatePullCount >= apolloVolumeConfig.maxCandidatesPerRun) apolloDiag.volume_cap_reached = true;
       if (apolloMatchFatal || apolloCandidatePullCount >= apolloVolumeConfig.maxCandidatesPerRun) break;
       if (!expandCandidatePool) break;
     }
@@ -4592,8 +5078,9 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
   for (const r of minedRepos) {
     const contrib = await githubContributors({ owner: r.owner, repo: r.repo, perPage: 15 });
     if (!contrib.ok) {
-      markProviderError(providerDiagnostics, 'github', { reason: `GitHub contributors HTTP ${contrib.status || 'fail'}`, status: contrib.status || null });
-      sourceQueryStats.github.push({ query: `contrib:${r.owner}/${r.repo}`, ok: false, count: 0, reason: `HTTP ${contrib.status || 'fail'}` });
+      const contribReason = contrib.reason || `GitHub contributors HTTP ${contrib.status || 'fail'}`;
+      markProviderError(providerDiagnostics, 'github', { reason: contribReason, status: contrib.status || null });
+      sourceQueryStats.github.push({ query: `contrib:${r.owner}/${r.repo}`, ok: false, count: 0, reason: contribReason });
       continue;
     }
     markProviderReturned(providerDiagnostics, 'github', (contrib.items || []).length);
@@ -4672,7 +5159,13 @@ async function runScout({ needId, pipelineRunId = null, expandCandidatePool = fa
   // sometimes contains "by NAME", "submitted by NAME", "author: NAME".
   // Extracted names always go to review pool (URL points at job board page,
   // not a candidate profile — verified-only gate stays unchanged).
-  if (isConfigured('adzuna')) {
+  // DISABLED BY DEFAULT (G2E): Adzuna returned zero candidates across the
+  // full production audit and every recent run — no code/query defect found
+  // (URL + params match the Adzuna API), the mention-mining strategy itself
+  // is near-zero-yield. Re-enable explicitly with ADZUNA_DISCOVERY_ENABLED=true.
+  if (isConfigured('adzuna') && !adzunaDiscoveryEnabled()) {
+    markProviderSkipped(providerDiagnostics, 'adzuna', 'Adzuna discovery disabled by default (zero-yield source; set ADZUNA_DISCOVERY_ENABLED=true to re-enable)');
+  } else if (isConfigured('adzuna')) {
     markProviderStarted(providerDiagnostics, 'adzuna');
     const adzKeywords = (need.requiredSkills || []).slice(0, 3).join(' ');
     const az = await adzunaSearch({ what: `${need.title} ${adzKeywords}`.trim(), where: '' });
@@ -5190,7 +5683,25 @@ async function generateClientReport({ needId, pipelineRunId = null, scoutStats =
   // satisfies (scoutDecision === 'accepted' + usable profile link). Identical
   // gate to matchmaker visible / /api/matches default / dashboard stats so
   // stale matches cannot leak into the final report.
-  const visibleMatches = DB.matches.filter(m => matchScope(m) && isVisibleMatch(m));
+  const visibleMatchesAll = DB.matches.filter(m => matchScope(m) && isVisibleMatch(m));
+  // G2G: already-submitted suppression — the same person is not re-included in
+  // a NEW report for the SAME need after a prior report already carried them.
+  // Suppression happens here at selection time only (the candidate record is
+  // untouched). Intentional re-submission is an explicit reviewed action: set
+  // candidate.resubmitApproved = true (cleared automatically after the next
+  // report that includes them).
+  const previouslySubmitted = new Set();
+  for (const prior of DB.client_reports.filter(r => r.needId === needId && (!pipelineRunId || r.pipelineRunId !== pipelineRunId))) {
+    for (const cid of (prior.submittedCandidateIds || [])) previouslySubmitted.add(cid);
+  }
+  const suppressedAlreadySubmitted = [];
+  const visibleMatches = visibleMatchesAll.filter(m => {
+    if (!previouslySubmitted.has(m.candidateId)) return true;
+    const cand = DB.candidates.find(x => x.id === m.candidateId);
+    if (cand && cand.resubmitApproved === true) return true;
+    suppressedAlreadySubmitted.push(m.candidateId);
+    return false;
+  });
   const matches = visibleMatches
     .slice()
     .sort((a, b) => {
@@ -5296,9 +5807,19 @@ Sola Scholar
     visibleMatchCount: visibleMatches.length,
     emailDraft,
     csv,
+    // Internal submission ledger (NOT part of the client-facing candidates
+    // array): drives cross-run already-submitted suppression per need.
+    submittedCandidateIds: matches.map(m => m.candidateId),
+    suppressedAlreadySubmittedCount: suppressedAlreadySubmitted.length,
   });
+  // One-shot re-submit: consume the explicit approval once the candidate has
+  // actually been re-included in a report.
+  for (const m of matches) {
+    const cand = DB.candidates.find(x => x.id === m.candidateId);
+    if (cand && cand.resubmitApproved === true && previouslySubmitted.has(cand.id)) cand.resubmitApproved = false;
+  }
   await persistDB();
-  await logActivity('Client Report', `Generated for "${need.title}" (${candidates.length} candidates)`, 'success');
+  await logActivity('Client Report', `Generated for "${need.title}" (${candidates.length} candidates${suppressedAlreadySubmitted.length ? `; ${suppressedAlreadySubmitted.length} suppressed as already submitted` : ''})`, 'success');
   return { ok: true, report };
 }
 
@@ -5306,7 +5827,7 @@ function newPipelineRunId() {
   return 'run_' + Date.now().toString(36) + '_' + crypto.randomBytes(3).toString('hex');
 }
 
-async function runPipeline({ company, role, skills = [], mustHaveSkills = [], location = '', seniority = 'Mid', expandCandidatePool = false, apolloMaxEnrichPerRun = APOLLO_MATCH_DEFAULT_MAX_PER_RUN, pdlEnrichMaxPerRun = PDL_ENRICH_DEFAULT_MAX_PER_RUN }) {
+async function runPipeline({ company, role, skills = [], mustHaveSkills = [], location = '', seniority = 'Mid', expandCandidatePool = false, apolloMaxEnrichPerRun = APOLLO_MATCH_DEFAULT_MAX_PER_RUN, pdlEnrichMaxPerRun = PDL_ENRICH_DEFAULT_MAX_PER_RUN, pdlBorderlineEnrichMaxPerRun = PDL_BORDERLINE_ENRICH_DEFAULT_MAX_PER_RUN, resolutionQueueDrainMax = undefined }) {
   const pipelineRunId = newPipelineRunId();
   console.log(`[pipeline] start runId=${pipelineRunId} role="${role}" company="${company}"`);
   await logActivity('Pipeline', `Pipeline start ${pipelineRunId}: ${role} @ ${company}`, 'running', { pipelineRunId });
@@ -5363,6 +5884,48 @@ async function runPipeline({ company, role, skills = [], mustHaveSkills = [], lo
     rejectedNonCandidates: scout.rejectedNonCandidates,
   });
 
+  // 4.5 Structured-resolution queue (G2B): enqueue this run's unresolved
+  // weak-source candidates that carry safe identity, then drain a capped
+  // number (cross-run persistent). Resolution alone never sets visibility —
+  // gates re-run inside the drain decide.
+  const RESOLUTION_QUEUE_REASONS = new Set([
+    'FIRECRAWL_ONLY_UNRESOLVED_LOCAL_HYBRID',
+    'STRUCTURAL_RESOLUTION_REQUIRED',
+    'APOLLO_MATCH_QUEUED_BUDGET_CAP',
+    'APOLLO_STRUCTURED_RESOLUTION_REQUIRED',
+    'APOLLO_MATCH_NO_STRUCTURED_DATA',
+  ]);
+  let queuedThisRun = 0;
+  let queueDuplicates = 0;
+  for (const c of (scout.candidates || [])) {
+    if (c.visibility_state !== VISIBILITY_STATE.NEEDS_REVIEW) continue;
+    if (!RESOLUTION_QUEUE_REASONS.has(c.reason_code || '')) continue;
+    const r = enqueueForStructuredResolution(c, need, c.reason_code);
+    if (r.queued) queuedThisRun++;
+    else if (r.duplicate) queueDuplicates++;
+  }
+  const queueDrain = await drainResolutionQueue({
+    needId: need.id,
+    pipelineRunId,
+    maxPerRun: resolutionQueueDrainMax,
+    providerDiagnostics: scout.providerDiagnostics,
+  });
+  const { providerDiagnostics: _queueDiags, ...resolutionQueue } = queueDrain;
+  result.steps.push({
+    step: 'resolution_queue',
+    queuedThisRun,
+    duplicateSuppressed: queueDuplicates + (resolutionQueue.duplicateSuppressed || 0),
+    pending: resolutionQueue.pending,
+    attempted: resolutionQueue.attempted,
+    resolved: resolutionQueue.resolved,
+    noMatch: resolutionQueue.noMatch,
+    budgetCapped: resolutionQueue.budgetCapped,
+    retryable: resolutionQueue.retryable,
+    failedPermanent: resolutionQueue.failedPermanent,
+    noResolver: resolutionQueue.noResolver,
+    cap: resolutionQueue.cap,
+  });
+
   // 5. Validate only the candidates this run sourced (rejected pages never reach here)
   const scoutIds = Array.from(new Set((scout.candidates || []).map(c => c.id)));
   const val = await runValidator({ candidateIds: scoutIds, pipelineRunId });
@@ -5380,6 +5943,7 @@ async function runPipeline({ company, role, skills = [], mustHaveSkills = [], lo
     pipelineRunId,
     candidateIds: scoutIds,
     pdlEnrichMaxPerRun,
+    pdlBorderlineEnrichMaxPerRun,
     providerDiagnostics: scout.providerDiagnostics,
   });
   const { providerDiagnostics: _pdlProviderDiagnostics, ...pdlEnrichment } = pdlEnrichmentResult;
@@ -5393,6 +5957,7 @@ async function runPipeline({ company, role, skills = [], mustHaveSkills = [], lo
     errored: pdlEnrichment.errored,
     queued: pdlEnrichment.queued,
     cap: pdlEnrichment.cap,
+    borderline: pdlEnrichment.borderline,
   });
 
   // 7. Match only this run's candidates against this run's need
@@ -5434,6 +5999,7 @@ async function runPipeline({ company, role, skills = [], mustHaveSkills = [], lo
     insufficientData: val.insufficientData,
     validated: val.validated,
     pdlEnrichment,
+    resolutionQueue: { queuedThisRun, ...resolutionQueue },
     matchmakerInput: mm.matched,
     visible: mm.visible,
     dropped: mm.dropped,
@@ -5848,6 +6414,19 @@ module.exports = {
     pdlProfileResolve,
     resolvePdlEnrichMaxPerRun,
     runPdlCandidateEnrichment,
+    resolvePdlBorderlineEnrichMaxPerRun,
+    pdlBorderlinePriority,
+    enqueueForStructuredResolution,
+    drainResolutionQueue,
+    resolutionQueueEligibility,
+    activeStructuredResolver,
+    resolveResolutionQueueDrainMax,
+    candidateDedupeKey,
+    dedupeLocationsConflict,
+    adzunaDiscoveryEnabled,
+    githubContributors,
+    rolePackForRole,
+    __setRolePacksForTest,
     mergeCandidateSkillEvidence,
     applyManualSkillEdit,
     displaySkillBucketsForMatch,
