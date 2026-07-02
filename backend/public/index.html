@@ -372,6 +372,56 @@ const ReviewMetadata = ({candidate = {}, reportCandidate = null}) => {
   );
 };
 
+/* G3C — concise internal explanations for gate outcomes (INTERNAL ONLY —
+   never rendered inside Client Report content). */
+const REASON_EXPLANATIONS = {
+  MANUAL_REVIEW_APPROVED: 'A reviewer explicitly approved this candidate.',
+  MANUAL_REVIEW_REJECTED: 'A reviewer explicitly rejected/hid this candidate (recoverable).',
+  GATE_NOT_APPLICABLE: 'Visible — the mid-level security gate does not apply to this role.',
+  MID_SECURITY_EXPERIENCE_PASS: 'Visible — 12+ months security experience, recent role within 3 years.',
+  UNSTRUCTURED_PROFILE_NO_WORK_HISTORY_PROOF: 'Needs review — trusted source/profile but NO structured work-history proof yet. Resolve or enrich to confirm experience.',
+  UNSTRUCTURED_PROVIDER_SECURITY_PROFILE: 'Legacy: visible on source trust alone (pre-tightening).',
+  FIRECRAWL_ONLY_UNRESOLVED_LOCAL_HYBRID: 'Needs review — web-discovered only; requires Apollo/PDL structural resolution before client-ready.',
+  STRUCTURAL_RESOLUTION_REQUIRED: 'Needs review — no structured provider has confirmed identity/location/history yet.',
+  APOLLO_MATCH_QUEUED_BUDGET_CAP: 'Needs review — Apollo resolution deferred (per-run budget cap); queued for a later run.',
+  APOLLO_MATCH_NO_MATCH: 'Needs review — Apollo could not match this person.',
+  APOLLO_MATCH_NO_STRUCTURED_DATA: 'Needs review — Apollo matched but returned no usable structured history.',
+  APOLLO_STRUCTURED_RESOLUTION_REQUIRED: 'Needs review — Apollo record lacks structured resolution.',
+  LOCATION_OUTSIDE_SELECTED_MARKET: 'Needs review — resolved location is outside the selected market.',
+  GITHUB_ONLY_WEAK_FOR_SOC: 'Needs review — GitHub-only evidence is weak for SOC roles.',
+  SECURITY_EXPERIENCE_UNDER_12_MONTHS: 'Needs review — under 12 months security experience.',
+  STALE_SECURITY_EXPERIENCE: 'Needs review — security experience older than 3 years.',
+  NO_SECURITY_WORK_HISTORY: 'Hidden — no security work history found (recoverable).',
+  PURGED_NON_CANDIDATE: 'Not a person/candidate record.',
+};
+const stateExplanation = (c) => {
+  const base = REASON_EXPLANATIONS[c.reason_code] || (c.reason_code ? `Gate outcome: ${c.reason_code}` : '');
+  return base;
+};
+const ReviewExplanation = ({candidate = {}, queueEntry = null}) => {
+  const c = candidate;
+  const expl = stateExplanation(c);
+  if (!expl && !c.visibility_state) return null;
+  const conf = [
+    c.location_confidence ? `location ${c.location_confidence}` : '',
+    c.work_history_confidence ? `work-history ${c.work_history_confidence}` : '',
+  ].filter(Boolean).join(' · ');
+  const lastAudit = Array.isArray(c.reviewAudit) && c.reviewAudit.length ? c.reviewAudit[c.reviewAudit.length - 1] : null;
+  return (
+    <div className="text-[11px] space-y-0.5 border-t border-gray-100 pt-2">
+      {c.visibility_state && <p><strong className="text-gray-600">State:</strong> <span className={
+        c.visibility_state === 'VISIBLE' ? 'text-emerald-700' : c.visibility_state === 'HIDDEN' ? 'text-rose-700' : 'text-amber-700'
+      }>{c.visibility_state}</span></p>}
+      {expl && <p className="text-gray-600">{expl}</p>}
+      {(c.discovered_by||[]).length > 0 && <p className="text-gray-500"><strong>Discovered by:</strong> {(c.discovered_by||[]).join(', ')}{c.provider_of_record ? ` · record: ${c.provider_of_record}` : ''}{(c.resolved_by||[]).length ? ` · resolved by: ${c.resolved_by.join(', ')}` : ' · unresolved'}</p>}
+      {conf && <p className="text-gray-500"><strong>Confidence:</strong> {conf}</p>}
+      {c.identityVerificationStatus && <p className="text-gray-500"><strong>Identity:</strong> {c.identityVerificationStatus}</p>}
+      {queueEntry && <p className="text-gray-500"><strong>Resolution queue:</strong> {queueEntry.status}{queueEntry.attempts ? ` (attempts: ${queueEntry.attempts})` : ''}</p>}
+      {lastAudit && <p className="text-gray-500"><strong>Last review:</strong> {lastAudit.action} — {lastAudit.reason}</p>}
+    </div>
+  );
+};
+
 const statusColor = s => ({
   'researching':'bg-gray-100 text-gray-600', 'contacted':'bg-blue-100 text-blue-700',
   'engaged':'bg-indigo-100 text-indigo-700', 'won':'bg-emerald-100 text-emerald-700',
@@ -1069,6 +1119,39 @@ const CandidatesPage = ({state, refresh}) => {
   // confused with the final shortlist.
   const [decisionFilter, setDF] = useState('accepted');
   const [validating, setV] = useState(false);
+  // G3A: Needs-Review bulk workspace state.
+  const [selected, setSelected] = useState({});
+  const [bulkReason, setBulkReason] = useState('');
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const [bulkResults, setBulkResults] = useState(null);
+  const [provFilter, setPF] = useState('all');
+  const [locConfFilter, setLCF] = useState('all');
+  const [whConfFilter, setWCF] = useState('all');
+  const [queueEntries, setQueueEntries] = useState([]);
+  useEffect(() => { apiGet('/api/resolution-queue').then(setQueueEntries).catch(() => setQueueEntries([])); }, [state.candidates.length]);
+  const queueByCandidate = useMemo(() => {
+    const m = {};
+    for (const e of queueEntries || []) if (!m[e.candidateId] || ['pending','retryable'].includes(e.status)) m[e.candidateId] = e;
+    return m;
+  }, [queueEntries]);
+
+  const selectedIds = Object.keys(selected).filter(id => selected[id]);
+  const toggleSelect = (id) => setSelected(s => ({ ...s, [id]: !s[id] }));
+  const runBulk = async (action) => {
+    if (!selectedIds.length) return;
+    if (!bulkReason.trim()) { alert('A reviewer reason is required for bulk actions.'); return; }
+    const label = action === 'approve' ? 'APPROVE' : action === 'reject' ? 'REJECT/HIDE' : 'KEEP IN REVIEW';
+    if (!confirm(`${label} ${selectedIds.length} candidate(s)?\nReason: ${bulkReason.trim()}`)) return;
+    setBulkBusy(true);
+    try {
+      const out = await apiPost('/api/candidates/bulk-review', { candidateIds: selectedIds, action, reason: bulkReason.trim() });
+      setBulkResults(out);
+      setSelected({});
+      await refresh();
+      apiGet('/api/review/metrics').catch(()=>{});
+    } catch (e) { alert(e.message); }
+    finally { setBulkBusy(false); }
+  };
 
   const validateAll = async () => {
     setV(true);
@@ -1108,8 +1191,24 @@ const CandidatesPage = ({state, refresh}) => {
       if (tierFilter === 'unvalidated' && v) return false;
       if (tierFilter !== 'unvalidated' && (!v || v.tier !== tierFilter)) return false;
     }
+    // G3A workspace filters (provider / confidence / queue status).
+    if (provFilter !== 'all' && String(c.provider_of_record || (c.discovered_by||[])[0] || '(none)') !== provFilter) return false;
+    if (locConfFilter !== 'all' && String(c.location_confidence || '(none)') !== locConfFilter) return false;
+    if (whConfFilter !== 'all' && String(c.work_history_confidence || '(none)') !== whConfFilter) return false;
     return true;
   });
+
+  // G3A: Needs-Review grouping by reason code (workspace mode).
+  const reviewWorkspace = decisionFilter === 'review';
+  const needsReviewGroups = useMemo(() => {
+    if (!reviewWorkspace) return [];
+    const groups = {};
+    for (const c of filtered.filter(x => x.visibility_state === 'NEEDS_REVIEW' || x.scoutDecision === 'review')) {
+      const key = c.reason_code || '(no reason code)';
+      (groups[key] = groups[key] || []).push(c);
+    }
+    return Object.entries(groups).sort((a, b) => b[1].length - a[1].length);
+  }, [reviewWorkspace, filtered]);
   const decisionCounts = state.candidates.reduce((acc, c) => {
     const d = decisionOf(c);
     acc[d] = (acc[d] || 0) + 1;
@@ -1165,7 +1264,79 @@ const CandidatesPage = ({state, refresh}) => {
             </button>
           ))}
         </div>
+        {reviewWorkspace && (
+          <div className="flex gap-2 mt-3 flex-wrap items-center">
+            <span className="text-[11px] uppercase tracking-wide text-gray-500 mr-1">Workspace filters:</span>
+            <select value={provFilter} onChange={e=>setPF(e.target.value)} className="border border-gray-200 rounded-lg px-2 py-1.5 text-xs bg-white">
+              <option value="all">Provider: all</option>
+              {[...new Set(state.candidates.map(c => String(c.provider_of_record || (c.discovered_by||[])[0] || '(none)')))].map(p => <option key={p} value={p}>{p}</option>)}
+            </select>
+            <select value={locConfFilter} onChange={e=>setLCF(e.target.value)} className="border border-gray-200 rounded-lg px-2 py-1.5 text-xs bg-white">
+              <option value="all">Location conf: all</option>
+              {['high','medium','low','(none)'].map(p => <option key={p} value={p}>{p}</option>)}
+            </select>
+            <select value={whConfFilter} onChange={e=>setWCF(e.target.value)} className="border border-gray-200 rounded-lg px-2 py-1.5 text-xs bg-white">
+              <option value="all">Work-history conf: all</option>
+              {['high','medium','low','(none)'].map(p => <option key={p} value={p}>{p}</option>)}
+            </select>
+          </div>
+        )}
       </div>
+
+      {/* G3A — Needs Review bulk workspace: grouped by reason code, explicit
+          confirmation, per-candidate results. Bulk approve can NEVER cross the
+          Firecrawl-only unresolved block (server refuses per-candidate). */}
+      {reviewWorkspace && (
+        <div className="bg-white rounded-2xl border border-amber-200 shadow-sm p-5 mb-6">
+          <div className="flex items-center justify-between flex-wrap gap-3 mb-3">
+            <h2 className="text-sm font-bold text-gray-800">🗂 Needs Review workspace <span className="text-gray-400 font-medium">({needsReviewGroups.reduce((a,[,l])=>a+l.length,0)} candidates in {needsReviewGroups.length} groups)</span></h2>
+            <div className="flex gap-2 items-center flex-wrap">
+              <input value={bulkReason} onChange={e=>setBulkReason(e.target.value)} placeholder="Reviewer reason (required)" className="border border-gray-200 rounded-lg px-3 py-2 text-xs w-56"/>
+              <span className="text-xs text-gray-500 font-semibold">{selectedIds.length} selected</span>
+              <button disabled={bulkBusy || !selectedIds.length} onClick={()=>runBulk('approve')} className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs px-3 py-2 rounded-lg font-semibold disabled:opacity-40">✓ Approve</button>
+              <button disabled={bulkBusy || !selectedIds.length} onClick={()=>runBulk('reject')} className="bg-rose-600 hover:bg-rose-700 text-white text-xs px-3 py-2 rounded-lg font-semibold disabled:opacity-40">✗ Reject/Hide</button>
+              <button disabled={bulkBusy || !selectedIds.length} onClick={()=>runBulk('keep')} className="bg-gray-200 hover:bg-gray-300 text-gray-700 text-xs px-3 py-2 rounded-lg font-semibold disabled:opacity-40">Keep in review</button>
+            </div>
+          </div>
+          {bulkResults && (
+            <div className={`rounded-xl px-4 py-3 mb-3 text-xs ${bulkResults.summary.failed ? 'bg-amber-50 border border-amber-200 text-amber-800' : 'bg-emerald-50 border border-emerald-200 text-emerald-800'}`}>
+              <strong>Bulk {bulkResults.action}:</strong> {bulkResults.summary.succeeded} succeeded, {bulkResults.summary.failed} failed.
+              {bulkResults.results.filter(r=>!r.ok).slice(0,8).map(r => {
+                const cand = state.candidates.find(c=>c.id===r.id);
+                return <p key={r.id} className="mt-1">• {cand?.name || r.id}: {r.error}</p>;
+              })}
+              <button onClick={()=>setBulkResults(null)} className="mt-1 underline">dismiss</button>
+            </div>
+          )}
+          {!needsReviewGroups.length ? (
+            <p className="text-xs text-gray-500">No candidates currently in Needs Review (with the active filters).</p>
+          ) : needsReviewGroups.map(([reasonCode, items]) => (
+            <div key={reasonCode} className="mb-4">
+              <div className="flex items-center gap-2 mb-2">
+                <label className="flex items-center gap-1.5 text-xs text-gray-600">
+                  <input type="checkbox"
+                    checked={items.every(c => selected[c.id])}
+                    onChange={e => setSelected(s => { const n = { ...s }; for (const c of items) n[c.id] = e.target.checked; return n; })}/>
+                  <span className="font-bold text-gray-700">{reasonCode}</span>
+                </label>
+                <Badge cls="bg-amber-100 text-amber-700">{items.length}</Badge>
+                <span className="text-[11px] text-gray-500">{REASON_EXPLANATIONS[reasonCode] || ''}</span>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                {items.map(c => (
+                  <label key={c.id} className={`flex items-start gap-2 border rounded-xl px-3 py-2 cursor-pointer ${selected[c.id] ? 'border-indigo-400 bg-indigo-50' : 'border-gray-100 bg-gray-50'}`}>
+                    <input type="checkbox" className="mt-1" checked={!!selected[c.id]} onChange={()=>toggleSelect(c.id)}/>
+                    <div className="min-w-0 flex-1">
+                      <p className="text-xs font-bold text-gray-800 truncate">{c.name} <span className="font-normal text-gray-500">· {c.currentTitle || '—'}{c.currentCompany ? ` @ ${c.currentCompany}` : ''}</span></p>
+                      <ReviewExplanation candidate={c} queueEntry={queueByCandidate[c.id] || null}/>
+                    </div>
+                  </label>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
 
       {!state.candidates.length ? (
         <Empty icon="🔍" title="No candidates yet" sub="Open a confirmed Hiring Need and click 'Source candidates', or run the Pipeline."/>
@@ -1607,6 +1778,7 @@ const ClientReportsPage = ({state, refresh, query}) => {
                         <p className="text-xs text-gray-500">{c.currentTitle}{c.currentCompany?` · ${c.currentCompany}`:''}{c.location?` · ${c.location}`:''}</p>
                       </div>
                     </div>
+                    {c.whyThisCandidate && <p className="text-xs text-gray-700 mb-2 leading-relaxed"><strong className="text-gray-800">Why this candidate:</strong> {c.whyThisCandidate}</p>}
                     {c.matchedSkills?.length>0 && (
                       <div className="flex flex-wrap gap-1 mb-1">
                         {c.matchedSkills.map(s => <Badge key={s} cls="bg-emerald-50 text-emerald-700">✓ {s}</Badge>)}

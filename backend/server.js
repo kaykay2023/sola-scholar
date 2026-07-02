@@ -1632,7 +1632,36 @@ function evaluateSourcingQuality(c = {}, need = {}) {
     });
   }
 
+  // G3B TIGHTEN-ONLY (final step): a candidate that is VISIBLE purely on source
+  // trust (UNSTRUCTURED_PROVIDER_SECURITY_PROFILE) — i.e. a clean provider/
+  // LinkedIn profile with NO structured work-history evidence — is downgraded
+  // to NEEDS_REVIEW. Structured Apollo employment / PDL-enriched experience /
+  // any approved structured work-history field sets has_structured_work_history
+  // and reaches VISIBLE via MID_SECURITY_EXPERIENCE_PASS instead, so it is not
+  // affected. Runs LAST so the specific structural gates above keep precedence.
+  if (result.visibility_state === VISIBILITY_STATE.VISIBLE &&
+      result.reason_code === 'UNSTRUCTURED_PROVIDER_SECURITY_PROFILE' &&
+      !hasApprovedWorkHistoryEvidence(c)) {
+    return reviewGateResult(result, c, 'UNSTRUCTURED_PROFILE_NO_WORK_HISTORY_PROOF');
+  }
+
   return result;
+}
+
+// G3B: acceptable forms of work-history evidence. Source trust / a LinkedIn URL
+// alone are NOT here by design — those must be corroborated by structured
+// employment (Apollo), PDL-enriched experience, or another approved structured
+// work-history field before a candidate can be client-ready on this path.
+function hasApprovedWorkHistoryEvidence(c = {}) {
+  if (hasStructuralResolver(c)) return true; // Apollo/PDL structurally resolved
+  if (Array.isArray(c.enrichedBy) && c.enrichedBy.includes('pdl-person-enrich') &&
+      Array.isArray(c.experience) && c.experience.length > 0) return true;
+  if (Array.isArray(c.workHistory) && c.workHistory.length > 0) return true;
+  const structuredExperienceFields = ['experience', 'employmentHistory', 'employment_history', 'positions'];
+  for (const f of structuredExperienceFields) {
+    if (Array.isArray(c[f]) && c[f].some(item => item && (item.title || item.role || item.job_title) && (item.company || item.organization || item.organization_name))) return true;
+  }
+  return false;
 }
 function isApolloCandidateRecord(c = {}) {
   const provider = normalizeProviderKey(c.provider_of_record || '');
@@ -1679,6 +1708,12 @@ function evaluateSourcingQualityBase(c = {}, need = {}) {
   if (c.manualVisibilityApproval || c.visibility_override === VISIBILITY_STATE.VISIBLE) {
     return { visibility_state: VISIBILITY_STATE.VISIBLE, reason_code: 'MANUAL_REVIEW_APPROVED', signals_snapshot: signals, recoverable: false };
   }
+  // G3A: explicit reviewer rejection — symmetric to manual approval and
+  // TIGHTEN-ONLY (can only hide, never reveal). Survives gate re-runs;
+  // recoverable so the person is retained, never purged.
+  if (c.manualVisibilityRejection) {
+    return { visibility_state: VISIBILITY_STATE.HIDDEN, reason_code: 'MANUAL_REVIEW_REJECTED', signals_snapshot: signals, recoverable: true };
+  }
   if (!isRealCandidateLike(c)) {
     return { visibility_state: VISIBILITY_STATE.PURGED, reason_code: 'PURGED_NON_CANDIDATE', signals_snapshot: { sourceType: c.sourceType || 'unknown', sourceDomain: c.sourceDomain || '' }, recoverable: false };
   }
@@ -1699,6 +1734,10 @@ function evaluateSourcingQualityBase(c = {}, need = {}) {
   }
   const trustedProviderProfile = ['Apollo', 'PDL', 'LinkedIn'].includes(c.source) && isLinkedInProfileUrl(c.linkedinUrl || c.sourceUrl || '');
   if (!signals.has_structured_work_history && !signals.github_only_soc_signal && !signals.negative_terms.length && (signals.current_security_signal || trustedProviderProfile)) {
+    // Still VISIBLE at the base gate; the G3B work-history tightening is applied
+    // as the FINAL step in evaluateSourcingQuality() so the more specific
+    // structural gates (firecrawl-only, Apollo-unresolved, out-of-market) keep
+    // precedence and their exact reason codes.
     return { visibility_state: VISIBILITY_STATE.VISIBLE, reason_code: 'UNSTRUCTURED_PROVIDER_SECURITY_PROFILE', signals_snapshot: signals, recoverable: false };
   }
   if (signals.security_months_cumulative >= 12 && !signals.most_recent_security_role_within_3y) {
@@ -5659,6 +5698,161 @@ async function runComposer({ needId, managerId, matchIds = [], kind }) {
   return { drafted: true, outreach: o };
 }
 
+/* ════════════════════════════════════════════════════════════════════
+   REVIEWER BULK ACTIONS (G3A) — safe batch review of the Needs Review pool
+   ════════════════════════════════════════════════════════════════════ */
+const BULK_REVIEW_MAX_BATCH = 50;
+const BULK_REVIEW_ACTIONS = new Set(['approve', 'reject', 'keep']);
+
+function appendReviewAudit(c, entry) {
+  if (!Array.isArray(c.reviewAudit)) c.reviewAudit = [];
+  c.reviewAudit.push(entry);
+  if (c.reviewAudit.length > 100) c.reviewAudit = c.reviewAudit.slice(-100);
+}
+
+// One reviewed action per candidate. Never silent: every candidate in the
+// batch gets an explicit ok/error result. Approve reuses the EXISTING manual
+// override semantics (manualVisibilityApproval → MANUAL_REVIEW_APPROVED), with
+// one hard exception the override may NOT cross in bulk: a Firecrawl-only
+// candidate with NO structural resolution is refused — resolve first (queue)
+// or use a deliberate single-candidate override. Bulk actions never touch
+// scoring, provider evidence, or identity verification.
+function bulkReviewCandidates({ candidateIds = [], action = '', reason = '', reviewer = 'internal-reviewer' } = {}) {
+  if (!Array.isArray(candidateIds) || !candidateIds.length) {
+    return { ok: false, error: 'candidateIds (non-empty array) required' };
+  }
+  if (!BULK_REVIEW_ACTIONS.has(action)) {
+    return { ok: false, error: `action must be one of: ${[...BULK_REVIEW_ACTIONS].join(', ')}` };
+  }
+  if (!String(reason || '').trim()) {
+    return { ok: false, error: 'reason is required for bulk review actions' };
+  }
+  if (candidateIds.length > BULK_REVIEW_MAX_BATCH) {
+    return { ok: false, error: `batch too large: ${candidateIds.length} > max ${BULK_REVIEW_MAX_BATCH}` };
+  }
+  const cleanReason = String(reason).trim().slice(0, 300);
+  const results = [];
+  for (const rawId of candidateIds) {
+    const id = String(rawId || '');
+    const c = DB.candidates.find(x => x.id === id);
+    if (!c) { results.push({ id, ok: false, error: 'candidate not found' }); continue; }
+    const need = DB.hiring_needs.find(n => n.id === c.needId) || {};
+    const previousState = c.visibility_state || '';
+    const previousReason = c.reason_code || '';
+    try {
+      if (action === 'approve') {
+        // NON-BYPASSABLE in bulk: firecrawl-only unresolved stays blocked.
+        if (isFirecrawlOnlyUnresolved(c, need) && !hasStructuralResolver(c)) {
+          results.push({ id, ok: false, error: 'FIRECRAWL_ONLY_UNRESOLVED — structural resolution required before approval' });
+          continue;
+        }
+        c.manualVisibilityApproval = true;
+        c.manualVisibilityRejection = false;
+        if (c.scoutDecision === 'review') c.scoutDecision = 'accepted';
+      } else if (action === 'reject') {
+        c.manualVisibilityRejection = true;
+        c.manualVisibilityApproval = false;
+        if (c.scoutDecision === 'accepted') c.scoutDecision = 'review';
+      } // 'keep' → no state mutation, audit only.
+      if (action !== 'keep') applySourcingQualityGate(c, need);
+      appendReviewAudit(c, {
+        action,
+        reason: cleanReason,
+        reviewer: String(reviewer || 'internal-reviewer').slice(0, 80),
+        at: now(),
+        previousState,
+        newState: c.visibility_state || previousState,
+        previousReasonCode: previousReason,
+        newReasonCode: c.reason_code || previousReason,
+      });
+      results.push({ id, ok: true, previousState, newState: c.visibility_state || previousState, reasonCode: c.reason_code || '' });
+    } catch (e) {
+      results.push({ id, ok: false, error: String(e && e.message || e).slice(0, 160) });
+    }
+  }
+  return {
+    ok: true,
+    action,
+    results,
+    summary: {
+      requested: candidateIds.length,
+      succeeded: results.filter(r => r.ok).length,
+      failed: results.filter(r => !r.ok).length,
+    },
+  };
+}
+
+// G3E: internal aggregate review-backlog metrics. Counts only — no names,
+// emails, phone numbers, or profile URLs.
+function reviewBacklogMetrics() {
+  const cands = DB.candidates || [];
+  const needsReview = cands.filter(c => c.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW);
+  const groupCount = (list, keyFn) => {
+    const out = {};
+    for (const c of list) { const k = keyFn(c) || '(none)'; out[k] = (out[k] || 0) + 1; }
+    return out;
+  };
+  const ageBucket = (iso) => {
+    const t = new Date(iso || 0).getTime();
+    if (!t) return 'unknown';
+    const days = (Date.now() - t) / 86400000;
+    if (days <= 7) return '0-7d';
+    if (days <= 30) return '7-30d';
+    return '30d+';
+  };
+  const audits = cands.flatMap(c => Array.isArray(c.reviewAudit) ? c.reviewAudit : []);
+  return {
+    totals: {
+      candidates: cands.length,
+      visible: cands.filter(c => c.visibility_state === VISIBILITY_STATE.VISIBLE).length,
+      needsReview: needsReview.length,
+      hidden: cands.filter(c => c.visibility_state === VISIBILITY_STATE.HIDDEN).length,
+    },
+    needsReviewByReason: groupCount(needsReview, c => c.reason_code),
+    needsReviewByProvider: groupCount(needsReview, c => normalizeProviderKey(c.provider_of_record || (c.discovered_by || [])[0] || '')),
+    needsReviewByLocationConfidence: groupCount(needsReview, c => c.location_confidence),
+    needsReviewByWorkHistoryConfidence: groupCount(needsReview, c => c.work_history_confidence),
+    needsReviewAging: groupCount(needsReview, c => ageBucket(c.createdAt)),
+    resolutionQueue: groupCount(DB.resolution_queue || [], e => e.status),
+    bulkReviewActions: {
+      total: audits.length,
+      approved: audits.filter(a => a.action === 'approve').length,
+      rejected: audits.filter(a => a.action === 'reject').length,
+      keptInReview: audits.filter(a => a.action === 'keep').length,
+    },
+  };
+}
+
+// G3D: deterministic, client-safe "why this candidate" line. Built ONLY from
+// already-verified evidence: scored (provider-evidence) matched skills — NOT
+// display buckets, so manual skill edits can never appear as proof — plus
+// title/company alignment and the location-match reasoning. No score, no
+// match labels, no provider names, no reason codes, no review language, no
+// LLM. When evidence is thin, a minimal factual line — never a persuasive
+// invention.
+function clientWhyLine(c = {}, m = {}, need = {}) {
+  const parts = [];
+  const title = String(c.currentTitle || '').trim();
+  const needTokens = String(need.title || '').toLowerCase().split(/\s+/).filter(t => t.length > 2);
+  const titleAligned = title && needTokens.some(t => title.toLowerCase().includes(t));
+  const workHistoryVerified = c.resolution_status === 'resolved'
+    || (Array.isArray(c.enrichedBy) && c.enrichedBy.includes('pdl-person-enrich'))
+    || (Array.isArray(c.workHistory) && c.workHistory.length > 0)
+    || (Array.isArray(c.experience) && c.experience.length > 0);
+  if (titleAligned) {
+    const company = String(c.currentCompany || '').trim();
+    parts.push(company && workHistoryVerified ? `Currently ${title} at ${company}` : `Currently ${title}`);
+  }
+  const supported = (Array.isArray(m.matchedSkills) ? m.matchedSkills : []).slice(0, 3);
+  if (supported.length) parts.push(`Demonstrated experience with ${supported.join(', ')}`);
+  const locReason = (m.reasoning || []).find(r => /^Location match:|^Remote-friendly$/i.test(String(r || '')));
+  if (locReason) parts.push(/remote/i.test(locReason) ? 'Open to remote work' : String(locReason).replace(/^Location match:\s*/i, 'Based in '));
+  if (!parts.length) {
+    return `Verified professional profile put forward for the ${String(need.title || 'role').trim()} search; see profile links for detail.`;
+  }
+  return parts.join(' · ') + '.';
+}
+
 async function generateClientReport({ needId, pipelineRunId = null, scoutStats = null } = {}) {
   const need = DB.hiring_needs.find(n => n.id === needId);
   if (!need) return { ok: false, reason: 'Need not found' };
@@ -5726,6 +5920,8 @@ async function generateClientReport({ needId, pipelineRunId = null, scoutStats =
       matchedSkills: displaySkills.matchedSkills,
       missingSkills: displaySkills.missingSkills,
       locationMatch,
+      // G3D: deterministic, client-safe explanation (no score/labels/providers).
+      whyThisCandidate: clientWhyLine(c || {}, m, need),
       links,
     };
   });
@@ -5773,6 +5969,7 @@ ${summary}
 
 Top candidates:
 ${candidates.map((c, i) => `${i + 1}. ${c.name} — ${c.currentTitle}${c.currentCompany ? ` (${c.currentCompany})` : ''}
+   Why this candidate: ${c.whyThisCandidate || '—'}
    Strong on: ${c.matchedSkills.join(', ') || '—'}
    Gaps: ${c.missingSkills.join(', ') || 'none'}
    Location match: ${c.locationMatch || c.location || '—'}
@@ -5791,8 +5988,8 @@ Sola Scholar
     return '"' + s.replace(/"/g, '""') + '"';
   };
   const csvRows = [
-    ['Rank','Name','Title','Company','Location','Matched Skills','Missing Skills','Location Match','LinkedIn'].map(esc).join(','),
-    ...candidates.map((c, i) => [i+1, c.name, c.currentTitle, c.currentCompany, c.location, c.matchedSkills.join(';'), c.missingSkills.join(';'), c.locationMatch, c.links.linkedin].map(esc).join(',')),
+    ['Rank','Name','Title','Company','Location','Why This Candidate','Matched Skills','Missing Skills','Location Match','LinkedIn'].map(esc).join(','),
+    ...candidates.map((c, i) => [i+1, c.name, c.currentTitle, c.currentCompany, c.location, c.whyThisCandidate || '', c.matchedSkills.join(';'), c.missingSkills.join(';'), c.locationMatch, c.links.linkedin].map(esc).join(',')),
   ];
   const csv = csvRows.join('\n');
 
@@ -6246,6 +6443,32 @@ app.patch('/api/candidates/:id/manual-skills', async (req, res) => {
   await persistDB();
   res.json({ ok: true, candidate: c, manualSkillEdits: edits });
 });
+
+// ── G3A: reviewer bulk actions (auth-protected via /api requireAuth) ──
+app.post('/api/candidates/bulk-review', async (req, res) => {
+  const body = req.body || {};
+  const out = bulkReviewCandidates({
+    candidateIds: body.candidateIds,
+    action: String(body.action || '').trim().toLowerCase(),
+    reason: body.reason,
+    reviewer: body.reviewer,
+  });
+  if (!out.ok) return res.status(400).json({ error: out.error });
+  await persistDB();
+  await logActivity('Reviewer', `Bulk ${out.action}: ${out.summary.succeeded}/${out.summary.requested} candidates (${out.summary.failed} failed)`, out.summary.failed ? 'warn' : 'success', { action: out.action, ...out.summary });
+  res.json(out);
+});
+
+// ── G3E: internal review-backlog metrics (aggregate counts only, no PII) ──
+app.get('/api/review/metrics', (req, res) => {
+  res.json(reviewBacklogMetrics());
+});
+
+// ── G3C: resolution queue (internal reviewer view) ──
+app.get('/api/resolution-queue', (req, res) => {
+  res.json(DB.resolution_queue || []);
+});
+
 app.patch('/api/matches/:id', async (req, res) => {
   const m = DB.matches.find(x => x.id === req.params.id);
   if (!m) return res.status(404).json({ error: 'Not found' });
@@ -6427,6 +6650,9 @@ module.exports = {
     githubContributors,
     rolePackForRole,
     __setRolePacksForTest,
+    bulkReviewCandidates,
+    reviewBacklogMetrics,
+    clientWhyLine,
     mergeCandidateSkillEvidence,
     applyManualSkillEdit,
     displaySkillBucketsForMatch,

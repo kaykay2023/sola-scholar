@@ -3592,12 +3592,18 @@ async function main() {
   assert(GH_CONTRIB_CALLS.includes('SigmaHQ/sigma'),
     `Scout called SigmaHQ/sigma contributors API`);
 
-  // Real users became accepted candidates
+  // G3B: Real GitHub contributors are RETAINED (identity-verified) but held in
+  // Needs Review — GitHub activity is evidence, not work-history proof, so it
+  // cannot make a candidate client-ready on its own for this (non-Detection/
+  // SIEM-titled) role. They stay recoverable pending structural resolution.
   const sentinelCand = DB.candidates.find(c =>
     c.pipelineRunId === cmBRun && /real-sentinel-contrib/.test(c.github || '')
   );
-  assert(sentinelCand && sentinelCand.scoutDecision === 'accepted',
-    `Azure-Sentinel contributor accepted (got "${sentinelCand && sentinelCand.scoutDecision}")`);
+  assert(sentinelCand && sentinelCand.scoutDecision === 'review' &&
+    sentinelCand.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW &&
+    sentinelCand.reason_code === 'UNSTRUCTURED_PROFILE_NO_WORK_HISTORY_PROOF' &&
+    sentinelCand.recoverable === true,
+    `G3B: Azure-Sentinel contributor held in Needs Review (GitHub alone not client-ready) (got decision="${sentinelCand && sentinelCand.scoutDecision}", state="${sentinelCand && sentinelCand.visibility_state}", reason="${sentinelCand && sentinelCand.reason_code}")`);
   assert(sentinelCand && /contributor of Azure\/Azure-Sentinel/.test(sentinelCand.scoutReason || ''),
     `scoutReason mentions Azure/Azure-Sentinel contributor (got "${sentinelCand && sentinelCand.scoutReason}")`);
   assert(sentinelCand && sentinelCand.identityVerificationStatus === 'verified',
@@ -3605,8 +3611,8 @@ async function main() {
   const sigmaCand = DB.candidates.find(c =>
     c.pipelineRunId === cmBRun && /real-sigma-contrib/.test(c.github || '')
   );
-  assert(sigmaCand && sigmaCand.scoutDecision === 'accepted',
-    `SigmaHQ/sigma contributor accepted`);
+  assert(sigmaCand && sigmaCand.scoutDecision === 'review' && sigmaCand.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW,
+    `G3B: SigmaHQ/sigma contributor held in Needs Review (got decision="${sigmaCand && sigmaCand.scoutDecision}")`);
   // Bot + org NOT in the candidate pool
   const botCand = DB.candidates.find(c =>
     c.pipelineRunId === cmBRun && /github-bot-app/.test(c.github || '')
@@ -3616,9 +3622,9 @@ async function main() {
     c.pipelineRunId === cmBRun && c.github === 'https://github.com/azure'
   );
   assert(!orgCand, `Org contributor (KNOWN_ORG) NOT in candidate pool`);
-  // Contributor mining counted under github
-  assert(cmBScout.acceptedBySource.github >= 2,
-    `acceptedBySource.github counts contributor candidates (got ${cmBScout.acceptedBySource.github})`);
+  // Contributor mining still runs + is retained — now under the review bucket.
+  assert(cmBScout.reviewBySource.github >= 2,
+    `G3B: contributor candidates retained under reviewBySource.github (got ${cmBScout.reviewBySource.github})`);
 
   // (d) Adzuna candidate-mention mining — G2E: discovery is DISABLED BY
   //     DEFAULT (zero-yield in production; no code defect found). First prove
@@ -5332,6 +5338,199 @@ async function main() {
     g2Impact.estimatedPdlCallsPerRun = 'client-ready cap 15 + borderline cap 5 = ≤20 enrich calls; queue drain ≤5 Apollo match calls';
     console.log('\n── G2 IMPACT SUMMARY (fixtures only) ──');
     console.log(JSON.stringify(g2Impact, null, 2));
+  }
+
+  // ══ G3. Review workflow + trust tightening (Group 3) ══════════════════
+  {
+    const g3 = _internals;
+    const g3Co = findOrCreateCompany({ name: 'G3 Trust Co' });
+    const g3Need = createNeed({
+      companyId: g3Co.id, title: 'SOC Analyst', requiredSkills: ['SIEM', 'SOC'],
+      seniority: 'Mid', locationType: 'Remote', confirmed: true,
+    });
+
+    // ── G3B: tighten UNSTRUCTURED_PROVIDER_SECURITY_PROFILE ──
+    // (a) Trusted provider + LinkedIn URL, NO work history → NEEDS_REVIEW.
+    const trustNoHistory = findOrCreateCandidate({
+      name: 'G3 Trust NoHistory', title: 'SOC Analyst', company: 'TrustCo', skills: ['SIEM'],
+      summary: 'SOC analyst', linkedinUrl: 'https://www.linkedin.com/in/g3-trust-nohistory',
+      sourceUrl: 'https://www.linkedin.com/in/g3-trust-nohistory',
+      source: 'LinkedIn', sourceType: 'candidate_profile', scoutDecision: 'accepted',
+      discovered_by: ['apollo'], provider_of_record: 'apollo', resolved_by: [], resolution_status: 'unresolved',
+      pipelineRunId: 'g3_run',
+    });
+    applySourcingQualityGate(trustNoHistory, g3Need);
+    assert(trustNoHistory.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW &&
+      trustNoHistory.reason_code === 'UNSTRUCTURED_PROFILE_NO_WORK_HISTORY_PROOF' &&
+      trustNoHistory.recoverable === true &&
+      g3.isClientReadyForNeed(trustNoHistory, g3Need) === false,
+      `G3B: trusted provider + LinkedIn URL WITHOUT work-history proof → NEEDS_REVIEW (state=${trustNoHistory.visibility_state}, reason=${trustNoHistory.reason_code})`);
+
+    // (b) LinkedIn URL alone is insufficient / source trust alone insufficient.
+    const linkedinOnly = findOrCreateCandidate({
+      name: 'G3 LinkedIn Only', title: 'SOC Analyst', company: 'LiCo', skills: ['SIEM', 'SOC'],
+      summary: 'security operations', linkedinUrl: 'https://www.linkedin.com/in/g3-linkedin-only',
+      sourceUrl: 'https://www.linkedin.com/in/g3-linkedin-only',
+      source: 'LinkedIn', sourceType: 'candidate_profile', scoutDecision: 'accepted',
+      discovered_by: ['linkedin'], provider_of_record: 'linkedin', resolution_status: 'unresolved',
+      pipelineRunId: 'g3_run',
+    });
+    applySourcingQualityGate(linkedinOnly, g3Need);
+    assert(g3.isClientReadyForNeed(linkedinOnly, g3Need) === false,
+      `G3B: LinkedIn URL + source trust alone is NOT client-ready (state=${linkedinOnly.visibility_state})`);
+
+    // (c) Structured/enriched work-history evidence CAN still pass (not over-tightened).
+    const withHistory = findOrCreateCandidate({
+      name: 'G3 With History', title: 'SOC Analyst', company: 'HistCo', skills: ['SIEM', 'SOC'],
+      summary: 'SOC analyst', linkedinUrl: 'https://www.linkedin.com/in/g3-with-history',
+      sourceUrl: 'https://www.linkedin.com/in/g3-with-history',
+      source: 'Apollo', sourceType: 'candidate_profile', scoutDecision: 'accepted',
+      discovered_by: ['apollo'], provider_of_record: 'apollo', resolved_by: ['apollo'], resolution_status: 'resolved',
+      workHistory: [{ title: 'SOC Analyst', company: 'HistCo', startDate: isoMonthsAgo(18), current: true, months: 18 }],
+      pipelineRunId: 'g3_run',
+    });
+    applySourcingQualityGate(withHistory, g3Need);
+    assert(withHistory.visibility_state === VISIBILITY_STATE.VISIBLE && g3.isClientReadyForNeed(withHistory, g3Need) === true,
+      `G3B: structured work-history evidence still passes all gates → VISIBLE (state=${withHistory.visibility_state}, reason=${withHistory.reason_code})`);
+
+    // (d) Already-rejected candidate does not become visible (tighten-only).
+    assert(trustNoHistory.visibility_state !== VISIBILITY_STATE.VISIBLE,
+      `G3B: tightening never turns a blocked candidate visible`);
+    // discovered-by / resolved-by / provider-of-record distinction preserved.
+    assert((withHistory.discovered_by||[]).includes('apollo') && (withHistory.resolved_by||[]).includes('apollo') && withHistory.provider_of_record === 'apollo',
+      `G3B: provenance distinctions preserved through gate`);
+
+    // ── G3A: bulk review actions ──
+    // Validation: batch size limit.
+    const tooMany = g3.bulkReviewCandidates({ candidateIds: Array.from({ length: 60 }, (_, i) => 'x' + i), action: 'approve', reason: 'test' });
+    assert(tooMany.ok === false && /batch too large/i.test(tooMany.error),
+      `G3A: batch size limit enforced (got ${tooMany.error})`);
+    // Validation: reason required.
+    const noReason = g3.bulkReviewCandidates({ candidateIds: [trustNoHistory.id], action: 'approve', reason: '' });
+    assert(noReason.ok === false && /reason is required/i.test(noReason.error),
+      `G3A: reviewer reason required`);
+    // Validation: action required.
+    const badAction = g3.bulkReviewCandidates({ candidateIds: [trustNoHistory.id], action: 'nuke', reason: 'x' });
+    assert(badAction.ok === false && /action must be/i.test(badAction.error),
+      `G3A: invalid action rejected`);
+    // Per-candidate failures are explicit, not silent.
+    const mixedBulk = g3.bulkReviewCandidates({ candidateIds: [trustNoHistory.id, 'does-not-exist'], action: 'keep', reason: 'triage pass' });
+    assert(mixedBulk.ok === true && mixedBulk.summary.succeeded === 1 && mixedBulk.summary.failed === 1 &&
+      mixedBulk.results.find(r => r.id === 'does-not-exist' && r.ok === false),
+      `G3A: invalid candidate IDs produce explicit per-item failure (${JSON.stringify(mixedBulk.summary)})`);
+    // Approve creates an audit entry, does not alter scoring/provider evidence.
+    const preSkills = JSON.stringify(trustNoHistory.skills);
+    const approve = g3.bulkReviewCandidates({ candidateIds: [trustNoHistory.id], action: 'approve', reason: 'reviewed profile + confirmed employment offline' });
+    assert(approve.ok === true && approve.summary.succeeded === 1 &&
+      trustNoHistory.visibility_state === VISIBILITY_STATE.VISIBLE &&
+      Array.isArray(trustNoHistory.reviewAudit) && trustNoHistory.reviewAudit.length >= 1 &&
+      trustNoHistory.reviewAudit[trustNoHistory.reviewAudit.length - 1].action === 'approve',
+      `G3A: bulk approve reuses manual-approval semantics + writes audit (state=${trustNoHistory.visibility_state})`);
+    assert(JSON.stringify(trustNoHistory.skills) === preSkills,
+      `G3A: bulk actions do not alter provider skill evidence`);
+    const lastAudit = trustNoHistory.reviewAudit[trustNoHistory.reviewAudit.length - 1];
+    for (const f of ['action', 'reason', 'reviewer', 'at', 'previousState', 'newState', 'previousReasonCode', 'newReasonCode']) {
+      assert(f in lastAudit, `G3A: audit entry records "${f}"`);
+    }
+
+    // NON-BYPASSABLE: bulk approve cannot cross firecrawl-only unresolved block.
+    const fcBlocked = findOrCreateCandidate({
+      name: 'G3 FC Blocked', title: 'SOC Analyst', company: 'FcCo', skills: ['SIEM'],
+      linkedinUrl: 'https://www.linkedin.com/in/g3-fc-blocked', sourceUrl: 'https://www.linkedin.com/in/g3-fc-blocked',
+      source: 'LinkedIn', sourceType: 'candidate_profile', scoutDecision: 'accepted',
+      discovered_by: ['firecrawl'], provider_of_record: 'firecrawl', resolution_status: 'unresolved',
+      needId: (createNeed({ companyId: g3Co.id, title: 'SOC Analyst', requiredSkills: ['SIEM'], seniority: 'Mid', locationType: 'Onsite', location: 'Detroit, Michigan', confirmed: true })).id,
+      pipelineRunId: 'g3_run',
+    });
+    const fcNeed = DB.hiring_needs.find(n => n.id === fcBlocked.needId);
+    applySourcingQualityGate(fcBlocked, fcNeed);
+    const fcApprove = g3.bulkReviewCandidates({ candidateIds: [fcBlocked.id], action: 'approve', reason: 'attempted bulk approve' });
+    assert(fcApprove.results[0].ok === false && /FIRECRAWL_ONLY_UNRESOLVED/.test(fcApprove.results[0].error) &&
+      g3.isClientReadyForNeed(DB.candidates.find(c => c.id === fcBlocked.id), fcNeed) === false,
+      `G3A/G3F: bulk approve CANNOT bypass firecrawl-only unresolved blocking (${fcApprove.results[0].error})`);
+
+    // Bulk reject hides (tighten-only), retains + audits.
+    const rejectCand = findOrCreateCandidate({
+      name: 'G3 Reject Me', title: 'SOC Analyst', company: 'RejCo', skills: ['SIEM'],
+      linkedinUrl: 'https://www.linkedin.com/in/g3-reject-me', sourceUrl: 'https://www.linkedin.com/in/g3-reject-me',
+      source: 'Apollo', sourceType: 'candidate_profile', scoutDecision: 'accepted',
+      discovered_by: ['apollo'], provider_of_record: 'apollo', resolved_by: ['apollo'], resolution_status: 'resolved',
+      workHistory: [{ title: 'SOC Analyst', company: 'RejCo', startDate: isoMonthsAgo(18), current: true, months: 18 }],
+      pipelineRunId: 'g3_run',
+    });
+    applySourcingQualityGate(rejectCand, g3Need);
+    g3.bulkReviewCandidates({ candidateIds: [rejectCand.id], action: 'reject', reason: 'not a fit' });
+    assert(rejectCand.visibility_state === VISIBILITY_STATE.HIDDEN && rejectCand.reason_code === 'MANUAL_REVIEW_REJECTED' && rejectCand.recoverable === true,
+      `G3A: bulk reject hides candidate (recoverable, audited) (state=${rejectCand.visibility_state})`);
+
+    // ── G3E: review backlog metrics (aggregate, no PII) ──
+    const metrics = g3.reviewBacklogMetrics();
+    assert(metrics.totals && typeof metrics.totals.needsReview === 'number' &&
+      metrics.needsReviewByReason && metrics.needsReviewByProvider && metrics.resolutionQueue &&
+      metrics.bulkReviewActions && metrics.bulkReviewActions.approved >= 1 && metrics.bulkReviewActions.rejected >= 1,
+      `G3E: backlog metrics expose aggregate counts incl. bulk actions (${JSON.stringify(metrics.bulkReviewActions)})`);
+    const metricsStr = JSON.stringify(metrics);
+    assert(!/g3-trust-nohistory|G3 Trust NoHistory|linkedin\.com\/in\//i.test(metricsStr),
+      `G3E: backlog metrics contain NO candidate PII (names/emails/URLs)`);
+
+    // ── G3D: client-safe "why this candidate" ──
+    const whyMatch = { matchedSkills: ['SIEM', 'SOC'], missingSkills: [], reasoning: ['Matches 2/2 required skills: SIEM, SOC', 'Remote-friendly'], score: 72, tier: 'Review' };
+    const why = g3.clientWhyLine(withHistory, whyMatch, g3Need);
+    assert(typeof why === 'string' && why.length > 0 &&
+      /SIEM/.test(why) && !/\b72\b/.test(why) && !/Review|NEEDS_REVIEW|Strong Match|Weak Match/i.test(why) &&
+      !/Apollo|PDL|Firecrawl|GitHub/i.test(why) && !/reason_code|visibility|UNSTRUCTURED|scout/i.test(why),
+      `G3D: why-line uses supported evidence, NO score/labels/providers/reason-codes (got "${why}")`);
+    // Manual added skills are NOT verified proof in the why-line.
+    applyManualSkillEdit(withHistory, { action: 'add', skill: 'Penetration Testing' });
+    const why2 = g3.clientWhyLine(withHistory, whyMatch, g3Need);
+    assert(!/Penetration Testing/i.test(why2),
+      `G3D: manually-added skill does NOT appear as verified proof in why-line (got "${why2}")`);
+    // Thin evidence → minimal factual line, not a persuasive invention.
+    const whyThin = g3.clientWhyLine({ name: 'Thin', currentTitle: '' }, { matchedSkills: [], reasoning: [] }, g3Need);
+    assert(typeof whyThin === 'string' && whyThin.length > 0 && !/\d\/\d|excellent|perfect|ideal|top candidate/i.test(whyThin),
+      `G3D: thin evidence → minimal factual line, no hype (got "${whyThin}")`);
+
+    // ── G3F: Client Report stays client-facing (no internal/provider/debug) ──
+    const repNeed = createNeed({
+      companyId: g3Co.id, title: 'SOC Analyst', requiredSkills: ['SIEM', 'SOC'],
+      seniority: 'Mid', locationType: 'Remote', confirmed: true,
+    });
+    const repCand = findOrCreateCandidate({
+      name: 'G3 Report Person', title: 'SOC Analyst', company: 'RepCo', skills: ['SIEM', 'SOC'],
+      summary: 'SOC analyst', linkedinUrl: 'https://www.linkedin.com/in/g3-report-person',
+      sourceUrl: 'https://www.linkedin.com/in/g3-report-person',
+      source: 'Apollo', sourceType: 'candidate_profile', scoutDecision: 'accepted',
+      discovered_by: ['apollo'], provider_of_record: 'apollo', resolved_by: ['apollo'], resolution_status: 'resolved',
+      workHistory: [{ title: 'SOC Analyst', company: 'RepCo', startDate: isoMonthsAgo(24), current: true, months: 24 }],
+      pipelineRunId: 'g3rep_run',
+    });
+    applySourcingQualityGate(repCand, repNeed);
+    createOrUpdateMatch({ needId: repNeed.id, candidateId: repCand.id, pipelineRunId: 'g3rep_run', score: 72, tier: 'Review', matchedSkills: ['SIEM', 'SOC'], missingSkills: [], reasoning: ['Matches 2/2 required skills: SIEM, SOC', 'Remote-friendly'], rank: 1 });
+    const g3rep = await generateClientReport({ needId: repNeed.id, pipelineRunId: 'g3rep_run' });
+    const rc = g3rep.report.candidates[0];
+    assert(rc && rc.whyThisCandidate && rc.links,
+      `G3F/G3D: client report candidate has whyThisCandidate + preserved profile links`);
+    const clientFacingKeys = new Set(['name', 'currentTitle', 'currentCompany', 'location', 'matchedSkills', 'missingSkills', 'locationMatch', 'whyThisCandidate', 'links']);
+    const leakedKeys = Object.keys(rc).filter(k => !clientFacingKeys.has(k));
+    assert(leakedKeys.length === 0,
+      `G3F: client report candidate exposes ONLY client-safe fields (leaked: ${JSON.stringify(leakedKeys)})`);
+    const repCandStr = JSON.stringify(rc);
+    assert(!/visibility_state|reason_code|provider_of_record|discovered_by|resolved_by|scoutDecision|scoutReason|provider_trace|reviewAudit|NEEDS_REVIEW|UNSTRUCTURED/i.test(repCandStr),
+      `G3F: client report candidate contains NO internal/provider/debug/review metadata`);
+    // Profile links preserved end to end.
+    assert(rc.links && (rc.links.linkedin || '').includes('g3-report-person'),
+      `G3F: profile links preserved in client report`);
+
+    console.log('\n── G3 SUMMARY ──');
+    console.log(JSON.stringify({
+      trustTightened: trustNoHistory.reason_code,
+      structuredWorkHistoryStillPasses: withHistory.visibility_state,
+      bulkApproveAudited: trustNoHistory.reviewAudit.length,
+      firecrawlBlockNonBypassable: fcApprove.results[0].ok === false,
+      backlogMetricsNoPII: !/g3-trust/i.test(metricsStr),
+      whyLineClientSafe: true,
+      clientReportNoLeak: leakedKeys.length === 0,
+    }, null, 2));
   }
 
   // ── 17. Sample-run proof: pipeline-style log of one scout pass ──
