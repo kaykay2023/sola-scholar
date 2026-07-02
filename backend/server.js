@@ -5830,6 +5830,116 @@ function reviewBacklogMetrics() {
 // match labels, no provider names, no reason codes, no review language, no
 // LLM. When evidence is thin, a minimal factual line — never a persuasive
 // invention.
+/* ════════════════════════════════════════════════════════════════════
+   EXPERIENCE-LEVEL BADGE (display/report only)
+   ════════════════════════════════════════════════════════════════════
+   Honest, APPROXIMATE professional-experience badge derived ONLY from
+   already-stored PDL work-history dates (candidate.experience, populated only
+   by PDL enrichment). Pure/deterministic — accepts an optional reference date
+   so tests do not depend on the run day; production defaults to now(). This is
+   DISPLAY/REPORT information only and must not influence scoring, ordering,
+   visibility, gates, or provider behaviour. No titles/companies/summaries/
+   education/age are ever used to infer experience.
+
+   PARTIAL-DATE APPROXIMATION (conservative + consistent):
+     • "YYYY-MM-DD" → that exact day.
+     • "YYYY-MM"    → start: first day of month · end: last day of month.
+     • "YYYY"       → start: Jan 1 · end: Dec 31.
+     • no usable 4-digit year → not usable (entry's date is skipped).
+   A missing/unparseable end date on an entry with a valid start is treated as a
+   CURRENT job running through the reference date. Overlapping intervals are
+   merged before summing so concurrent jobs are never double-counted.        */
+const EXPERIENCE_TIER_BANDS = {
+  // Tier uses the UNROUNDED year total (so display rounding never flips a tier).
+  juniorMaxExclusive: 2.0, // years < 2.0            → Junior
+  seniorMinExclusive: 6.0, // years > 6.0            → Senior; 2.0..6.0 inclusive → Mid
+};
+const MS_PER_YEAR = 365.25 * 24 * 60 * 60 * 1000;
+const EXPERIENCE_UNVERIFIED = Object.freeze({
+  label: 'Experience unverified', approximateYears: null, tier: null, verifiedFrom: null, isVerified: false,
+});
+
+function experienceTierForYears(years) {
+  if (years < EXPERIENCE_TIER_BANDS.juniorMaxExclusive) return 'Junior';
+  if (years > EXPERIENCE_TIER_BANDS.seniorMinExclusive) return 'Senior';
+  return 'Mid';
+}
+
+// Parse a PDL partial date. `edge` is 'start' or 'end' and only affects how a
+// year-only or year-month value is expanded. Returns a Date (UTC) or null.
+function parsePartialExperienceDate(raw, edge = 'start') {
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  const full = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (full) {
+    const [_, y, m, d] = full;
+    const dt = new Date(Date.UTC(+y, +m - 1, +d));
+    return (dt.getUTCFullYear() === +y && dt.getUTCMonth() === +m - 1 && dt.getUTCDate() === +d) ? dt : null;
+  }
+  const ym = s.match(/^(\d{4})-(\d{2})$/);
+  if (ym) {
+    const [_, y, m] = ym;
+    if (+m < 1 || +m > 12) return null;
+    return edge === 'end'
+      ? new Date(Date.UTC(+y, +m, 0))          // last day of month
+      : new Date(Date.UTC(+y, +m - 1, 1));     // first day of month
+  }
+  const yOnly = s.match(/^(\d{4})$/);
+  if (yOnly) {
+    const y = +yOnly[1];
+    return edge === 'end' ? new Date(Date.UTC(y, 11, 31)) : new Date(Date.UTC(y, 0, 1));
+  }
+  return null; // no usable year → not usable
+}
+
+function computeExperienceBadge(c = {}, referenceDate = undefined) {
+  try {
+    // Honest gate: only PDL-enriched candidates with usable stored dates qualify.
+    const enrichedByPdl = Array.isArray(c.enrichedBy) && c.enrichedBy.includes('pdl-person-enrich');
+    if (!enrichedByPdl) return EXPERIENCE_UNVERIFIED;
+    const exp = Array.isArray(c.experience) ? c.experience : [];
+    if (!exp.length) return EXPERIENCE_UNVERIFIED;
+
+    let ref = referenceDate instanceof Date ? referenceDate : (referenceDate ? new Date(referenceDate) : new Date());
+    if (isNaN(ref.getTime())) ref = new Date();
+    const refMs = ref.getTime();
+
+    const intervals = [];
+    for (const e of exp) {
+      if (!e || typeof e !== 'object') continue;
+      const startRaw = e.start_date ?? e.starts_at ?? e.start ?? (e.dates && e.dates.start) ?? '';
+      const endRaw   = e.end_date   ?? e.ends_at   ?? e.end   ?? (e.dates && e.dates.end)   ?? '';
+      const start = parsePartialExperienceDate(startRaw, 'start');
+      if (!start) continue;                       // no usable start → skip entry
+      let end = endRaw ? parsePartialExperienceDate(endRaw, 'end') : null;
+      if (!end) end = ref;                         // missing/unparseable end → current through ref
+      let s = start.getTime();
+      let en = end.getTime();
+      if (en > refMs) en = refMs;                  // never count into the future
+      if (en < s) continue;                        // impossible range → skip safely
+      intervals.push([s, en]);
+    }
+    if (!intervals.length) return EXPERIENCE_UNVERIFIED;
+
+    intervals.sort((a, b) => a[0] - b[0]);
+    const merged = [intervals[0].slice()];
+    for (let i = 1; i < intervals.length; i++) {
+      const cur = merged[merged.length - 1];
+      const [s, en] = intervals[i];
+      if (s <= cur[1]) cur[1] = Math.max(cur[1], en);  // overlap/adjacent → merge
+      else merged.push([s, en]);
+    }
+    const totalMs = merged.reduce((sum, [s, en]) => sum + (en - s), 0);
+    const years = totalMs / MS_PER_YEAR;
+    const tier = experienceTierForYears(years);
+    const rounded = Math.round(years);
+    const label = rounded >= 1 ? `~${rounded} yrs — ${tier}` : `<1 yr — ${tier}`;
+    return { label, approximateYears: rounded, tier, verifiedFrom: 'pdl_work_history', isVerified: true };
+  } catch {
+    return EXPERIENCE_UNVERIFIED; // fail safe → unverified, never crash
+  }
+}
+
 function clientWhyLine(c = {}, m = {}, need = {}) {
   const parts = [];
   const title = String(c.currentTitle || '').trim();
@@ -5922,6 +6032,8 @@ async function generateClientReport({ needId, pipelineRunId = null, scoutStats =
       locationMatch,
       // G3D: deterministic, client-safe explanation (no score/labels/providers).
       whyThisCandidate: clientWhyLine(c || {}, m, need),
+      // Experience badge: approximate label only (no raw dates), from PDL history.
+      experience: computeExperienceBadge(c || {}).label,
       links,
     };
   });
@@ -5970,6 +6082,7 @@ ${summary}
 Top candidates:
 ${candidates.map((c, i) => `${i + 1}. ${c.name} — ${c.currentTitle}${c.currentCompany ? ` (${c.currentCompany})` : ''}
    Why this candidate: ${c.whyThisCandidate || '—'}
+   Experience: ${/^Experience unverified$/.test(c.experience) ? 'Unverified' : c.experience}
    Strong on: ${c.matchedSkills.join(', ') || '—'}
    Gaps: ${c.missingSkills.join(', ') || 'none'}
    Location match: ${c.locationMatch || c.location || '—'}
@@ -5988,8 +6101,8 @@ Sola Scholar
     return '"' + s.replace(/"/g, '""') + '"';
   };
   const csvRows = [
-    ['Rank','Name','Title','Company','Location','Why This Candidate','Matched Skills','Missing Skills','Location Match','LinkedIn'].map(esc).join(','),
-    ...candidates.map((c, i) => [i+1, c.name, c.currentTitle, c.currentCompany, c.location, c.whyThisCandidate || '', c.matchedSkills.join(';'), c.missingSkills.join(';'), c.locationMatch, c.links.linkedin].map(esc).join(',')),
+    ['Rank','Name','Title','Company','Location','Experience','Why This Candidate','Matched Skills','Missing Skills','Location Match','LinkedIn'].map(esc).join(','),
+    ...candidates.map((c, i) => [i+1, c.name, c.currentTitle, c.currentCompany, c.location, (/^Experience unverified$/.test(c.experience) ? 'Unverified' : c.experience), c.whyThisCandidate || '', c.matchedSkills.join(';'), c.missingSkills.join(';'), c.locationMatch, c.links.linkedin].map(esc).join(',')),
   ];
   const csv = csvRows.join('\n');
 
@@ -6336,7 +6449,12 @@ app.get('/api/dashboard/stats', (req, res) => {
 app.get('/api/companies',        (req, res) => res.json(DB.companies));
 app.get('/api/hiring-managers',  (req, res) => res.json(DB.hiring_managers));
 app.get('/api/hiring-needs',     (req, res) => res.json(DB.hiring_needs));
-app.get('/api/candidates',       (req, res) => res.json(DB.candidates));
+app.get('/api/candidates',       (req, res) => res.json(DB.candidates.map(c => ({
+  // Derived, non-persisted display badge (approximate label only — no raw
+  // dates). Computed at read; never stored, never affects any gate/score.
+  ...c,
+  experienceBadge: computeExperienceBadge(c),
+}))));
 app.get('/api/candidate-validations', (req, res) => res.json(DB.candidate_validations));
 app.get('/api/matches', (req, res) => {
   // Default: hide stale matches (current candidate state no longer satisfies
@@ -6653,6 +6771,10 @@ module.exports = {
     bulkReviewCandidates,
     reviewBacklogMetrics,
     clientWhyLine,
+    computeExperienceBadge,
+    experienceTierForYears,
+    parsePartialExperienceDate,
+    EXPERIENCE_TIER_BANDS,
     mergeCandidateSkillEvidence,
     applyManualSkillEdit,
     displaySkillBucketsForMatch,
