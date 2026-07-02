@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "comment": "Curated skill alias groups for matched/missing skill computation. Each group is a list of equivalent skill names — matching is by EXPLICIT group membership only, never substring. Editing this file changes which required skills count as matched (and therefore scores); keep groups conservative and unambiguous. Missing/malformed file = no synonyms (exact matching only).",
+  "groups": [
+    ["Microsoft Sentinel", "Azure Sentinel", "Sentinel"],
+    ["Azure Active Directory", "Azure AD", "AAD", "Microsoft Entra ID", "Entra ID"],
+    ["Identity and Access Management", "IAM", "Identity Access Management", "Identity & Access Management"],
+    ["Security Information and Event Management", "SIEM"],
+    ["Security Operations Center", "SOC", "Security Operations"],
+    ["Kusto Query Language", "KQL", "Kusto"],
+    ["Microsoft Defender for Cloud", "Defender for Cloud", "Azure Defender", "Azure Security Center"],
+    ["Microsoft Defender", "Microsoft 365 Defender", "Defender XDR"],
+    ["Multi-Factor Authentication", "MFA", "Two-Factor Authentication", "2FA"],
+    ["Endpoint Detection and Response", "EDR"],
+    ["Extended Detection and Response", "XDR"],
+    ["Penetration Testing", "Pentesting", "Pen Testing", "Ethical Hacking"],
+    ["Incident Response", "DFIR", "Digital Forensics and Incident Response"],
+    ["Amazon Web Services", "AWS"],
+    ["Google Cloud Platform", "GCP", "Google Cloud"],
+    ["Microsoft Azure", "Azure"],
+    ["Infrastructure as Code", "IaC"],
+    ["Kubernetes", "K8s"],
+    ["Zero Trust", "Zero Trust Architecture", "ZTA"],
+    ["Governance Risk and Compliance", "GRC", "Governance, Risk and Compliance", "Governance, Risk & Compliance"],
+    ["CrowdStrike", "CrowdStrike Falcon"],
+    ["Vulnerability Management", "Vulnerability Assessment"]
+  ]
+}

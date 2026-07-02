@@ -285,6 +285,7 @@ const {
   apolloPeopleMatch, resolveApolloMaxEnrichPerRun, resolveApolloVolumeConfig, APOLLO_MATCH_DEFAULT_MAX_PER_RUN, APOLLO_MAX_RESULTS_PER_VARIANT_DEFAULT, APOLLO_MAX_VARIANTS_PER_RUN_DEFAULT, APOLLO_MAX_CANDIDATES_PER_RUN_DEFAULT, apolloSearchLocationFromNeed,
   selectedMarketFromNeed, isApolloOutsideSelectedMarket,
   applyManualSkillEdit, displaySkillBucketsForMatch,
+  resolveSkillKey, __setSkillSynonymGroupsForTest, __resetSkillSynonymGroups,
   createCandidateOutcome, patchCandidateOutcome, buildDailyLearningSummary,
 } = _internals;
 
@@ -4810,6 +4811,121 @@ async function main() {
   else process.env.FIRECRAWL_API_KEY = prevFirecrawlKey;
   STUB_FIRECRAWL_ITEMS = null;
   STUB_GH_SEARCH_USERS = null;
+
+  // ── G1. Skill synonym matching + must-have weighting (Group 1) ─────────
+  // Synonyms are explicit alias GROUPS from config/skill-synonyms.json, never
+  // substring matching. mustHaveSkills weights 2:1 inside the 35% skill
+  // component only; absent mustHaveSkills must reproduce legacy scores exactly.
+  {
+    const g1Co = findOrCreateCompany({ name: 'G1 Synonym Co' });
+    const g1RunId = 'g1_syn_' + Date.now().toString(36);
+    const mkG1Cand = (name, skills) => findOrCreateCandidate({
+      name, title: 'Security Engineer', skills,
+      linkedinUrl: `https://www.linkedin.com/in/${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
+      source: 'Manual', scoutDecision: 'accepted', pipelineRunId: g1RunId,
+    });
+
+    // (a) Deterministic groups via test hook — alias matches, unrelated does not.
+    __setSkillSynonymGroupsForTest([['Microsoft Sentinel', 'Sentinel'], ['Amazon Web Services', 'AWS']]);
+    const g1NeedA = createNeed({
+      companyId: g1Co.id, title: 'G1 Role A',
+      requiredSkills: ['Sentinel', 'AWS', 'Terraform'], seniority: 'Mid', locationType: 'Remote', confirmed: true,
+    });
+    const aliasCand = mkG1Cand('G1 Alias Cand', ['Microsoft Sentinel', 'Amazon Web Services', 'Python']);
+    const rA = scoreCandidateAgainstNeed(aliasCand, g1NeedA, g1RunId);
+    assert(rA.matchedSkills.length === 2 && rA.matchedSkills.includes('Sentinel') && rA.matchedSkills.includes('AWS'),
+      `G1(a): alias-group skills match required aliases (matched=${JSON.stringify(rA.matchedSkills)})`);
+    assert(rA.missingSkills.length === 1 && rA.missingSkills[0] === 'Terraform',
+      `G1(a): non-alias skill still missing (missing=${JSON.stringify(rA.missingSkills)})`);
+
+    // (b) Alias groups are NOT substrings: "Azure" never matches "Azure Active Directory".
+    __setSkillSynonymGroupsForTest([['Microsoft Azure', 'Azure'], ['Azure Active Directory', 'Azure AD']]);
+    const g1NeedB = createNeed({
+      companyId: g1Co.id, title: 'G1 Role B',
+      requiredSkills: ['Azure'], seniority: 'Mid', locationType: 'Remote', confirmed: true,
+    });
+    const aadOnlyCand = mkG1Cand('G1 AAD Only', ['Azure Active Directory']);
+    const rB = scoreCandidateAgainstNeed(aadOnlyCand, g1NeedB, g1RunId);
+    assert(rB.matchedSkills.length === 0 && rB.missingSkills.length === 1,
+      `G1(b): "Azure Active Directory" does NOT match required "Azure" via synonyms (matched=${JSON.stringify(rB.matchedSkills)})`);
+
+    // (c) Backward compat: with synonyms DISABLED and no mustHaveSkills, the
+    //     legacy formula is reproduced exactly. Manual candidate, Remote need:
+    //     skills 2/3 → (2/3*100)*0.35 = 23.33; sen Mid none in title → 50*0.2=10;
+    //     Remote → 15; avail default 50*0.15=7.5; validation default 20*0.15=3.
+    //     total = round(23.33+10+15+7.5+3) = 59.
+    __setSkillSynonymGroupsForTest([]);
+    const g1NeedC = createNeed({
+      companyId: g1Co.id, title: 'G1 Role C',
+      requiredSkills: ['Azure', 'Sentinel', 'KQL'], seniority: 'Mid', locationType: 'Remote', confirmed: true,
+    });
+    const legacyCand = mkG1Cand('G1 Legacy Cand', ['Azure', 'Sentinel']);
+    const rC = scoreCandidateAgainstNeed(legacyCand, g1NeedC, g1RunId);
+    assert(rC.score === 59,
+      `G1(c): legacy formula reproduced exactly with synonyms off + no mustHaveSkills (expected 59, got ${rC.score})`);
+
+    // (c2) Same candidate/need with synonyms ENABLED but no aliases involved →
+    //      byte-identical score (synonyms are inert unless an alias applies).
+    __resetSkillSynonymGroups();
+    const rC2 = scoreCandidateAgainstNeed(legacyCand, g1NeedC, g1RunId);
+    assert(rC2.score === rC.score,
+      `G1(c2): shipped synonym config does not change non-alias scores (${rC.score} vs ${rC2.score})`);
+
+    // (d) Must-have weighting: same skills, mustHaveSkills changes ONLY the
+    //     skill component. required=[Azure(must), Sentinel, KQL], candidate has
+    //     Azure+Sentinel → weights: Azure 2, others 1 → matchedWeight 3 / total 4
+    //     → 75*0.35=26.25 vs legacy 23.33. Total = round(26.25+10+15+7.5+3)=62.
+    const g1NeedD = createNeed({
+      companyId: g1Co.id, title: 'G1 Role D',
+      requiredSkills: ['Azure', 'Sentinel', 'KQL'], mustHaveSkills: ['Azure'],
+      seniority: 'Mid', locationType: 'Remote', confirmed: true,
+    });
+    __setSkillSynonymGroupsForTest([]);
+    const rD = scoreCandidateAgainstNeed(legacyCand, g1NeedD, g1RunId);
+    assert(rD.score === 62,
+      `G1(d): must-have hit weighted 2:1 inside skill component (expected 62, got ${rD.score})`);
+
+    //     Missing the must-have cuts harder: candidate has Sentinel+KQL but NOT
+    //     Azure(must) → matchedWeight 2 / total 4 → 50*0.35=17.5 → total 53
+    //     (legacy equal-weight would be 66.67*0.35=23.33 → 59). Issue text names it.
+    const noMustCand = mkG1Cand('G1 NoMust Cand', ['Sentinel', 'KQL']);
+    const rD2 = scoreCandidateAgainstNeed(noMustCand, g1NeedD, g1RunId);
+    assert(rD2.score === 53,
+      `G1(d2): missing must-have scores lower than legacy equal weighting (expected 53, got ${rD2.score})`);
+    assert(/Missing MUST-HAVE skills: Azure/.test(rD2.reviewReason || rD2.dropReason || ''),
+      `G1(d2): missing must-have named in review/drop reason (got "${rD2.reviewReason || rD2.dropReason}")`);
+
+    // (e) Display buckets use the SAME alias resolution as scoring, and a
+    //     manual remove of one alias applies to its whole synonym group.
+    __setSkillSynonymGroupsForTest([['Microsoft Sentinel', 'Sentinel']]);
+    const g1NeedE = createNeed({
+      companyId: g1Co.id, title: 'G1 Role E',
+      requiredSkills: ['Sentinel', 'KQL'], seniority: 'Mid', locationType: 'Remote', confirmed: true,
+    });
+    const dispCand = mkG1Cand('G1 Display Cand', ['Microsoft Sentinel']);
+    const rE = scoreCandidateAgainstNeed(dispCand, g1NeedE, g1RunId);
+    const bucketsE = displaySkillBucketsForMatch(dispCand, rE, g1NeedE);
+    assert(bucketsE.matchedSkills.some(s => resolveSkillKey(s) === resolveSkillKey('Sentinel')) &&
+      bucketsE.missingSkills.length === 1,
+      `G1(e): display buckets agree with alias-aware scoring (matched=${JSON.stringify(bucketsE.matchedSkills)})`);
+    applyManualSkillEdit(dispCand, { action: 'remove', skill: 'Microsoft Sentinel' });
+    const bucketsE2 = displaySkillBucketsForMatch(dispCand, rE, g1NeedE);
+    assert(!bucketsE2.matchedSkills.some(s => resolveSkillKey(s) === resolveSkillKey('Sentinel')) &&
+      bucketsE2.missingSkills.some(s => resolveSkillKey(s) === resolveSkillKey('Sentinel')),
+      `G1(e2): manual remove of an alias removes the whole synonym group from matched (matched=${JSON.stringify(bucketsE2.matchedSkills)})`);
+    //     ...and the stored match/score are untouched by the manual edit.
+    assert(rE.matchedSkills.length === 1 && rE.score === scoreCandidateAgainstNeed({ ...dispCand, manualSkillEdits: undefined }, g1NeedE, g1RunId).score,
+      `G1(e3): manual skill edits remain display-only (score/matched unchanged)`);
+
+    // (f) Shipped config sanity: a real group resolves, unrelated keys do not.
+    __resetSkillSynonymGroups();
+    assert(resolveSkillKey('Azure Sentinel') === resolveSkillKey('Microsoft Sentinel'),
+      `G1(f): shipped config groups "Azure Sentinel" with "Microsoft Sentinel"`);
+    assert(resolveSkillKey('Azure') !== resolveSkillKey('Azure Active Directory'),
+      `G1(f2): shipped config keeps "Azure" and "Azure Active Directory" separate`);
+
+    __resetSkillSynonymGroups();
+  }
 
   // ── 17. Sample-run proof: pipeline-style log of one scout pass ──
   console.log('\n── Sample mock run proving non-candidate pages are rejected ──');

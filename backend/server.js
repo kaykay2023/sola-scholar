@@ -585,6 +585,43 @@ function normalizeSkillKey(skill = '') {
   return String(skill || '').toLowerCase().replace(/[^a-z0-9+#]/g, '');
 }
 
+// ── Skill synonym resolution (config/skill-synonyms.json) ──────────────
+// Alias GROUPS only — matching is by explicit group membership, never
+// substring ("Azure" must still NOT match "Azure Active Directory" unless
+// both are listed in the same group; they are not). Every alias in a group
+// resolves to one canonical key, so scoring's matched/missing computation,
+// display buckets, and manual-edit dedupe all agree. Missing/malformed
+// config = empty map = exact matching only (today's behavior).
+function buildSkillSynonymResolver(groups = []) {
+  const map = new Map();
+  for (const group of Array.isArray(groups) ? groups : []) {
+    if (!Array.isArray(group) || group.length < 2) continue;
+    const canonical = normalizeSkillKey(group[0]);
+    if (!canonical) continue;
+    for (const alias of group) {
+      const key = normalizeSkillKey(alias);
+      if (key && !map.has(key)) map.set(key, canonical);
+    }
+  }
+  return map;
+}
+const SKILL_SYNONYMS_CONFIG = loadJsonConfig('skill-synonyms.json', { version: 0, groups: [] });
+let SKILL_SYNONYM_MAP = buildSkillSynonymResolver(SKILL_SYNONYMS_CONFIG.groups);
+
+function resolveSkillKey(skill = '') {
+  const key = normalizeSkillKey(skill);
+  return SKILL_SYNONYM_MAP.get(key) || key;
+}
+
+// TEST-ONLY hook: lets tests install deterministic synonym groups (or [] to
+// disable synonyms) without touching the shipped config file.
+function __setSkillSynonymGroupsForTest(groups = []) {
+  SKILL_SYNONYM_MAP = buildSkillSynonymResolver(groups);
+}
+function __resetSkillSynonymGroups() {
+  SKILL_SYNONYM_MAP = buildSkillSynonymResolver(SKILL_SYNONYMS_CONFIG.groups);
+}
+
 function mergeCandidateSkillEvidence(c, skills = [], source = '') {
   if (!c) return c;
   const provider = normalizeProviderKey(source || c.provider_of_record || c.source || 'unknown') || 'unknown';
@@ -631,10 +668,12 @@ function normalizeManualSkillEdits(c) {
 function applyManualSkillEdit(c, { action, skill }) {
   if (!c) return null;
   const cleanSkill = String(skill || '').trim();
-  const skillKey = normalizeSkillKey(cleanSkill);
+  // resolveSkillKey: an add/remove of any alias supersedes prior edits of the
+  // same synonym group, so the buckets can never hold contradictory aliases.
+  const skillKey = resolveSkillKey(cleanSkill);
   if (!skillKey) return null;
   const edits = normalizeManualSkillEdits(c);
-  const removeKey = list => list.filter(s => normalizeSkillKey(s) !== skillKey);
+  const removeKey = list => list.filter(s => resolveSkillKey(s) !== skillKey);
   const entry = {
     skill: cleanSkill,
     action,
@@ -643,10 +682,10 @@ function applyManualSkillEdit(c, { action, skill }) {
   };
   if (action === 'add') {
     edits.removed = removeKey(edits.removed);
-    if (!edits.added.some(s => normalizeSkillKey(s) === skillKey)) edits.added.push(cleanSkill);
+    if (!edits.added.some(s => resolveSkillKey(s) === skillKey)) edits.added.push(cleanSkill);
   } else if (action === 'remove') {
     edits.added = removeKey(edits.added);
-    if (!edits.removed.some(s => normalizeSkillKey(s) === skillKey)) edits.removed.push(cleanSkill);
+    if (!edits.removed.some(s => resolveSkillKey(s) === skillKey)) edits.removed.push(cleanSkill);
   } else {
     return null;
   }
@@ -658,9 +697,12 @@ function applyManualSkillEdit(c, { action, skill }) {
 }
 
 function displaySkillBucketsForMatch(candidate = {}, match = {}, need = {}) {
+  // Uses resolveSkillKey (same alias resolution as scoring) so the displayed
+  // matched/missing buckets always agree with the scoring buckets, and a
+  // manual add/remove of any alias applies to its whole synonym group.
   const edits = normalizeManualSkillEdits(candidate);
-  const addedKeys = new Set(edits.added.map(normalizeSkillKey));
-  const removedKeys = new Set(edits.removed.map(normalizeSkillKey));
+  const addedKeys = new Set(edits.added.map(resolveSkillKey));
+  const removedKeys = new Set(edits.removed.map(resolveSkillKey));
   const required = Array.isArray(need.requiredSkills) ? need.requiredSkills : [];
   const baseMatched = Array.isArray(match.matchedSkills) ? match.matchedSkills : [];
   const baseMissing = Array.isArray(match.missingSkills) ? match.missingSkills : [];
@@ -668,32 +710,32 @@ function displaySkillBucketsForMatch(candidate = {}, match = {}, need = {}) {
   const missing = [];
 
   const pushUnique = (list, skill) => {
-    const key = normalizeSkillKey(skill);
-    if (!key || list.some(s => normalizeSkillKey(s) === key)) return;
+    const key = resolveSkillKey(skill);
+    if (!key || list.some(s => resolveSkillKey(s) === key)) return;
     list.push(skill);
   };
 
   if (required.length) {
     for (const skill of required) {
-      const key = normalizeSkillKey(skill);
+      const key = resolveSkillKey(skill);
       if (removedKeys.has(key)) pushUnique(missing, skill);
-      else if (addedKeys.has(key) || baseMatched.some(s => normalizeSkillKey(s) === key)) pushUnique(matched, skill);
+      else if (addedKeys.has(key) || baseMatched.some(s => resolveSkillKey(s) === key)) pushUnique(matched, skill);
       else pushUnique(missing, skill);
     }
   } else {
     for (const skill of baseMatched) {
-      const key = normalizeSkillKey(skill);
+      const key = resolveSkillKey(skill);
       if (!removedKeys.has(key)) pushUnique(matched, skill);
     }
   }
 
   for (const skill of baseMissing) {
-    const key = normalizeSkillKey(skill);
-    if (!addedKeys.has(key) && !removedKeys.has(key) && !matched.some(s => normalizeSkillKey(s) === key)) pushUnique(missing, skill);
+    const key = resolveSkillKey(skill);
+    if (!addedKeys.has(key) && !removedKeys.has(key) && !matched.some(s => resolveSkillKey(s) === key)) pushUnique(missing, skill);
   }
   for (const skill of edits.added) {
-    const key = normalizeSkillKey(skill);
-    if (required.length && !required.some(s => normalizeSkillKey(s) === key)) continue;
+    const key = resolveSkillKey(skill);
+    if (required.length && !required.some(s => resolveSkillKey(s) === key)) continue;
     if (!removedKeys.has(key)) pushUnique(matched, skill);
   }
 
@@ -1716,6 +1758,9 @@ function createNeed(input) {
     title: input.title || '',
     description: input.description || '',
     requiredSkills: Array.isArray(input.requiredSkills) ? input.requiredSkills : [],
+    // Optional subset of requiredSkills weighted 2:1 inside the skill score
+    // component. Empty = all required skills weigh equally (legacy behavior).
+    mustHaveSkills: Array.isArray(input.mustHaveSkills) ? input.mustHaveSkills : [],
     tools: Array.isArray(input.tools) ? input.tools : [],
     seniority: input.seniority || 'Mid',
     locationType: input.locationType || 'Remote',
@@ -4921,24 +4966,40 @@ async function runValidator({ candidateIds = null, pipelineRunId = null } = {}) 
 }
 
 function scoreCandidateAgainstNeed(c, need, pipelineRunId = null) {
-  const norm = s => (s || '').toLowerCase().replace(/[^a-z0-9+#]/g, '');
-  const cSkills = new Set((c.skills || []).map(norm));
+  // Skill comparison uses resolveSkillKey: normalizeSkillKey + curated alias
+  // groups from config/skill-synonyms.json (explicit group membership only,
+  // never substring). With no synonyms configured this is byte-identical to
+  // the previous exact-match behavior.
+  const cSkills = new Set((c.skills || []).map(resolveSkillKey));
   const req = (need.requiredSkills || []);
-  const matched = req.filter(s => cSkills.has(norm(s)));
-  const missing = req.filter(s => !cSkills.has(norm(s)));
+  const matched = req.filter(s => cSkills.has(resolveSkillKey(s)));
+  const missing = req.filter(s => !cSkills.has(resolveSkillKey(s)));
   const reasons = [];
+
+  // Must-have vs nice-to-have (optional need.mustHaveSkills, a subset of
+  // requiredSkills by intent). Must-haves weigh 2, nice-to-haves 1 INSIDE the
+  // existing 35% skill component — the 35/20/15/15/15 outer weights are
+  // unchanged. When mustHaveSkills is absent/empty every weight is 1, which
+  // reduces to exactly the previous formula.
+  const mustKeys = new Set((Array.isArray(need.mustHaveSkills) ? need.mustHaveSkills : []).map(resolveSkillKey).filter(Boolean));
+  const weightOf = s => (mustKeys.size && mustKeys.has(resolveSkillKey(s)) ? 2 : 1);
+  const totalWeight = req.reduce((a, s) => a + weightOf(s), 0);
+  const missingMustHaves = mustKeys.size ? missing.filter(s => mustKeys.has(resolveSkillKey(s))) : [];
 
   // Run-scoped: only use validation evidence from the current pipeline run.
   const v = latestValidation(c.id, pipelineRunId);
   let skillRaw = 0;
   if (req.length) {
     if (v?.proficiency && Object.keys(v.proficiency).length) {
-      const profScores = matched.map(s => {
-        const key = Object.keys(v.proficiency).find(k => norm(k) === norm(s));
-        return key ? v.proficiency[key] / 100 : 0.5;
+      const profWeighted = matched.map(s => {
+        const key = Object.keys(v.proficiency).find(k => resolveSkillKey(k) === resolveSkillKey(s));
+        return (key ? v.proficiency[key] / 100 : 0.5) * weightOf(s);
       });
-      skillRaw = profScores.length ? (profScores.reduce((a, b) => a + b, 0) / req.length) * 100 : 0;
-    } else { skillRaw = (matched.length / req.length) * 100; }
+      skillRaw = profWeighted.length ? (profWeighted.reduce((a, b) => a + b, 0) / totalWeight) * 100 : 0;
+    } else {
+      const matchedWeight = matched.reduce((a, s) => a + weightOf(s), 0);
+      skillRaw = (matchedWeight / totalWeight) * 100;
+    }
   } else { skillRaw = 50; }
   const skillScore = Math.min(skillRaw, 100) * 0.35;
   if (matched.length) reasons.push(`Matches ${matched.length}/${req.length} required skills: ${matched.join(', ')}`);
@@ -4980,6 +5041,7 @@ function scoreCandidateAgainstNeed(c, need, pipelineRunId = null) {
 
   const issues = [];
   if (req.length && matched.length === 0) issues.push('No required skill overlap');
+  if (missingMustHaves.length) issues.push(`Missing MUST-HAVE skills: ${missingMustHaves.join(', ')}`);
   if (missing.length) issues.push(`Missing required skills: ${missing.join(', ')}`);
   if (v?.tier === 'Needs Review') issues.push(c.github ? 'Partial evidence only — needs human review' : 'Missing GitHub but has profile/source data');
   if (v?.tier === 'Insufficient Data') issues.push('Insufficient public evidence');
@@ -5244,7 +5306,7 @@ function newPipelineRunId() {
   return 'run_' + Date.now().toString(36) + '_' + crypto.randomBytes(3).toString('hex');
 }
 
-async function runPipeline({ company, role, skills = [], location = '', seniority = 'Mid', expandCandidatePool = false, apolloMaxEnrichPerRun = APOLLO_MATCH_DEFAULT_MAX_PER_RUN, pdlEnrichMaxPerRun = PDL_ENRICH_DEFAULT_MAX_PER_RUN }) {
+async function runPipeline({ company, role, skills = [], mustHaveSkills = [], location = '', seniority = 'Mid', expandCandidatePool = false, apolloMaxEnrichPerRun = APOLLO_MATCH_DEFAULT_MAX_PER_RUN, pdlEnrichMaxPerRun = PDL_ENRICH_DEFAULT_MAX_PER_RUN }) {
   const pipelineRunId = newPipelineRunId();
   console.log(`[pipeline] start runId=${pipelineRunId} role="${role}" company="${company}"`);
   await logActivity('Pipeline', `Pipeline start ${pipelineRunId}: ${role} @ ${company}`, 'running', { pipelineRunId });
@@ -5282,6 +5344,7 @@ async function runPipeline({ company, role, skills = [], location = '', seniorit
   const need = createNeed({
     companyId: co.id, managerId: mgr?.id || null,
     title: role, requiredSkills: Array.isArray(skills) ? skills : [],
+    mustHaveSkills: Array.isArray(mustHaveSkills) ? mustHaveSkills : [],
     seniority, locationType: location?.toLowerCase().includes('remote') ? 'Remote' : 'Onsite',
     location, confirmed: true, urgency: 'Medium',
     pipelineRunId,
@@ -5560,7 +5623,7 @@ app.post('/api/hiring-needs', async (req, res) => {
 app.patch('/api/hiring-needs/:id', async (req, res) => {
   const n = DB.hiring_needs.find(x => x.id === req.params.id);
   if (!n) return res.status(404).json({ error: 'Not found' });
-  const allow = ['title','description','requiredSkills','seniority','locationType','location','urgency','status','confirmed','sourceUrl'];
+  const allow = ['title','description','requiredSkills','mustHaveSkills','seniority','locationType','location','urgency','status','confirmed','sourceUrl'];
   for (const k of allow) if (k in (req.body || {})) n[k] = req.body[k];
   await persistDB();
   res.json(n);
@@ -5788,6 +5851,10 @@ module.exports = {
     mergeCandidateSkillEvidence,
     applyManualSkillEdit,
     displaySkillBucketsForMatch,
+    normalizeSkillKey,
+    resolveSkillKey,
+    __setSkillSynonymGroupsForTest,
+    __resetSkillSynonymGroups,
     createCandidateOutcome,
     patchCandidateOutcome,
     buildDailyLearningSummary,
