@@ -285,6 +285,8 @@ const {
   apolloPeopleMatch, resolveApolloMaxEnrichPerRun, resolveApolloVolumeConfig, APOLLO_MATCH_DEFAULT_MAX_PER_RUN, APOLLO_MAX_RESULTS_PER_VARIANT_DEFAULT, APOLLO_MAX_VARIANTS_PER_RUN_DEFAULT, APOLLO_MAX_CANDIDATES_PER_RUN_DEFAULT, apolloSearchLocationFromNeed,
   selectedMarketFromNeed, isApolloOutsideSelectedMarket,
   applyManualSkillEdit, displaySkillBucketsForMatch,
+  resolveSkillKey, __setSkillSynonymGroupsForTest, __resetSkillSynonymGroups,
+  createCandidateOutcome, patchCandidateOutcome, buildDailyLearningSummary,
 } = _internals;
 
 // NOTE: do NOT call loadDB() — it reassigns the module-internal `DB` binding
@@ -724,6 +726,196 @@ async function main() {
       `Manual skill edits do not change existing candidate ordering/rank`);
   }
 
+  // ── 7e. Candidate outcomes + daily learning summaries are passive ──
+  {
+    assert(Array.isArray(DB.candidate_outcomes) && Array.isArray(DB.agent_learning_summaries),
+      'candidate_outcomes and agent_learning_summaries initialize safely for old data files');
+    const emptyLearning = buildDailyLearningSummary({ date: '2026-06-17' });
+    assert(emptyLearning.totalOutcomesReviewed === 0 && /Not enough data yet/i.test(emptyLearning.summary),
+      `Daily learning summary handles no outcomes (summary=${JSON.stringify(emptyLearning.summary)})`);
+
+    const learnRun = 'learning_outcomes_' + Date.now().toString(36);
+    const learnNeed = createNeed({
+      companyId: coA.id,
+      title: 'Learning Outcomes Role',
+      requiredSkills: ['Azure', 'KQL'],
+      seniority: 'Mid',
+      locationType: 'Remote',
+      location: 'Remote',
+      confirmed: true,
+      pipelineRunId: learnRun,
+    });
+    const highRejectedCand = findOrCreateCandidate({
+      name: 'High Score Rejected',
+      currentTitle: 'Cloud Security Engineer',
+      currentCompany: 'Learning Co',
+      location: 'Remote',
+      skills: ['Azure', 'KQL', 'Sentinel'],
+      linkedinUrl: 'https://www.linkedin.com/in/high-score-rejected',
+      source: 'Apollo',
+      provider_of_record: 'apollo',
+      discovered_by: ['apollo'],
+      scoutDecision: 'accepted',
+      pipelineRunId: learnRun,
+    });
+    const lowAcceptedCand = findOrCreateCandidate({
+      name: 'Lower Score Accepted',
+      currentTitle: 'Security Analyst',
+      currentCompany: 'Learning Co',
+      location: 'Remote',
+      skills: ['Azure'],
+      linkedinUrl: 'https://www.linkedin.com/in/lower-score-accepted',
+      source: 'Firecrawl',
+      provider_of_record: 'firecrawl',
+      discovered_by: ['firecrawl'],
+      resolved_by: ['pdl'],
+      resolution_status: 'resolved',
+      scoutDecision: 'accepted',
+      pipelineRunId: learnRun,
+    });
+    createValidation(highRejectedCand.id, { pipelineRunId: learnRun, tier: 'Verified Active', evidenceNotes: 'Strong technical evidence' });
+    createValidation(lowAcceptedCand.id, { pipelineRunId: learnRun, tier: 'Needs Review', evidenceNotes: 'Sparse but relevant evidence' });
+    const highBeforeScore = scoreCandidateAgainstNeed(highRejectedCand, learnNeed, learnRun).score;
+    const lowBeforeScore = scoreCandidateAgainstNeed(lowAcceptedCand, learnNeed, learnRun).score;
+    const highMatch = createOrUpdateMatch({
+      needId: learnNeed.id,
+      candidateId: highRejectedCand.id,
+      pipelineRunId: learnRun,
+      score: 88,
+      tier: 'Strong Match',
+      matchedSkills: ['Azure', 'KQL'],
+      missingSkills: [],
+      reasoning: ['Matches 2/2 required skills'],
+      rank: 1,
+    });
+    const lowMatch = createOrUpdateMatch({
+      needId: learnNeed.id,
+      candidateId: lowAcceptedCand.id,
+      pipelineRunId: learnRun,
+      score: 55,
+      tier: 'Weak Match',
+      matchedSkills: ['Azure'],
+      missingSkills: ['KQL'],
+      reasoning: ['Matches 1/2 required skills'],
+      rank: 2,
+    });
+
+    const highOutcome = createCandidateOutcome({
+      candidateId: highRejectedCand.id,
+      needId: learnNeed.id,
+      matchId: highMatch.id,
+      clientVerdict: 'rejected',
+      finalOutcome: 'rejected',
+      clientReason: 'too senior for budget',
+      outcomeDate: '2026-06-17T12:00:00.000Z',
+    });
+    assert(highOutcome.matchScore === 88 && highOutcome.matchTier === 'Strong Match' && highOutcome.pipelineRunId === learnRun,
+      `Outcome snapshots match score/tier/run from match (outcome=${JSON.stringify(highOutcome)})`);
+    assert(highOutcome.sourcedBy === 'apollo' && highOutcome.validatorVerdict === 'Verified Active',
+      `Outcome snapshots provider and validator fields (source=${highOutcome.sourcedBy}, validator=${highOutcome.validatorVerdict})`);
+    assert(highOutcome.validatorReason === 'Strong technical evidence',
+      `Outcome snapshots validator reason`);
+
+    let duplicateBlocked = false;
+    try {
+      createCandidateOutcome({ candidateId: highRejectedCand.id, needId: learnNeed.id, pipelineRunId: learnRun });
+    } catch (e) {
+      duplicateBlocked = e.status === 409;
+    }
+    assert(duplicateBlocked, 'Duplicate active outcome is blocked for candidateId + needId + pipelineRunId');
+
+    let invalidClientVerdictBlocked = false;
+    try {
+      createCandidateOutcome({ candidateId: lowAcceptedCand.id, needId: learnNeed.id, clientVerdict: 'maybe' });
+    } catch (e) {
+      invalidClientVerdictBlocked = e.status === 400;
+    }
+    assert(invalidClientVerdictBlocked, 'Invalid clientVerdict is rejected');
+
+    const lowOutcome = createCandidateOutcome({
+      candidateId: lowAcceptedCand.id,
+      needId: learnNeed.id,
+      matchId: lowMatch.id,
+      clientVerdict: 'accepted',
+      finalOutcome: 'hired',
+      clientReason: 'hands-on detection experience',
+      outcomeDate: '2026-06-17T13:00:00.000Z',
+    });
+    const oldId = lowOutcome.id;
+    const oldCandidateId = lowOutcome.candidateId;
+    const oldNeedId = lowOutcome.needId;
+    const oldPipelineRunId = lowOutcome.pipelineRunId;
+    const oldMatchId = lowOutcome.matchId;
+    const oldSourcedBy = lowOutcome.sourcedBy;
+    const oldValidatorVerdict = lowOutcome.validatorVerdict;
+    const oldValidatorReason = lowOutcome.validatorReason;
+    const oldMatchScore = lowOutcome.matchScore;
+    const oldMatchTier = lowOutcome.matchTier;
+    const oldCreatedAt = lowOutcome.createdAt;
+    patchCandidateOutcome(lowOutcome, {
+      feedbackFromClient: 'client liked practical Azure depth',
+      finalOutcome: 'hired',
+      needId: 'bad-need',
+      pipelineRunId: 'bad-run',
+      matchId: 'bad-match',
+      sourcedBy: 'bad-source',
+      validatorVerdict: 'bad-validator',
+      validatorReason: 'bad-reason',
+      matchScore: 999,
+      matchTier: 'bad-tier',
+      candidateSnapshot: { bad: true },
+      matchSnapshot: { bad: true },
+      validationSnapshot: { bad: true },
+      id: 'bad-id',
+      candidateId: 'bad-candidate',
+      createdAt: '1900-01-01T00:00:00.000Z',
+    });
+    assert(lowOutcome.id === oldId &&
+      lowOutcome.candidateId === oldCandidateId &&
+      lowOutcome.needId === oldNeedId &&
+      lowOutcome.pipelineRunId === oldPipelineRunId &&
+      lowOutcome.matchId === oldMatchId &&
+      lowOutcome.sourcedBy === oldSourcedBy &&
+      lowOutcome.validatorVerdict === oldValidatorVerdict &&
+      lowOutcome.validatorReason === oldValidatorReason &&
+      lowOutcome.matchScore === oldMatchScore &&
+      lowOutcome.matchTier === oldMatchTier &&
+      lowOutcome.createdAt === oldCreatedAt &&
+      !lowOutcome.candidateSnapshot &&
+      !lowOutcome.matchSnapshot &&
+      !lowOutcome.validationSnapshot &&
+      lowOutcome.feedbackFromClient === 'client liked practical Azure depth',
+      'PATCH outcome updates allowed fields but cannot change identity, snapshots, or history fields');
+
+    let invalidFinalOutcomeBlocked = false;
+    try {
+      patchCandidateOutcome(lowOutcome, { finalOutcome: 'maybe_later' });
+    } catch (e) {
+      invalidFinalOutcomeBlocked = e.status === 400;
+    }
+    assert(invalidFinalOutcomeBlocked, 'Invalid finalOutcome is rejected');
+
+    const learning = buildDailyLearningSummary({
+      date: '2026-06-17',
+      windowStart: '2026-06-17T00:00:00.000Z',
+      windowEnd: '2026-06-17T23:59:59.999Z',
+    });
+    assert(learning.totalOutcomesReviewed === 2 && learning.highScoreRejectedCount === 1 && learning.lowScoreAcceptedCount === 1,
+      `Learning summary detects score/outcome mismatches (summary=${JSON.stringify(learning)})`);
+    assert(learning.hiredCount === 1 && learning.rejectedCount === 1,
+      `Learning summary counts hired/rejected outcomes`);
+    assert(learning.providerSignals.some(s => s.provider === 'apollo' && s.rejected === 1) &&
+      learning.validatorSignals.some(s => s.verdict === 'Verified Active' && s.rejected === 1),
+      `Learning summary includes provider and validator signals`);
+    assert(scoreCandidateAgainstNeed(highRejectedCand, learnNeed, learnRun).score === highBeforeScore &&
+      scoreCandidateAgainstNeed(lowAcceptedCand, learnNeed, learnRun).score === lowBeforeScore,
+      'Candidate outcomes and learning summaries do not change scoring math');
+    assert(isClientReadyForNeed(highRejectedCand, learnNeed) === true && isClientReadyForNeed(lowAcceptedCand, learnNeed) === true,
+      'Candidate outcomes and learning summaries do not change visible/client-ready gates');
+    assert(highMatch.rank === 1 && lowMatch.rank === 2,
+      'Candidate outcomes and learning summaries do not change candidate ordering');
+  }
+
   // Re-stamp sharedCand under runB and run matchmaker to materialize a runB match record
   sharedCand.pipelineRunId = runB;
   const mmBshared = await runMatchmaker({ needId: need.id, pipelineRunId: runB });
@@ -1052,9 +1244,9 @@ async function main() {
 
   assert(scoutResult.sourcedRaw === 6,                       `scout sourcedRaw === 6 (got ${scoutResult.sourcedRaw})`);
   assert(scoutResult.rejectedNonCandidates === 4,            `4 rejected non-candidates (got ${scoutResult.rejectedNonCandidates})`);
-  assert(scoutResult.acceptedCandidates === 2,               `2 accepted candidates (got ${scoutResult.acceptedCandidates})`);
-  assert(scoutResult.needsScoutReview === 0,                 `0 review (got ${scoutResult.needsScoutReview})`);
-  assert(scoutResult.sourced === 2,                          `scout.sourced (validator-input) === 2 (got ${scoutResult.sourced})`);
+  assert(scoutResult.acceptedCandidates === 0,               `0 accepted Firecrawl-only unresolved candidates (got ${scoutResult.acceptedCandidates})`);
+  assert(scoutResult.needsScoutReview === 2,                 `2 Firecrawl-only unresolved profiles held for review (got ${scoutResult.needsScoutReview})`);
+  assert(scoutResult.sourced === 2,                          `scout.sourced retains 2 candidate-like profiles for internal review (got ${scoutResult.sourced})`);
 
   // Rejected samples carry the right sourceType
   const rejTypes = scoutResult.rejectedSamples.map(r => r.sourceType).sort();
@@ -1081,17 +1273,18 @@ async function main() {
   const learnDocCand = DB.candidates.find(c => (c.sourceUrl || '').includes('learn.microsoft.com'));
   assert(!learnDocCand, `No candidate record carries a Microsoft Learn URL`);
 
-  // Validator only sees accepted candidates — pipeline-style call
+  // Validator can still see retained review candidates for internal QA, but
+  // matchmaker/client-visible paths must not include them.
   const scoutCandIds = scoutResult.candidates.map(c => c.id);
-  assert(scoutCandIds.length === 2, `Validator receives exactly 2 candidate ids (got ${scoutCandIds.length})`);
+  assert(scoutCandIds.length === 2, `Validator receives 2 retained unresolved Firecrawl-only candidate ids (got ${scoutCandIds.length})`);
   const scoutValRes = await runValidator({ candidateIds: scoutCandIds, pipelineRunId: scoutRunId });
   assert(scoutValRes.validated === 2,
-    `Validator processed 2 candidates only — rejected items skipped (got validated=${scoutValRes.validated})`);
+    `Validator processed 2 retained review candidates for internal QA (got validated=${scoutValRes.validated})`);
 
-  // Matchmaker pool is run-scoped — equals accepted candidates
+  // Matchmaker pool is run-scoped — equals accepted/client-visible candidates
   const scoutMm = await runMatchmaker({ needId: scoutNeed.id, pipelineRunId: scoutRunId });
-  assert(scoutMm.matched === 2,
-    `Matchmaker scored 2 candidates only — rejected pages excluded (got ${scoutMm.matched})`);
+  assert(scoutMm.matched === 0,
+    `Matchmaker scored 0 unresolved Firecrawl-only candidates (got ${scoutMm.matched})`);
   // No match record should reference a ZipRecruiter/MS-blog/Learn URL
   for (const m of DB.matches.filter(m => m.pipelineRunId === scoutRunId)) {
     const c = DB.candidates.find(x => x.id === m.candidateId);
@@ -1264,10 +1457,12 @@ async function main() {
   const verifyRunId = 'verify_run_' + Date.now().toString(36);
   const verifyScout = await runScout({ needId: verifyNeed.id, pipelineRunId: verifyRunId });
 
-  // real-individual → upgraded to accepted (API User)
+  // real-individual → person-like, but still review until Apollo/PDL structural resolution
   const realIndCand = DB.candidates.find(c => (c.sourceUrl || '').includes('github.com/real-individual'));
-  assert(realIndCand && realIndCand.scoutDecision === 'accepted',
-    `GitHub API type=User → candidate accepted (got scoutDecision="${realIndCand && realIndCand.scoutDecision}", scoutReason="${realIndCand && realIndCand.scoutReason}")`);
+  assert(realIndCand && realIndCand.scoutDecision === 'review' &&
+    realIndCand.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW &&
+    realIndCand.reason_code === 'FIRECRAWL_ONLY_UNRESOLVED_LOCAL_HYBRID',
+    `GitHub API type=User remains review until Apollo/PDL resolution (got scoutDecision="${realIndCand && realIndCand.scoutDecision}", visibility="${realIndCand && realIndCand.visibility_state}", reason="${realIndCand && realIndCand.reason_code}")`);
   assert(realIndCand && /API verified type=User/.test(realIndCand.scoutReason || ''),
     `scoutReason mentions API verification (got "${realIndCand && realIndCand.scoutReason}")`);
   // acme-security → demoted to rejected (API Organization)
@@ -1280,10 +1475,12 @@ async function main() {
   assert(randomRej && /no person-like signals/.test(randomRej.scoutReason || ''),
     `random-thing rejected reason mentions no-person-signals (got "${randomRej && randomRej.scoutReason}")`);
 
-  // Control LinkedIn /in/ → accepted (still works alongside GH verification)
+  // Control LinkedIn /in/ → candidate-like, but still review until Apollo/PDL structural resolution
   const ctrlCand = DB.candidates.find(c => (c.sourceUrl || '').includes('linkedin.com/in/control'));
-  assert(ctrlCand && ctrlCand.scoutDecision === 'accepted',
-    `Control LinkedIn /in/ still accepted (got scoutDecision="${ctrlCand && ctrlCand.scoutDecision}")`);
+  assert(ctrlCand && ctrlCand.scoutDecision === 'review' &&
+    ctrlCand.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW &&
+    ctrlCand.reason_code === 'FIRECRAWL_ONLY_UNRESOLVED_LOCAL_HYBRID',
+    `Control LinkedIn /in/ remains review until Apollo/PDL resolution (got scoutDecision="${ctrlCand && ctrlCand.scoutDecision}", visibility="${ctrlCand && ctrlCand.visibility_state}", reason="${ctrlCand && ctrlCand.reason_code}")`);
 
   // ── 16f. API unavailable → stays review (do NOT blindly accept) ──
   STUB_FIRECRAWL_ITEMS = [
@@ -1362,14 +1559,18 @@ async function main() {
   assert(apolloScout.acceptedBySource.apollo === 3,
     `acceptedBySource.apollo === 3 (got ${apolloScout.acceptedBySource.apollo})`);
   // (d) Dedupe — Bob's LinkedIn URL appears in both Apollo and Firecrawl;
-  //     only Apollo gets credit (first-touch). Firecrawl gets credit for the
-  //     unique fresh-firecrawl LinkedIn person.
-  assert(apolloScout.acceptedBySource.firecrawl === 1,
-    `acceptedBySource.firecrawl === 1 (Bob deduped, only fresh-firecrawl counted; got ${apolloScout.acceptedBySource.firecrawl})`);
+  //     only Apollo gets credit (first-touch). The unique fresh-firecrawl
+  //     LinkedIn person is preserved for review until Apollo/PDL resolution.
+  assert((apolloScout.acceptedBySource.firecrawl || 0) === 0,
+    `acceptedBySource.firecrawl === 0 for unresolved Firecrawl-only candidates (got ${apolloScout.acceptedBySource.firecrawl})`);
+  assert(apolloScout.reviewBySource.firecrawl === 1,
+    `reviewBySource.firecrawl === 1 for fresh-firecrawl (got ${apolloScout.reviewBySource.firecrawl})`);
 
-  // (e) Total accepted = 4 unique (Alice, Bob, Charlie, fresh-firecrawl)
-  assert(apolloScout.acceptedCandidates === 4,
-    `acceptedCandidates === 4 unique after dedupe (got ${apolloScout.acceptedCandidates})`);
+  // (e) Total accepted = 3 Apollo-resolved unique candidates (Alice, Bob, Charlie)
+  assert(apolloScout.acceptedCandidates === 3,
+    `acceptedCandidates === 3 Apollo-resolved unique candidates after dedupe (got ${apolloScout.acceptedCandidates})`);
+  assert(apolloScout.needsScoutReview === 1,
+    `needsScoutReview === 1 unresolved Firecrawl-only profile (got ${apolloScout.needsScoutReview})`);
   // (f) Rejected non-candidates still excluded
   assert(apolloScout.rejectedNonCandidates === 1,
     `1 rejected (ZipRecruiter) — non-candidates still excluded (got ${apolloScout.rejectedNonCandidates})`);
@@ -1382,8 +1583,8 @@ async function main() {
   assert(apolloVal.validated >= 3,
     `Validator processed Apollo candidates (validated=${apolloVal.validated})`);
   const apolloMm = await runMatchmaker({ needId: apolloNeed.id, pipelineRunId: apolloRunId });
-  assert(apolloMm.matched === 4,
-    `Matchmaker scored all 4 accepted Apollo+Firecrawl candidates (got ${apolloMm.matched})`);
+  assert(apolloMm.matched === 3,
+    `Matchmaker scored all 3 accepted Apollo-resolved candidates (got ${apolloMm.matched})`);
 
   // (h) Apollo missing/disabled → no crash, falls back to Firecrawl/GitHub
   delete process.env.APOLLO_API_KEY;
@@ -1402,8 +1603,8 @@ async function main() {
     fallbackScout = await runScout({ needId: fallbackNeed.id, pipelineRunId: fallbackRunId });
   } catch (e) { fallbackErr = e; }
   assert(!fallbackErr, `Apollo missing does not crash runScout (err=${fallbackErr && fallbackErr.message})`);
-  assert(fallbackScout && fallbackScout.acceptedCandidates >= 1,
-    `Pipeline continues with Firecrawl when Apollo missing (accepted=${fallbackScout && fallbackScout.acceptedCandidates})`);
+  assert(fallbackScout && fallbackScout.acceptedCandidates === 0 && fallbackScout.needsScoutReview >= 1,
+    `Pipeline preserves Firecrawl-only fallback candidates for review when Apollo missing (accepted=${fallbackScout && fallbackScout.acceptedCandidates}, review=${fallbackScout && fallbackScout.needsScoutReview})`);
   assert(fallbackScout && fallbackScout.rawResultsBySource.apollo === 0,
     `rawResultsBySource.apollo === 0 when Apollo missing (got ${fallbackScout && fallbackScout.rawResultsBySource.apollo})`);
 
@@ -2535,12 +2736,14 @@ async function main() {
     locationType: 'Remote',
     confirmed: true,
   });
-  const fcProfileScout = await runScout({ needId: fcProfileNeed.id, pipelineRunId: 'fc_profile_' + Date.now().toString(36) });
+  const fcProfileRunId = 'fc_profile_' + Date.now().toString(36);
+  const fcProfileScout = await runScout({ needId: fcProfileNeed.id, pipelineRunId: fcProfileRunId });
   assert(FIRECRAWL_QUERIES[0] && FIRECRAWL_QUERIES[0].includes('site:linkedin.com/in/'),
     `runScout uses LinkedIn-profile Firecrawl query first (got "${FIRECRAWL_QUERIES[0]}")`);
-  assert(fcProfileScout.acceptedBySource.firecrawl === 1,
-    `Profile-targeted Firecrawl LinkedIn result accepted (got ${fcProfileScout.acceptedBySource.firecrawl})`);
-  const fcProfileCand = fcProfileScout.candidates.find(c => (c.linkedinUrl || '').includes('profile-person'));
+  assert((fcProfileScout.acceptedBySource.firecrawl || 0) === 0 &&
+    fcProfileScout.reviewBySource.firecrawl === 1,
+    `Profile-targeted Firecrawl LinkedIn result held for review until structural resolution (accepted=${fcProfileScout.acceptedBySource.firecrawl}, review=${fcProfileScout.reviewBySource.firecrawl})`);
+  const fcProfileCand = DB.candidates.find(c => c.pipelineRunId === fcProfileRunId && (c.linkedinUrl || '').includes('profile-person'));
   assert(fcProfileCand && fcProfileCand.scoutScore >= 30 && fcProfileCand.scoutSourceLabel,
     `Firecrawl candidate carries score/source diagnostics`);
 
@@ -4056,6 +4259,23 @@ async function main() {
     locationType: 'Remote',
     confirmed: true,
   });
+  const remoteUsQualityNeed = createNeed({
+    companyId: coApollo.id,
+    title: 'SOC Analyst',
+    requiredSkills: ['Microsoft Sentinel', 'KQL', 'SIEM'],
+    seniority: 'Mid',
+    locationType: 'Remote',
+    location: 'Remote US',
+    confirmed: true,
+  });
+  const softwareRemoteNeed = createNeed({
+    companyId: coApollo.id,
+    title: 'Software Engineer',
+    requiredSkills: ['React', 'Node.js'],
+    seniority: 'Mid',
+    locationType: 'Remote',
+    confirmed: true,
+  });
   const detectionNeed = createNeed({
     companyId: coApollo.id,
     title: 'Detection Engineer',
@@ -4214,9 +4434,24 @@ async function main() {
   assert(isFirecrawlOnlyUnresolved(ghFirecrawlDetection, detectionNeed) === true,
     'Firecrawl-only unresolved is identified independently of role type');
   applySourcingQualityGate(ghFirecrawlDetection, detectionNeed);
-  assert(ghFirecrawlDetection.visibility_state === VISIBILITY_STATE.VISIBLE &&
-    ghFirecrawlDetection.reason_code !== 'FIRECRAWL_ONLY_UNRESOLVED_LOCAL_HYBRID',
-    `Remote Detection/SIEM GitHub evidence remains allowed (state=${ghFirecrawlDetection.visibility_state}, reason=${ghFirecrawlDetection.reason_code})`);
+  assert(ghFirecrawlDetection.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW &&
+    ghFirecrawlDetection.reason_code === 'FIRECRAWL_ONLY_UNRESOLVED_LOCAL_HYBRID' &&
+    isClientReadyForNeed(ghFirecrawlDetection, detectionNeed) === false,
+    `Remote/no-location Firecrawl-only unresolved candidate becomes NEEDS_REVIEW (state=${ghFirecrawlDetection.visibility_state}, reason=${ghFirecrawlDetection.reason_code})`);
+
+  const ghFirecrawlRemoteUs = mkGithubVerifiedFirecrawlOnly('GH Firecrawl Remote US');
+  applySourcingQualityGate(ghFirecrawlRemoteUs, remoteUsQualityNeed);
+  assert(ghFirecrawlRemoteUs.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW &&
+    ghFirecrawlRemoteUs.reason_code === 'FIRECRAWL_ONLY_UNRESOLVED_LOCAL_HYBRID' &&
+    isClientReadyForNeed(ghFirecrawlRemoteUs, remoteUsQualityNeed) === false,
+    `Remote US Firecrawl-only unresolved candidate becomes NEEDS_REVIEW (state=${ghFirecrawlRemoteUs.visibility_state}, reason=${ghFirecrawlRemoteUs.reason_code})`);
+
+  const ghFirecrawlSoftwareRemote = mkGithubVerifiedFirecrawlOnly('GH Firecrawl Software Remote');
+  applySourcingQualityGate(ghFirecrawlSoftwareRemote, softwareRemoteNeed);
+  assert(ghFirecrawlSoftwareRemote.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW &&
+    ghFirecrawlSoftwareRemote.reason_code === 'FIRECRAWL_ONLY_UNRESOLVED_LOCAL_HYBRID' &&
+    isClientReadyForNeed(ghFirecrawlSoftwareRemote, softwareRemoteNeed) === false,
+    `Non-security remote Firecrawl-only unresolved candidate becomes NEEDS_REVIEW despite GATE_NOT_APPLICABLE path (state=${ghFirecrawlSoftwareRemote.visibility_state}, reason=${ghFirecrawlSoftwareRemote.reason_code})`);
 
   const ghFirecrawlSoc = mkGithubVerifiedFirecrawlOnly('GH Firecrawl SOC');
   applySourcingQualityGate(ghFirecrawlSoc, michiganHybridNeed);
@@ -4267,6 +4502,24 @@ async function main() {
   assert(apolloTexasVisible.visibility_state === VISIBILITY_STATE.VISIBLE &&
     isClientReadyForNeed(apolloTexasVisible, texasHybridNeed) === true,
     `Apollo-resolved Texas candidate is client-ready for Texas hybrid (state=${apolloTexasVisible.visibility_state})`);
+
+  const pdlResolvedRemote = gateCandidate({
+    name: 'PDL Resolved Remote Visible',
+    title: 'SOC Analyst',
+    currentTitle: 'SOC Analyst',
+    currentCompany: 'SecurityCo',
+    skills: ['Microsoft Sentinel', 'KQL', 'SIEM'],
+    source: 'Firecrawl',
+    sourceType: 'candidate_profile',
+    provider_of_record: 'firecrawl',
+    discovered_by: ['firecrawl'],
+    resolved_by: ['pdl'],
+    resolution_status: 'resolved',
+    workHistory: [work('SOC Analyst', 24)],
+  }, qualityNeed);
+  assert(pdlResolvedRemote.visibility_state === VISIBILITY_STATE.VISIBLE &&
+    isClientReadyForNeed(pdlResolvedRemote, qualityNeed) === true,
+    `PDL-resolved Firecrawl-discovered remote candidate remains VISIBLE (state=${pdlResolvedRemote.visibility_state}, reason=${pdlResolvedRemote.reason_code})`);
 
   const liveGateRun = 'live_firecrawl_gate_' + Date.now().toString(36);
   const liveNeed = createNeed({
@@ -4558,6 +4811,121 @@ async function main() {
   else process.env.FIRECRAWL_API_KEY = prevFirecrawlKey;
   STUB_FIRECRAWL_ITEMS = null;
   STUB_GH_SEARCH_USERS = null;
+
+  // ── G1. Skill synonym matching + must-have weighting (Group 1) ─────────
+  // Synonyms are explicit alias GROUPS from config/skill-synonyms.json, never
+  // substring matching. mustHaveSkills weights 2:1 inside the 35% skill
+  // component only; absent mustHaveSkills must reproduce legacy scores exactly.
+  {
+    const g1Co = findOrCreateCompany({ name: 'G1 Synonym Co' });
+    const g1RunId = 'g1_syn_' + Date.now().toString(36);
+    const mkG1Cand = (name, skills) => findOrCreateCandidate({
+      name, title: 'Security Engineer', skills,
+      linkedinUrl: `https://www.linkedin.com/in/${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
+      source: 'Manual', scoutDecision: 'accepted', pipelineRunId: g1RunId,
+    });
+
+    // (a) Deterministic groups via test hook — alias matches, unrelated does not.
+    __setSkillSynonymGroupsForTest([['Microsoft Sentinel', 'Sentinel'], ['Amazon Web Services', 'AWS']]);
+    const g1NeedA = createNeed({
+      companyId: g1Co.id, title: 'G1 Role A',
+      requiredSkills: ['Sentinel', 'AWS', 'Terraform'], seniority: 'Mid', locationType: 'Remote', confirmed: true,
+    });
+    const aliasCand = mkG1Cand('G1 Alias Cand', ['Microsoft Sentinel', 'Amazon Web Services', 'Python']);
+    const rA = scoreCandidateAgainstNeed(aliasCand, g1NeedA, g1RunId);
+    assert(rA.matchedSkills.length === 2 && rA.matchedSkills.includes('Sentinel') && rA.matchedSkills.includes('AWS'),
+      `G1(a): alias-group skills match required aliases (matched=${JSON.stringify(rA.matchedSkills)})`);
+    assert(rA.missingSkills.length === 1 && rA.missingSkills[0] === 'Terraform',
+      `G1(a): non-alias skill still missing (missing=${JSON.stringify(rA.missingSkills)})`);
+
+    // (b) Alias groups are NOT substrings: "Azure" never matches "Azure Active Directory".
+    __setSkillSynonymGroupsForTest([['Microsoft Azure', 'Azure'], ['Azure Active Directory', 'Azure AD']]);
+    const g1NeedB = createNeed({
+      companyId: g1Co.id, title: 'G1 Role B',
+      requiredSkills: ['Azure'], seniority: 'Mid', locationType: 'Remote', confirmed: true,
+    });
+    const aadOnlyCand = mkG1Cand('G1 AAD Only', ['Azure Active Directory']);
+    const rB = scoreCandidateAgainstNeed(aadOnlyCand, g1NeedB, g1RunId);
+    assert(rB.matchedSkills.length === 0 && rB.missingSkills.length === 1,
+      `G1(b): "Azure Active Directory" does NOT match required "Azure" via synonyms (matched=${JSON.stringify(rB.matchedSkills)})`);
+
+    // (c) Backward compat: with synonyms DISABLED and no mustHaveSkills, the
+    //     legacy formula is reproduced exactly. Manual candidate, Remote need:
+    //     skills 2/3 → (2/3*100)*0.35 = 23.33; sen Mid none in title → 50*0.2=10;
+    //     Remote → 15; avail default 50*0.15=7.5; validation default 20*0.15=3.
+    //     total = round(23.33+10+15+7.5+3) = 59.
+    __setSkillSynonymGroupsForTest([]);
+    const g1NeedC = createNeed({
+      companyId: g1Co.id, title: 'G1 Role C',
+      requiredSkills: ['Azure', 'Sentinel', 'KQL'], seniority: 'Mid', locationType: 'Remote', confirmed: true,
+    });
+    const legacyCand = mkG1Cand('G1 Legacy Cand', ['Azure', 'Sentinel']);
+    const rC = scoreCandidateAgainstNeed(legacyCand, g1NeedC, g1RunId);
+    assert(rC.score === 59,
+      `G1(c): legacy formula reproduced exactly with synonyms off + no mustHaveSkills (expected 59, got ${rC.score})`);
+
+    // (c2) Same candidate/need with synonyms ENABLED but no aliases involved →
+    //      byte-identical score (synonyms are inert unless an alias applies).
+    __resetSkillSynonymGroups();
+    const rC2 = scoreCandidateAgainstNeed(legacyCand, g1NeedC, g1RunId);
+    assert(rC2.score === rC.score,
+      `G1(c2): shipped synonym config does not change non-alias scores (${rC.score} vs ${rC2.score})`);
+
+    // (d) Must-have weighting: same skills, mustHaveSkills changes ONLY the
+    //     skill component. required=[Azure(must), Sentinel, KQL], candidate has
+    //     Azure+Sentinel → weights: Azure 2, others 1 → matchedWeight 3 / total 4
+    //     → 75*0.35=26.25 vs legacy 23.33. Total = round(26.25+10+15+7.5+3)=62.
+    const g1NeedD = createNeed({
+      companyId: g1Co.id, title: 'G1 Role D',
+      requiredSkills: ['Azure', 'Sentinel', 'KQL'], mustHaveSkills: ['Azure'],
+      seniority: 'Mid', locationType: 'Remote', confirmed: true,
+    });
+    __setSkillSynonymGroupsForTest([]);
+    const rD = scoreCandidateAgainstNeed(legacyCand, g1NeedD, g1RunId);
+    assert(rD.score === 62,
+      `G1(d): must-have hit weighted 2:1 inside skill component (expected 62, got ${rD.score})`);
+
+    //     Missing the must-have cuts harder: candidate has Sentinel+KQL but NOT
+    //     Azure(must) → matchedWeight 2 / total 4 → 50*0.35=17.5 → total 53
+    //     (legacy equal-weight would be 66.67*0.35=23.33 → 59). Issue text names it.
+    const noMustCand = mkG1Cand('G1 NoMust Cand', ['Sentinel', 'KQL']);
+    const rD2 = scoreCandidateAgainstNeed(noMustCand, g1NeedD, g1RunId);
+    assert(rD2.score === 53,
+      `G1(d2): missing must-have scores lower than legacy equal weighting (expected 53, got ${rD2.score})`);
+    assert(/Missing MUST-HAVE skills: Azure/.test(rD2.reviewReason || rD2.dropReason || ''),
+      `G1(d2): missing must-have named in review/drop reason (got "${rD2.reviewReason || rD2.dropReason}")`);
+
+    // (e) Display buckets use the SAME alias resolution as scoring, and a
+    //     manual remove of one alias applies to its whole synonym group.
+    __setSkillSynonymGroupsForTest([['Microsoft Sentinel', 'Sentinel']]);
+    const g1NeedE = createNeed({
+      companyId: g1Co.id, title: 'G1 Role E',
+      requiredSkills: ['Sentinel', 'KQL'], seniority: 'Mid', locationType: 'Remote', confirmed: true,
+    });
+    const dispCand = mkG1Cand('G1 Display Cand', ['Microsoft Sentinel']);
+    const rE = scoreCandidateAgainstNeed(dispCand, g1NeedE, g1RunId);
+    const bucketsE = displaySkillBucketsForMatch(dispCand, rE, g1NeedE);
+    assert(bucketsE.matchedSkills.some(s => resolveSkillKey(s) === resolveSkillKey('Sentinel')) &&
+      bucketsE.missingSkills.length === 1,
+      `G1(e): display buckets agree with alias-aware scoring (matched=${JSON.stringify(bucketsE.matchedSkills)})`);
+    applyManualSkillEdit(dispCand, { action: 'remove', skill: 'Microsoft Sentinel' });
+    const bucketsE2 = displaySkillBucketsForMatch(dispCand, rE, g1NeedE);
+    assert(!bucketsE2.matchedSkills.some(s => resolveSkillKey(s) === resolveSkillKey('Sentinel')) &&
+      bucketsE2.missingSkills.some(s => resolveSkillKey(s) === resolveSkillKey('Sentinel')),
+      `G1(e2): manual remove of an alias removes the whole synonym group from matched (matched=${JSON.stringify(bucketsE2.matchedSkills)})`);
+    //     ...and the stored match/score are untouched by the manual edit.
+    assert(rE.matchedSkills.length === 1 && rE.score === scoreCandidateAgainstNeed({ ...dispCand, manualSkillEdits: undefined }, g1NeedE, g1RunId).score,
+      `G1(e3): manual skill edits remain display-only (score/matched unchanged)`);
+
+    // (f) Shipped config sanity: a real group resolves, unrelated keys do not.
+    __resetSkillSynonymGroups();
+    assert(resolveSkillKey('Azure Sentinel') === resolveSkillKey('Microsoft Sentinel'),
+      `G1(f): shipped config groups "Azure Sentinel" with "Microsoft Sentinel"`);
+    assert(resolveSkillKey('Azure') !== resolveSkillKey('Azure Active Directory'),
+      `G1(f2): shipped config keeps "Azure" and "Azure Active Directory" separate`);
+
+    __resetSkillSynonymGroups();
+  }
 
   // ── 17. Sample-run proof: pipeline-style log of one scout pass ──
   console.log('\n── Sample mock run proving non-candidate pages are rejected ──');

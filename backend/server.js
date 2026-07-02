@@ -259,7 +259,8 @@ function providerDiagnostics() {
    ════════════════════════════════════════════════════════════════════ */
 const COLLECTIONS = [
   'companies', 'hiring_managers', 'hiring_needs', 'candidates',
-  'candidate_validations', 'matches', 'outreach', 'client_reports', 'activity_logs',
+  'candidate_validations', 'matches', 'outreach', 'client_reports',
+  'candidate_outcomes', 'agent_learning_summaries', 'activity_logs',
 ];
 function emptyDB() { return Object.fromEntries(COLLECTIONS.map(c => [c, []])); }
 
@@ -306,6 +307,215 @@ async function logActivity(agent, message, status = 'info', meta = null) {
   if (DB.activity_logs.length > 500) DB.activity_logs.length = 500;
   await persistDB();
   return entry;
+}
+
+const CLIENT_VERDICTS = new Set(['accepted', 'rejected', 'interview', 'offer', 'hired', 'declined', 'no_response']);
+const FINAL_OUTCOMES = new Set(['hired', 'rejected', 'declined', 'no_show', 'still_in_process', 'unknown']);
+const OUTCOME_PATCH_FIELDS = [
+  'clientVerdict', 'clientReason', 'finalOutcome', 'outcomeDate',
+  'feedbackFromClient', 'feedbackFromCandidate', 'hiredDate',
+];
+
+function normalizeNullableEnum(value, allowed, field) {
+  if (value === undefined) return undefined;
+  if (value === null || value === '') return null;
+  const clean = String(value).trim().toLowerCase();
+  if (!allowed.has(clean)) {
+    const err = new Error(`${field} must be one of: ${Array.from(allowed).join(', ')}`);
+    err.status = 400;
+    throw err;
+  }
+  return clean;
+}
+
+function candidateSourceLabel(c = {}) {
+  const providers = Array.isArray(c.providersFound) ? c.providersFound.filter(Boolean) : [];
+  const discovered = Array.isArray(c.discovered_by) ? c.discovered_by.filter(Boolean) : [];
+  return c.provider_of_record || providers[0] || discovered[0] || c.source || c.sourceChannel || '';
+}
+
+function snapshotOutcomeFields({ candidate = null, match = null, pipelineRunId = null } = {}) {
+  const runId = pipelineRunId || match?.pipelineRunId || candidate?.pipelineRunId || null;
+  const validation = candidate ? latestValidation(candidate.id, runId) || latestValidation(candidate.id) : null;
+  return {
+    pipelineRunId: runId,
+    sourcedBy: candidateSourceLabel(candidate || {}),
+    validatorVerdict: validation?.tier || '',
+    validatorReason: validation?.evidenceNotes || '',
+    matchScore: Number.isFinite(Number(match?.score)) ? Number(match.score) : null,
+    matchTier: match?.tier || '',
+  };
+}
+
+function duplicateCandidateOutcome(candidateId, needId, pipelineRunId, ignoreId = null) {
+  if (!pipelineRunId) return null;
+  return (DB.candidate_outcomes || []).find(o =>
+    o.id !== ignoreId &&
+    o.candidateId === candidateId &&
+    o.needId === needId &&
+    o.pipelineRunId === pipelineRunId
+  ) || null;
+}
+
+function createCandidateOutcome(input = {}) {
+  const candidateId = String(input.candidateId || '').trim();
+  const needId = String(input.needId || '').trim();
+  if (!candidateId) {
+    const err = new Error('candidateId required');
+    err.status = 400;
+    throw err;
+  }
+  if (!needId) {
+    const err = new Error('needId required');
+    err.status = 400;
+    throw err;
+  }
+
+  const match = input.matchId ? DB.matches.find(m => m.id === input.matchId) : null;
+  const candidate = DB.candidates.find(c => c.id === candidateId) || (match ? DB.candidates.find(c => c.id === match.candidateId) : null);
+  const snapshot = snapshotOutcomeFields({
+    candidate,
+    match,
+    pipelineRunId: input.pipelineRunId || match?.pipelineRunId || null,
+  });
+  const pipelineRunId = input.pipelineRunId || snapshot.pipelineRunId || null;
+  if (duplicateCandidateOutcome(candidateId, needId, pipelineRunId)) {
+    const err = new Error('duplicate outcome for candidateId + needId + pipelineRunId');
+    err.status = 409;
+    throw err;
+  }
+
+  const at = now();
+  const outcome = {
+    id: uid(),
+    candidateId,
+    needId,
+    matchId: input.matchId || match?.id || '',
+    pipelineRunId,
+    sourcedBy: input.sourcedBy || snapshot.sourcedBy || '',
+    validatorVerdict: input.validatorVerdict || snapshot.validatorVerdict || '',
+    validatorReason: input.validatorReason || snapshot.validatorReason || '',
+    matchScore: input.matchScore !== undefined ? Number(input.matchScore) : snapshot.matchScore,
+    matchTier: input.matchTier || snapshot.matchTier || '',
+    clientVerdict: normalizeNullableEnum(input.clientVerdict, CLIENT_VERDICTS, 'clientVerdict') ?? null,
+    clientReason: input.clientReason || '',
+    finalOutcome: normalizeNullableEnum(input.finalOutcome, FINAL_OUTCOMES, 'finalOutcome') ?? null,
+    outcomeDate: input.outcomeDate || at,
+    feedbackFromClient: input.feedbackFromClient || '',
+    feedbackFromCandidate: input.feedbackFromCandidate || '',
+    hiredDate: input.hiredDate || '',
+    createdAt: at,
+    updatedAt: at,
+  };
+  if (!Number.isFinite(outcome.matchScore)) outcome.matchScore = null;
+  DB.candidate_outcomes.push(outcome);
+  return outcome;
+}
+
+function patchCandidateOutcome(outcome, input = {}) {
+  if (!outcome) return null;
+  const candidateId = outcome.candidateId;
+  for (const k of OUTCOME_PATCH_FIELDS) {
+    if (!(k in input)) continue;
+    if (k === 'clientVerdict') outcome[k] = normalizeNullableEnum(input[k], CLIENT_VERDICTS, k);
+    else if (k === 'finalOutcome') outcome[k] = normalizeNullableEnum(input[k], FINAL_OUTCOMES, k);
+    else outcome[k] = input[k];
+  }
+  outcome.candidateId = candidateId;
+  outcome.updatedAt = now();
+  return outcome;
+}
+
+function textList(items, limit = 5) {
+  return (items || []).filter(Boolean).slice(0, limit).join('; ');
+}
+
+function countBy(items, keyFn) {
+  const counts = {};
+  for (const item of items || []) {
+    const key = keyFn(item) || 'unknown';
+    counts[key] = (counts[key] || 0) + 1;
+  }
+  return counts;
+}
+
+function buildDailyLearningSummary(input = {}) {
+  const date = input.date || new Date().toISOString().slice(0, 10);
+  const windowStart = input.windowStart || `${date}T00:00:00.000Z`;
+  const windowEnd = input.windowEnd || `${date}T23:59:59.999Z`;
+  const startMs = Date.parse(windowStart);
+  const endMs = Date.parse(windowEnd);
+  const inWindow = (o) => {
+    const t = Date.parse(o.outcomeDate || o.updatedAt || o.createdAt || '');
+    if (!Number.isFinite(t)) return true;
+    if (Number.isFinite(startMs) && t < startMs) return false;
+    if (Number.isFinite(endMs) && t > endMs) return false;
+    return true;
+  };
+  const outcomes = (DB.candidate_outcomes || []).filter(inWindow);
+  const highScoreRejected = outcomes.filter(o => Number(o.matchScore) >= 70 && (o.clientVerdict === 'rejected' || o.finalOutcome === 'rejected'));
+  const lowScoreAccepted = outcomes.filter(o =>
+    Number(o.matchScore) < 60 &&
+    (['accepted', 'interview', 'offer', 'hired'].includes(o.clientVerdict || '') || o.finalOutcome === 'hired')
+  );
+  const hired = outcomes.filter(o => o.clientVerdict === 'hired' || o.finalOutcome === 'hired');
+  const rejected = outcomes.filter(o => o.clientVerdict === 'rejected' || o.finalOutcome === 'rejected');
+  const clientReasons = countBy(rejected, o => String(o.clientReason || o.feedbackFromClient || '').trim().toLowerCase());
+
+  const providerSignals = Object.entries(countBy(outcomes, o => o.sourcedBy || 'unknown')).map(([provider, total]) => {
+    const providerOutcomes = outcomes.filter(o => (o.sourcedBy || 'unknown') === provider);
+    const providerRejected = providerOutcomes.filter(o => o.clientVerdict === 'rejected' || o.finalOutcome === 'rejected').length;
+    const providerHired = providerOutcomes.filter(o => o.clientVerdict === 'hired' || o.finalOutcome === 'hired').length;
+    return { provider, total, rejected: providerRejected, hired: providerHired };
+  });
+  const validatorSignals = Object.entries(countBy(outcomes, o => o.validatorVerdict || 'unknown')).map(([verdict, total]) => {
+    const verdictOutcomes = outcomes.filter(o => (o.validatorVerdict || 'unknown') === verdict);
+    return {
+      verdict,
+      total,
+      rejected: verdictOutcomes.filter(o => o.clientVerdict === 'rejected' || o.finalOutcome === 'rejected').length,
+      acceptedOrHired: verdictOutcomes.filter(o => ['accepted', 'interview', 'offer', 'hired'].includes(o.clientVerdict || '') || o.finalOutcome === 'hired').length,
+    };
+  });
+  const scoringSignals = {
+    highScoreRejected: highScoreRejected.map(o => ({ candidateId: o.candidateId, needId: o.needId, matchScore: o.matchScore, reason: o.clientReason || o.feedbackFromClient || '' })),
+    lowScoreAccepted: lowScoreAccepted.map(o => ({ candidateId: o.candidateId, needId: o.needId, matchScore: o.matchScore, verdict: o.clientVerdict, finalOutcome: o.finalOutcome })),
+  };
+  const suggestedRuleAdjustments = [];
+  if (highScoreRejected.length) suggestedRuleAdjustments.push('Review high-score client rejections before changing scoring weights.');
+  if (lowScoreAccepted.length) suggestedRuleAdjustments.push('Review lower-score accepted or hired candidates for positive signals missing from scoring.');
+  for (const [reason, count] of Object.entries(clientReasons)) {
+    if (reason && reason !== 'unknown' && count >= 2) suggestedRuleAdjustments.push(`Client rejection reason repeated ${count}x: ${reason}`);
+  }
+  if (!suggestedRuleAdjustments.length) suggestedRuleAdjustments.push('No rule changes recommended yet; continue collecting outcomes.');
+
+  const summaryText = outcomes.length
+    ? [
+        `Reviewed ${outcomes.length} candidate outcome${outcomes.length === 1 ? '' : 's'} for ${date}.`,
+        `${hired.length} hired, ${rejected.length} rejected.`,
+        highScoreRejected.length ? `${highScoreRejected.length} high-score rejection signal${highScoreRejected.length === 1 ? '' : 's'} found.` : '',
+        lowScoreAccepted.length ? `${lowScoreAccepted.length} lower-score acceptance/hire signal${lowScoreAccepted.length === 1 ? '' : 's'} found.` : '',
+        textList(suggestedRuleAdjustments, 3),
+      ].filter(Boolean).join(' ')
+    : `Not enough data yet for ${date}; no candidate outcomes were available in the selected window.`;
+
+  return {
+    id: uid(),
+    date,
+    windowStart,
+    windowEnd,
+    totalOutcomesReviewed: outcomes.length,
+    highScoreRejectedCount: highScoreRejected.length,
+    lowScoreAcceptedCount: lowScoreAccepted.length,
+    hiredCount: hired.length,
+    rejectedCount: rejected.length,
+    providerSignals,
+    validatorSignals,
+    scoringSignals,
+    suggestedRuleAdjustments,
+    summary: summaryText,
+    createdAt: now(),
+  };
 }
 
 const norm = {
@@ -375,6 +585,43 @@ function normalizeSkillKey(skill = '') {
   return String(skill || '').toLowerCase().replace(/[^a-z0-9+#]/g, '');
 }
 
+// ── Skill synonym resolution (config/skill-synonyms.json) ──────────────
+// Alias GROUPS only — matching is by explicit group membership, never
+// substring ("Azure" must still NOT match "Azure Active Directory" unless
+// both are listed in the same group; they are not). Every alias in a group
+// resolves to one canonical key, so scoring's matched/missing computation,
+// display buckets, and manual-edit dedupe all agree. Missing/malformed
+// config = empty map = exact matching only (today's behavior).
+function buildSkillSynonymResolver(groups = []) {
+  const map = new Map();
+  for (const group of Array.isArray(groups) ? groups : []) {
+    if (!Array.isArray(group) || group.length < 2) continue;
+    const canonical = normalizeSkillKey(group[0]);
+    if (!canonical) continue;
+    for (const alias of group) {
+      const key = normalizeSkillKey(alias);
+      if (key && !map.has(key)) map.set(key, canonical);
+    }
+  }
+  return map;
+}
+const SKILL_SYNONYMS_CONFIG = loadJsonConfig('skill-synonyms.json', { version: 0, groups: [] });
+let SKILL_SYNONYM_MAP = buildSkillSynonymResolver(SKILL_SYNONYMS_CONFIG.groups);
+
+function resolveSkillKey(skill = '') {
+  const key = normalizeSkillKey(skill);
+  return SKILL_SYNONYM_MAP.get(key) || key;
+}
+
+// TEST-ONLY hook: lets tests install deterministic synonym groups (or [] to
+// disable synonyms) without touching the shipped config file.
+function __setSkillSynonymGroupsForTest(groups = []) {
+  SKILL_SYNONYM_MAP = buildSkillSynonymResolver(groups);
+}
+function __resetSkillSynonymGroups() {
+  SKILL_SYNONYM_MAP = buildSkillSynonymResolver(SKILL_SYNONYMS_CONFIG.groups);
+}
+
 function mergeCandidateSkillEvidence(c, skills = [], source = '') {
   if (!c) return c;
   const provider = normalizeProviderKey(source || c.provider_of_record || c.source || 'unknown') || 'unknown';
@@ -421,10 +668,12 @@ function normalizeManualSkillEdits(c) {
 function applyManualSkillEdit(c, { action, skill }) {
   if (!c) return null;
   const cleanSkill = String(skill || '').trim();
-  const skillKey = normalizeSkillKey(cleanSkill);
+  // resolveSkillKey: an add/remove of any alias supersedes prior edits of the
+  // same synonym group, so the buckets can never hold contradictory aliases.
+  const skillKey = resolveSkillKey(cleanSkill);
   if (!skillKey) return null;
   const edits = normalizeManualSkillEdits(c);
-  const removeKey = list => list.filter(s => normalizeSkillKey(s) !== skillKey);
+  const removeKey = list => list.filter(s => resolveSkillKey(s) !== skillKey);
   const entry = {
     skill: cleanSkill,
     action,
@@ -433,10 +682,10 @@ function applyManualSkillEdit(c, { action, skill }) {
   };
   if (action === 'add') {
     edits.removed = removeKey(edits.removed);
-    if (!edits.added.some(s => normalizeSkillKey(s) === skillKey)) edits.added.push(cleanSkill);
+    if (!edits.added.some(s => resolveSkillKey(s) === skillKey)) edits.added.push(cleanSkill);
   } else if (action === 'remove') {
     edits.added = removeKey(edits.added);
-    if (!edits.removed.some(s => normalizeSkillKey(s) === skillKey)) edits.removed.push(cleanSkill);
+    if (!edits.removed.some(s => resolveSkillKey(s) === skillKey)) edits.removed.push(cleanSkill);
   } else {
     return null;
   }
@@ -448,9 +697,12 @@ function applyManualSkillEdit(c, { action, skill }) {
 }
 
 function displaySkillBucketsForMatch(candidate = {}, match = {}, need = {}) {
+  // Uses resolveSkillKey (same alias resolution as scoring) so the displayed
+  // matched/missing buckets always agree with the scoring buckets, and a
+  // manual add/remove of any alias applies to its whole synonym group.
   const edits = normalizeManualSkillEdits(candidate);
-  const addedKeys = new Set(edits.added.map(normalizeSkillKey));
-  const removedKeys = new Set(edits.removed.map(normalizeSkillKey));
+  const addedKeys = new Set(edits.added.map(resolveSkillKey));
+  const removedKeys = new Set(edits.removed.map(resolveSkillKey));
   const required = Array.isArray(need.requiredSkills) ? need.requiredSkills : [];
   const baseMatched = Array.isArray(match.matchedSkills) ? match.matchedSkills : [];
   const baseMissing = Array.isArray(match.missingSkills) ? match.missingSkills : [];
@@ -458,32 +710,32 @@ function displaySkillBucketsForMatch(candidate = {}, match = {}, need = {}) {
   const missing = [];
 
   const pushUnique = (list, skill) => {
-    const key = normalizeSkillKey(skill);
-    if (!key || list.some(s => normalizeSkillKey(s) === key)) return;
+    const key = resolveSkillKey(skill);
+    if (!key || list.some(s => resolveSkillKey(s) === key)) return;
     list.push(skill);
   };
 
   if (required.length) {
     for (const skill of required) {
-      const key = normalizeSkillKey(skill);
+      const key = resolveSkillKey(skill);
       if (removedKeys.has(key)) pushUnique(missing, skill);
-      else if (addedKeys.has(key) || baseMatched.some(s => normalizeSkillKey(s) === key)) pushUnique(matched, skill);
+      else if (addedKeys.has(key) || baseMatched.some(s => resolveSkillKey(s) === key)) pushUnique(matched, skill);
       else pushUnique(missing, skill);
     }
   } else {
     for (const skill of baseMatched) {
-      const key = normalizeSkillKey(skill);
+      const key = resolveSkillKey(skill);
       if (!removedKeys.has(key)) pushUnique(matched, skill);
     }
   }
 
   for (const skill of baseMissing) {
-    const key = normalizeSkillKey(skill);
-    if (!addedKeys.has(key) && !removedKeys.has(key) && !matched.some(s => normalizeSkillKey(s) === key)) pushUnique(missing, skill);
+    const key = resolveSkillKey(skill);
+    if (!addedKeys.has(key) && !removedKeys.has(key) && !matched.some(s => resolveSkillKey(s) === key)) pushUnique(missing, skill);
   }
   for (const skill of edits.added) {
-    const key = normalizeSkillKey(skill);
-    if (required.length && !required.some(s => normalizeSkillKey(s) === key)) continue;
+    const key = resolveSkillKey(skill);
+    if (required.length && !required.some(s => resolveSkillKey(s) === key)) continue;
     if (!removedKeys.has(key)) pushUnique(matched, skill);
   }
 
@@ -1331,10 +1583,11 @@ function evaluateSourcingQuality(c = {}, need = {}) {
   const structurallyResolved = hasStructuralResolver(c);
   const signals = result.signals_snapshot || sourcingSignalsSnapshot(c, need);
 
+  if (!structurallyResolved && isFirecrawlOnlyUnresolved(c, need)) {
+    return reviewGateResult(result, c, 'FIRECRAWL_ONLY_UNRESOLVED_LOCAL_HYBRID');
+  }
+
   if (localHybridGateApplies && !structurallyResolved) {
-    if (isFirecrawlOnlyUnresolved(c, need)) {
-      return reviewGateResult(result, c, 'FIRECRAWL_ONLY_UNRESOLVED_LOCAL_HYBRID');
-    }
     if (isApolloUnresolvedCandidate(c)) {
       return reviewGateResult(result, c, apolloUnresolvedReason(c));
     }
@@ -1505,6 +1758,9 @@ function createNeed(input) {
     title: input.title || '',
     description: input.description || '',
     requiredSkills: Array.isArray(input.requiredSkills) ? input.requiredSkills : [],
+    // Optional subset of requiredSkills weighted 2:1 inside the skill score
+    // component. Empty = all required skills weigh equally (legacy behavior).
+    mustHaveSkills: Array.isArray(input.mustHaveSkills) ? input.mustHaveSkills : [],
     tools: Array.isArray(input.tools) ? input.tools : [],
     seniority: input.seniority || 'Mid',
     locationType: input.locationType || 'Remote',
@@ -3398,6 +3654,7 @@ function isFinalShortlistEligible(c) {
 
 function isClientReadyForNeed(c, need = {}) {
   if (!isFinalShortlistEligible(c)) return false;
+  if (isFirecrawlOnlyUnresolved(c, need)) return false;
   const market = selectedMarketFromNeed(need);
   if (market.mode !== 'concrete') return true;
   return evaluateSourcingQuality(c, need).visibility_state === VISIBILITY_STATE.VISIBLE;
@@ -4709,24 +4966,40 @@ async function runValidator({ candidateIds = null, pipelineRunId = null } = {}) 
 }
 
 function scoreCandidateAgainstNeed(c, need, pipelineRunId = null) {
-  const norm = s => (s || '').toLowerCase().replace(/[^a-z0-9+#]/g, '');
-  const cSkills = new Set((c.skills || []).map(norm));
+  // Skill comparison uses resolveSkillKey: normalizeSkillKey + curated alias
+  // groups from config/skill-synonyms.json (explicit group membership only,
+  // never substring). With no synonyms configured this is byte-identical to
+  // the previous exact-match behavior.
+  const cSkills = new Set((c.skills || []).map(resolveSkillKey));
   const req = (need.requiredSkills || []);
-  const matched = req.filter(s => cSkills.has(norm(s)));
-  const missing = req.filter(s => !cSkills.has(norm(s)));
+  const matched = req.filter(s => cSkills.has(resolveSkillKey(s)));
+  const missing = req.filter(s => !cSkills.has(resolveSkillKey(s)));
   const reasons = [];
+
+  // Must-have vs nice-to-have (optional need.mustHaveSkills, a subset of
+  // requiredSkills by intent). Must-haves weigh 2, nice-to-haves 1 INSIDE the
+  // existing 35% skill component — the 35/20/15/15/15 outer weights are
+  // unchanged. When mustHaveSkills is absent/empty every weight is 1, which
+  // reduces to exactly the previous formula.
+  const mustKeys = new Set((Array.isArray(need.mustHaveSkills) ? need.mustHaveSkills : []).map(resolveSkillKey).filter(Boolean));
+  const weightOf = s => (mustKeys.size && mustKeys.has(resolveSkillKey(s)) ? 2 : 1);
+  const totalWeight = req.reduce((a, s) => a + weightOf(s), 0);
+  const missingMustHaves = mustKeys.size ? missing.filter(s => mustKeys.has(resolveSkillKey(s))) : [];
 
   // Run-scoped: only use validation evidence from the current pipeline run.
   const v = latestValidation(c.id, pipelineRunId);
   let skillRaw = 0;
   if (req.length) {
     if (v?.proficiency && Object.keys(v.proficiency).length) {
-      const profScores = matched.map(s => {
-        const key = Object.keys(v.proficiency).find(k => norm(k) === norm(s));
-        return key ? v.proficiency[key] / 100 : 0.5;
+      const profWeighted = matched.map(s => {
+        const key = Object.keys(v.proficiency).find(k => resolveSkillKey(k) === resolveSkillKey(s));
+        return (key ? v.proficiency[key] / 100 : 0.5) * weightOf(s);
       });
-      skillRaw = profScores.length ? (profScores.reduce((a, b) => a + b, 0) / req.length) * 100 : 0;
-    } else { skillRaw = (matched.length / req.length) * 100; }
+      skillRaw = profWeighted.length ? (profWeighted.reduce((a, b) => a + b, 0) / totalWeight) * 100 : 0;
+    } else {
+      const matchedWeight = matched.reduce((a, s) => a + weightOf(s), 0);
+      skillRaw = (matchedWeight / totalWeight) * 100;
+    }
   } else { skillRaw = 50; }
   const skillScore = Math.min(skillRaw, 100) * 0.35;
   if (matched.length) reasons.push(`Matches ${matched.length}/${req.length} required skills: ${matched.join(', ')}`);
@@ -4768,6 +5041,7 @@ function scoreCandidateAgainstNeed(c, need, pipelineRunId = null) {
 
   const issues = [];
   if (req.length && matched.length === 0) issues.push('No required skill overlap');
+  if (missingMustHaves.length) issues.push(`Missing MUST-HAVE skills: ${missingMustHaves.join(', ')}`);
   if (missing.length) issues.push(`Missing required skills: ${missing.join(', ')}`);
   if (v?.tier === 'Needs Review') issues.push(c.github ? 'Partial evidence only — needs human review' : 'Missing GitHub but has profile/source data');
   if (v?.tier === 'Insufficient Data') issues.push('Insufficient public evidence');
@@ -5032,7 +5306,7 @@ function newPipelineRunId() {
   return 'run_' + Date.now().toString(36) + '_' + crypto.randomBytes(3).toString('hex');
 }
 
-async function runPipeline({ company, role, skills = [], location = '', seniority = 'Mid', expandCandidatePool = false, apolloMaxEnrichPerRun = APOLLO_MATCH_DEFAULT_MAX_PER_RUN, pdlEnrichMaxPerRun = PDL_ENRICH_DEFAULT_MAX_PER_RUN }) {
+async function runPipeline({ company, role, skills = [], mustHaveSkills = [], location = '', seniority = 'Mid', expandCandidatePool = false, apolloMaxEnrichPerRun = APOLLO_MATCH_DEFAULT_MAX_PER_RUN, pdlEnrichMaxPerRun = PDL_ENRICH_DEFAULT_MAX_PER_RUN }) {
   const pipelineRunId = newPipelineRunId();
   console.log(`[pipeline] start runId=${pipelineRunId} role="${role}" company="${company}"`);
   await logActivity('Pipeline', `Pipeline start ${pipelineRunId}: ${role} @ ${company}`, 'running', { pipelineRunId });
@@ -5070,6 +5344,7 @@ async function runPipeline({ company, role, skills = [], location = '', seniorit
   const need = createNeed({
     companyId: co.id, managerId: mgr?.id || null,
     title: role, requiredSkills: Array.isArray(skills) ? skills : [],
+    mustHaveSkills: Array.isArray(mustHaveSkills) ? mustHaveSkills : [],
     seniority, locationType: location?.toLowerCase().includes('remote') ? 'Remote' : 'Onsite',
     location, confirmed: true, urgency: 'Medium',
     pipelineRunId,
@@ -5290,6 +5565,8 @@ app.get('/api/dashboard/stats', (req, res) => {
     matches_visible: DB.matches.filter(isVisibleMatch).length,
     outreach: DB.outreach.length,
     client_reports: DB.client_reports.length,
+    candidate_outcomes: DB.candidate_outcomes.length,
+    agent_learning_summaries: DB.agent_learning_summaries.length,
     activity_logs: DB.activity_logs.length,
   });
 });
@@ -5311,6 +5588,13 @@ app.get('/api/matches', (req, res) => {
 });
 app.get('/api/outreach',         (req, res) => res.json(DB.outreach));
 app.get('/api/client-reports',   (req, res) => res.json(DB.client_reports));
+app.get('/api/candidate-outcomes', (req, res) => res.json(DB.candidate_outcomes));
+app.get('/api/candidate-outcomes/:id', (req, res) => {
+  const outcome = DB.candidate_outcomes.find(x => x.id === req.params.id);
+  if (!outcome) return res.status(404).json({ error: 'Not found' });
+  res.json(outcome);
+});
+app.get('/api/agent-learning/summaries', (req, res) => res.json(DB.agent_learning_summaries));
 app.get('/api/activity-logs',    (req, res) => res.json(DB.activity_logs.slice(0, 100)));
 
 // ── Mutation: small CRUD helpers used by the UI ──
@@ -5339,7 +5623,7 @@ app.post('/api/hiring-needs', async (req, res) => {
 app.patch('/api/hiring-needs/:id', async (req, res) => {
   const n = DB.hiring_needs.find(x => x.id === req.params.id);
   if (!n) return res.status(404).json({ error: 'Not found' });
-  const allow = ['title','description','requiredSkills','seniority','locationType','location','urgency','status','confirmed','sourceUrl'];
+  const allow = ['title','description','requiredSkills','mustHaveSkills','seniority','locationType','location','urgency','status','confirmed','sourceUrl'];
   for (const k of allow) if (k in (req.body || {})) n[k] = req.body[k];
   await persistDB();
   res.json(n);
@@ -5350,6 +5634,37 @@ app.delete('/api/hiring-needs/:id', async (req, res) => {
   DB.hiring_needs.splice(i, 1);
   await persistDB();
   res.json({ ok: true });
+});
+app.post('/api/candidate-outcomes', async (req, res) => {
+  try {
+    const outcome = createCandidateOutcome(req.body || {});
+    await persistDB();
+    await logActivity('Learning', `Candidate outcome created for candidate ${outcome.candidateId}`, 'info', {
+      candidateId: outcome.candidateId,
+      needId: outcome.needId,
+      pipelineRunId: outcome.pipelineRunId || null,
+    });
+    res.json(outcome);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message || 'Unable to create outcome' });
+  }
+});
+app.patch('/api/candidate-outcomes/:id', async (req, res) => {
+  const outcome = DB.candidate_outcomes.find(x => x.id === req.params.id);
+  if (!outcome) return res.status(404).json({ error: 'Not found' });
+  try {
+    patchCandidateOutcome(outcome, req.body || {});
+    await persistDB();
+    await logActivity('Learning', `Candidate outcome updated for candidate ${outcome.candidateId}`, 'info', {
+      outcomeId: outcome.id,
+      candidateId: outcome.candidateId,
+      needId: outcome.needId,
+      pipelineRunId: outcome.pipelineRunId || null,
+    });
+    res.json(outcome);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message || 'Unable to update outcome' });
+  }
 });
 app.patch('/api/candidates/:id/manual-skills', async (req, res) => {
   const c = DB.candidates.find(x => x.id === req.params.id);
@@ -5411,6 +5726,23 @@ app.post('/api/outreach/draft', async (req, res) => {
 app.post('/api/client-report/generate', async (req, res) => {
   try { res.json(await generateClientReport(req.body || {})); }
   catch (e) { console.error('client-report', e); res.status(500).json({ error: e.message }); }
+});
+app.post('/api/agent-learning/daily-summary', async (req, res) => {
+  try {
+    const summary = buildDailyLearningSummary(req.body || {});
+    DB.agent_learning_summaries.unshift(summary);
+    if (DB.agent_learning_summaries.length > 365) DB.agent_learning_summaries.length = 365;
+    await persistDB();
+    await logActivity('Learning', `Daily learning summary created for ${summary.date}`, 'info', {
+      summaryId: summary.id,
+      date: summary.date,
+      totalOutcomesReviewed: summary.totalOutcomesReviewed,
+    });
+    res.json(summary);
+  } catch (e) {
+    console.error('agent-learning/daily-summary', e);
+    res.status(500).json({ error: e.message || 'Unable to create learning summary' });
+  }
 });
 app.post('/api/pipeline/run', async (req, res) => {
   const { company, role } = req.body || {};
@@ -5519,6 +5851,13 @@ module.exports = {
     mergeCandidateSkillEvidence,
     applyManualSkillEdit,
     displaySkillBucketsForMatch,
+    normalizeSkillKey,
+    resolveSkillKey,
+    __setSkillSynonymGroupsForTest,
+    __resetSkillSynonymGroups,
+    createCandidateOutcome,
+    patchCandidateOutcome,
+    buildDailyLearningSummary,
     openaiParseCandidateItem,
     refineMatchScoresWithOpenAI,
     isPersonLikeSignal,

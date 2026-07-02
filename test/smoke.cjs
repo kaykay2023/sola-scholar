@@ -136,7 +136,12 @@ const SPEC = [
   ['GET',    '/api/candidates'],
   ['GET',    '/api/matches'],
   ['GET',    '/api/outreach'],
+  ['GET',    '/api/candidate-outcomes'],
+  ['GET',    '/api/candidate-outcomes/:id'],
+  ['GET',    '/api/agent-learning/summaries'],
   ['GET',    '/api/activity-logs'],
+  ['POST',   '/api/candidate-outcomes'],
+  ['PATCH',  '/api/candidate-outcomes/:id'],
   ['POST',   '/api/connector/run'],
   ['POST',   '/api/needs/detect'],
   ['POST',   '/api/scout/run'],
@@ -144,6 +149,7 @@ const SPEC = [
   ['POST',   '/api/matchmaker/run'],
   ['POST',   '/api/outreach/draft'],
   ['POST',   '/api/client-report/generate'],
+  ['POST',   '/api/agent-learning/daily-summary'],
   ['POST',   '/api/pipeline/run'],
 ];
 
@@ -163,11 +169,11 @@ else ok(`All ${SPEC.length} required routes registered`);
 console.log(`  (server registers ${registered.length} routes total, including extras)`);
 
 // 4. Collections check
-const expectedCollections = ['companies','hiring_managers','hiring_needs','candidates','candidate_validations','matches','outreach','client_reports','activity_logs'];
+const expectedCollections = ['companies','hiring_managers','hiring_needs','candidates','candidate_validations','matches','outreach','client_reports','candidate_outcomes','agent_learning_summaries','activity_logs'];
 const dbKeys = Object.keys(serverModule.DB);
 const missingCols = expectedCollections.filter(c => !dbKeys.includes(c));
 if (missingCols.length) fail(`Missing DB collections: ${missingCols.join(', ')}`);
-else ok(`All 9 collections present in DB`);
+else ok(`All ${expectedCollections.length} collections present in DB`);
 
 // 5. Secret scan
 const filesToScan = [

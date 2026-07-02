@@ -98,7 +98,8 @@ async function main() {
   const reads = [
     '/api/dashboard/stats', '/api/companies', '/api/hiring-managers',
     '/api/hiring-needs', '/api/candidates', '/api/candidate-validations',
-    '/api/matches', '/api/outreach', '/api/client-reports', '/api/activity-logs',
+    '/api/matches', '/api/outreach', '/api/client-reports',
+    '/api/candidate-outcomes', '/api/agent-learning/summaries', '/api/activity-logs',
   ];
   for (const p of reads) {
     r = await request('GET', p, { auth: goodAuth });
@@ -134,6 +135,106 @@ async function main() {
     r = await request('PATCH', '/api/hiring-needs/' + needId, { auth: goodAuth, body: { confirmed: false } });
     if (r.status !== 200 || r.data?.confirmed !== false) fail(`PATCH hiring need → ${r.status}`);
     else ok('PATCH /api/hiring-needs/:id (toggle confirmed) → 200');
+  }
+
+  // Learning summary with no outcomes must not crash and should save a clean summary.
+  r = await request('POST', '/api/agent-learning/daily-summary', { auth: goodAuth, body: { date: '2026-06-17' } });
+  if (r.status !== 200 || r.data?.totalOutcomesReviewed !== 0 || !/Not enough data/i.test(r.data?.summary || '')) {
+    fail(`POST empty daily learning summary → ${r.status}`);
+  } else ok('POST /api/agent-learning/daily-summary → 200 with no outcomes');
+
+  let outcomeId = null;
+  if (needId) {
+    r = await request('POST', '/api/candidate-outcomes', {
+      auth: goodAuth,
+      body: {
+        candidateId: 'behavior-candidate-1',
+        needId,
+        pipelineRunId: 'behavior-run-1',
+        clientVerdict: 'interview',
+        finalOutcome: 'still_in_process',
+        clientReason: 'promising profile',
+      },
+    });
+    if (r.status !== 200 || !r.data?.id || r.data?.clientVerdict !== 'interview') fail(`POST /api/candidate-outcomes → ${r.status}`);
+    else {
+      outcomeId = r.data.id;
+      ok('POST /api/candidate-outcomes → creates outcome');
+    }
+
+    r = await request('POST', '/api/candidate-outcomes', {
+      auth: goodAuth,
+      body: { candidateId: 'behavior-candidate-1', needId, pipelineRunId: 'behavior-run-1' },
+    });
+    if (r.status !== 409) fail(`duplicate POST /api/candidate-outcomes → ${r.status} (expected 409)`);
+    else ok('POST /api/candidate-outcomes duplicate → 409');
+
+    r = await request('POST', '/api/candidate-outcomes', {
+      auth: goodAuth,
+      body: { candidateId: 'behavior-candidate-2', needId, clientVerdict: 'maybe' },
+    });
+    if (r.status !== 400) fail(`invalid clientVerdict → ${r.status} (expected 400)`);
+    else ok('POST /api/candidate-outcomes invalid clientVerdict → 400');
+  }
+
+  if (outcomeId) {
+    r = await request('GET', '/api/candidate-outcomes/' + outcomeId, { auth: goodAuth });
+    if (r.status !== 200 || r.data?.id !== outcomeId) fail(`GET /api/candidate-outcomes/:id → ${r.status}`);
+    else ok('GET /api/candidate-outcomes/:id → 200');
+
+    r = await request('PATCH', '/api/candidate-outcomes/' + outcomeId, {
+      auth: goodAuth,
+      body: {
+        clientVerdict: 'hired',
+        finalOutcome: 'hired',
+        feedbackFromClient: 'excellent fit',
+        candidateId: 'should-not-change',
+        needId: 'should-not-change',
+        pipelineRunId: 'should-not-change',
+        matchId: 'should-not-change',
+        sourcedBy: 'should-not-change',
+        validatorVerdict: 'should-not-change',
+        validatorReason: 'should-not-change',
+        matchScore: 999,
+        matchTier: 'should-not-change',
+        candidateSnapshot: { bad: true },
+        matchSnapshot: { bad: true },
+        validationSnapshot: { bad: true },
+        id: 'should-not-change',
+        createdAt: '1900-01-01T00:00:00.000Z',
+      },
+    });
+    if (
+      r.status !== 200 ||
+      r.data?.clientVerdict !== 'hired' ||
+      r.data?.candidateId !== 'behavior-candidate-1' ||
+      r.data?.needId !== needId ||
+      r.data?.pipelineRunId !== 'behavior-run-1' ||
+      r.data?.matchId === 'should-not-change' ||
+      r.data?.sourcedBy === 'should-not-change' ||
+      r.data?.validatorVerdict === 'should-not-change' ||
+      r.data?.validatorReason === 'should-not-change' ||
+      r.data?.matchScore === 999 ||
+      r.data?.matchTier === 'should-not-change' ||
+      r.data?.candidateSnapshot ||
+      r.data?.matchSnapshot ||
+      r.data?.validationSnapshot ||
+      r.data?.id !== outcomeId ||
+      r.data?.createdAt === '1900-01-01T00:00:00.000Z'
+    ) {
+      fail(`PATCH /api/candidate-outcomes/:id allowed bad update or failed → ${r.status}`);
+    } else ok('PATCH /api/candidate-outcomes/:id updates outcome fields only and preserves immutable snapshots/history');
+
+    r = await request('PATCH', '/api/candidate-outcomes/' + outcomeId, {
+      auth: goodAuth,
+      body: { finalOutcome: 'maybe_later' },
+    });
+    if (r.status !== 400) fail(`invalid finalOutcome → ${r.status} (expected 400)`);
+    else ok('PATCH /api/candidate-outcomes/:id invalid finalOutcome → 400');
+
+    r = await request('POST', '/api/agent-learning/daily-summary', { auth: goodAuth, body: { date: '2026-06-17', windowStart: '2000-01-01T00:00:00.000Z', windowEnd: '2100-01-01T00:00:00.000Z' } });
+    if (r.status !== 200 || r.data?.totalOutcomesReviewed < 1 || r.data?.hiredCount < 1) fail(`POST learning summary with outcomes → ${r.status}`);
+    else ok('POST /api/agent-learning/daily-summary → creates summary with outcomes');
   }
 
   // Run agents — they should respond gracefully even without external keys
