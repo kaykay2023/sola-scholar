@@ -60,6 +60,7 @@ const APOLLO_SEARCH_CALLS = [];      // captured sanitized Search request bodies
 let LAST_APOLLO_MATCH_BODY = null;   // last parsed JSON body sent to Apollo people/match
 let STUB_GH_CONTRIBUTORS = null;     // { 'owner/repo': [{login, type, html_url}] }
 let STUB_ADZUNA_RESULTS = null;      // { results: [...] }
+let STUB_GH_CONTRIB_HTTP = null;     // { 'owner/repo': { status, body, malformed } } per-repo HTTP override
 const GH_CONTRIB_CALLS = [];         // captured 'owner/repo' calls
 let STUB_PDL_SEARCH = null;          // when set, /v5/person/search returns { data: [...] }
 let STUB_PDL_LOOKUP = null;          // when set, /v5/person/enrich?profile= returns { data: {...} }
@@ -98,6 +99,17 @@ global.fetch = async (url, opts) => {
     if (m) {
       const key = `${decodeURIComponent(m[1])}/${decodeURIComponent(m[2])}`;
       GH_CONTRIB_CALLS.push(key);
+      // Optional per-repo HTTP shape override: { status, body, malformed }.
+      const httpEntry = STUB_GH_CONTRIB_HTTP && STUB_GH_CONTRIB_HTTP[key];
+      if (httpEntry) {
+        const bodyTxt = typeof httpEntry.body === 'string' ? httpEntry.body : JSON.stringify(httpEntry.body ?? {});
+        return {
+          ok: httpEntry.status >= 200 && httpEntry.status < 300,
+          status: httpEntry.status,
+          json: async () => { if (httpEntry.malformed) throw new Error('unexpected token'); return typeof httpEntry.body === 'string' ? JSON.parse(httpEntry.body) : (httpEntry.body ?? {}); },
+          text: async () => bodyTxt,
+        };
+      }
       const arr = (STUB_GH_CONTRIBUTORS && STUB_GH_CONTRIBUTORS[key]) || [];
       return mkRes(arr);
     }
@@ -198,6 +210,7 @@ global.fetch = async (url, opts) => {
         : [],
       q_keywords: LAST_APOLLO_REQUEST_BODY && LAST_APOLLO_REQUEST_BODY.q_keywords || '',
       per_page: LAST_APOLLO_REQUEST_BODY && LAST_APOLLO_REQUEST_BODY.per_page || 0,
+      page: LAST_APOLLO_REQUEST_BODY && LAST_APOLLO_REQUEST_BODY.page || 1,
       titleCount: Array.isArray(LAST_APOLLO_REQUEST_BODY && LAST_APOLLO_REQUEST_BODY.person_titles)
         ? LAST_APOLLO_REQUEST_BODY.person_titles.length
         : 0,
@@ -3607,7 +3620,10 @@ async function main() {
   assert(cmBScout.acceptedBySource.github >= 2,
     `acceptedBySource.github counts contributor candidates (got ${cmBScout.acceptedBySource.github})`);
 
-  // (d) Adzuna candidate-mention mining
+  // (d) Adzuna candidate-mention mining — G2E: discovery is DISABLED BY
+  //     DEFAULT (zero-yield in production; no code defect found). First prove
+  //     the default-off behavior, then prove the fixture-proven mining path
+  //     still works when explicitly re-enabled via ADZUNA_DISCOVERY_ENABLED.
   STUB_GH_CONTRIBUTORS = {};
   process.env.ADZUNA_APP_ID = process.env.ADZUNA_APP_ID || 'test-id';
   process.env.ADZUNA_API_KEY = process.env.ADZUNA_API_KEY || 'test-key';
@@ -3622,6 +3638,21 @@ async function main() {
     ],
   };
 
+  // Default: keys set but discovery flag NOT set → provider skipped with an
+  // explicit zero-yield diagnostic; no adzuna candidates sourced.
+  delete process.env.ADZUNA_DISCOVERY_ENABLED;
+  const adzOffNeed = createNeed({
+    companyId: coApollo.id, title: 'Detection Engineer',
+    requiredSkills: ['SIEM','KQL'], seniority: 'Mid', locationType: 'Remote', confirmed: true,
+  });
+  const adzOffRun = 'adzuna_off_run_' + Date.now().toString(36);
+  const adzOffScout = await runScout({ needId: adzOffNeed.id, pipelineRunId: adzOffRun });
+  assert(adzOffScout.adzunaRaw === 0 && adzOffScout.providerDiagnostics.adzuna.was_skipped === true &&
+    /disabled by default/i.test(adzOffScout.providerDiagnostics.adzuna.skip_reason || ''),
+    `G2E: Adzuna discovery disabled by default with explicit diagnostic (raw=${adzOffScout.adzunaRaw}, skip="${adzOffScout.providerDiagnostics.adzuna.skip_reason}")`);
+
+  // Explicit re-enable: fixture-proven mining behavior preserved.
+  process.env.ADZUNA_DISCOVERY_ENABLED = 'true';
   const adzNeed = createNeed({
     companyId: coApollo.id, title: 'Detection Engineer',
     requiredSkills: ['SIEM','KQL'], seniority: 'Mid', locationType: 'Remote', confirmed: true,
@@ -3647,7 +3678,8 @@ async function main() {
   }
   assert('adzunaRaw' in adzScout, `scout return has top-level adzunaRaw`);
 
-  // Reset stubs
+  // Reset stubs (restore G2E default-off state)
+  delete process.env.ADZUNA_DISCOVERY_ENABLED;
   STUB_GH_CONTRIBUTORS = null;
   STUB_ADZUNA_RESULTS = null;
   STUB_APOLLO_PEOPLE = null;
@@ -4925,6 +4957,381 @@ async function main() {
       `G1(f2): shipped config keeps "Azure" and "Azure Active Directory" separate`);
 
     __resetSkillSynonymGroups();
+  }
+
+  // ══ G2. Candidate pull + evidence depth (Group 2) ══════════════════════
+  {
+    const g2 = _internals; // local handle for Group-2-only internals
+    const g2Co = findOrCreateCompany({ name: 'G2 Evidence Co' });
+    const g2Impact = {};
+
+    // ── G2-D: role title packs + slash safety ──
+    g2.__setRolePacksForTest([
+      { primary: 'Widget Wrangler', family: 'test', variants: ['Widget Wrangler', 'Gadget Handler', 'Thing / Stuff Specialist'] },
+    ]);
+    const packTitles = g2.expandRoleToTitles('Widget Wrangler');
+    assert(packTitles.includes('Gadget Handler'),
+      `G2-D: configured pack variants used for exact primary role (got ${JSON.stringify(packTitles)})`);
+    assert(packTitles.includes('Thing') && packTitles.includes('Stuff Specialist') && !packTitles.some(t => t.includes('/')),
+      `G2-D: slashed pack variant split into clean standalone titles (got ${JSON.stringify(packTitles)})`);
+    g2.__setRolePacksForTest(null); // restore shipped config
+    const socPack = g2.rolePackForRole('SOC Analyst');
+    assert(socPack && socPack.variants.length >= 6 && socPack.variants.every(v => !v.includes('/')),
+      `G2-D: shipped SOC Analyst pack present, clean, ≥6 variants (got ${socPack && socPack.variants.length})`);
+    for (const packRole of ['Cloud Security Engineer', 'Cybersecurity Analyst', 'GRC Analyst', 'Data Engineer', 'Analytics Engineer', 'Marketing Specialist', 'Sales Development Representative']) {
+      const rp = g2.rolePackForRole(packRole);
+      assert(rp && rp.variants.length >= 5 && rp.variants.every(v => !v.includes('/')),
+        `G2-D: shipped pack for "${packRole}" present + clean (got ${rp && rp.variants.length})`);
+    }
+    const legacyTitles = g2.expandRoleToTitles('Azure Security Engineer');
+    assert(legacyTitles.includes('Cloud Security Engineer') && legacyTitles.includes('SOC Analyst'),
+      `G2-D: role WITHOUT a pack keeps legacy keyword expansion (back-compat)`);
+    assert(JSON.stringify(g2.normalizeApolloTitles(['SOC Analyst / IR Analyst'])) === JSON.stringify(['SOC Analyst', 'IR Analyst']),
+      `G2-D: normalizeApolloTitles splits slash-combined titles — providers never see slashes`);
+
+    // ── G2-F: GitHub contributors hardened response handling (fixtures) ──
+    STUB_GH_CONTRIB_HTTP = {
+      'empty/repo':     { status: 204, body: '' },
+      'bad/request':    { status: 400, body: { message: 'problems parsing per_page parameter' } },
+      'rate/limited':   { status: 403, body: { message: 'API rate limit exceeded for user' } },
+      'malformed/body': { status: 200, body: 'not-json{', malformed: true },
+    };
+    const ghEmpty = await g2.githubContributors({ owner: 'empty', repo: 'repo' });
+    assert(ghEmpty.ok === true && ghEmpty.items.length === 0 && ghEmpty.empty === true,
+      `G2-F: 204 empty repo → ok + empty list, no crash (got ${JSON.stringify(ghEmpty)})`);
+    const ghBad = await g2.githubContributors({ owner: 'bad', repo: 'request' });
+    assert(ghBad.ok === false && ghBad.status === 400 && /problems parsing/i.test(ghBad.reason || ''),
+      `G2-F: 400 bad-request captures GitHub's sanitized message (got "${ghBad.reason}")`);
+    const ghRate = await g2.githubContributors({ owner: 'rate', repo: 'limited' });
+    assert(ghRate.ok === false && ghRate.status === 403 && /rate-limited/i.test(ghRate.reason || ''),
+      `G2-F: 403 rate limit classified explicitly (got "${ghRate.reason}")`);
+    const ghMal = await g2.githubContributors({ owner: 'malformed', repo: 'body' });
+    assert(ghMal.ok === false && /malformed/i.test(ghMal.reason || ''),
+      `G2-F: malformed response body handled safely (got "${ghMal.reason}")`);
+    STUB_GH_CONTRIB_HTTP = null;
+    STUB_GH_CONTRIBUTORS = { 'ok/list': [] };
+    const ghEmptyList = await g2.githubContributors({ owner: 'ok', repo: 'list' });
+    assert(ghEmptyList.ok === true && ghEmptyList.items.length === 0,
+      `G2-F: 200 empty contributor list handled (got ${JSON.stringify(ghEmptyList.items)})`);
+    STUB_GH_CONTRIBUTORS = null;
+
+    // GitHub alone cannot make a candidate client-ready (SOC concrete need).
+    const g2SocNeed = createNeed({
+      companyId: g2Co.id, title: 'SOC Analyst', requiredSkills: ['SIEM', 'SOC'],
+      seniority: 'Mid', locationType: 'Onsite', location: 'Detroit, Michigan', confirmed: true,
+    });
+    const ghOnlyCand = findOrCreateCandidate({
+      name: 'G2 GithubOnly Person', title: 'SOC Analyst', skills: ['SIEM'],
+      github: 'https://github.com/g2-github-only', sourceUrl: 'https://github.com/g2-github-only',
+      source: 'GitHub', sourceType: 'candidate_profile', scoutDecision: 'accepted',
+      scoutReason: 'GitHub API verified type=User',
+      discovered_by: ['github'], provider_of_record: 'github', resolution_status: 'unresolved',
+      pipelineRunId: 'g2f_run',
+    });
+    applySourcingQualityGate(ghOnlyCand, g2SocNeed);
+    assert(g2.isClientReadyForNeed(ghOnlyCand, g2SocNeed) === false,
+      `G2-F: GitHub evidence alone cannot make a SOC candidate client-ready (state=${ghOnlyCand.visibility_state}, reason=${ghOnlyCand.reason_code})`);
+
+    // ── G2-G: dedupe hardening ──
+    const dk = g2.candidateDedupeKey;
+    assert(dk({ name: 'Sam Cole', company: 'Acme' }) !== dk({ name: 'Sam Cole', company: 'Globex' }),
+      `G2-G: same name at different companies never share a key`);
+    assert(dk({ linkedinUrl: 'https://www.linkedin.com/in/jane-doe/' }) === dk({ linkedinUrl: 'http://linkedin.com/in/jane-doe?utm=x' }),
+      `G2-G: LinkedIn URL formatting differences normalize to one key`);
+    assert(dk({ name: 'No Links Person', apollo_person_id: 'ap-777' }) === dk({ name: 'No Links Person Renamed', apollo_person_id: 'ap-777' }),
+      `G2-G: stable Apollo person-ID is a dedupe layer`);
+    assert(g2.dedupeLocationsConflict('Detroit, Michigan', 'Sydney, Australia') === true &&
+      g2.dedupeLocationsConflict('Detroit, Michigan', 'Detroit, MI area') === false &&
+      g2.dedupeLocationsConflict('', 'Sydney, Australia') === false,
+      `G2-G: location-conflict helper distinguishes real conflicts from compatible/missing locations`);
+    // Same name + same company + INCOMPATIBLE locations → two distinct records.
+    const dupeA = findOrCreateCandidate({ name: 'G2 Twin Person', company: 'TwinCo', location: 'Detroit, Michigan', title: 'Analyst', pipelineRunId: 'g2g_run' });
+    const dupeB = findOrCreateCandidate({ name: 'G2 Twin Person', company: 'TwinCo', location: 'Sydney, Australia', title: 'Analyst', pipelineRunId: 'g2g_run' });
+    assert(dupeA.id !== dupeB.id,
+      `G2-G: same name+company with conflicting locations = two distinct people (not merged)`);
+    // Same person whose company changed but LinkedIn URL is stable → ONE record.
+    const moveA = findOrCreateCandidate({ name: 'G2 Mover', company: 'OldCo', linkedinUrl: 'https://www.linkedin.com/in/g2-mover', pipelineRunId: 'g2g_run' });
+    const moveB = findOrCreateCandidate({ name: 'G2 Mover', company: 'NewCo', linkedinUrl: 'https://www.linkedin.com/in/g2-mover/', pipelineRunId: 'g2g_run' });
+    assert(moveA.id === moveB.id,
+      `G2-G: changed company over time still one person via stable LinkedIn key`);
+    g2Impact.dedupe = { distinctTwins: dupeA.id !== dupeB.id, stableMover: moveA.id === moveB.id };
+
+    // ── G2-B: structured-resolution queue ──
+    // Test isolation: earlier pipeline runs in this file legitimately enqueued
+    // their own unresolved candidates (runPipeline step 4.5). Clear the queue
+    // so drain assertions below are deterministic.
+    DB.resolution_queue.length = 0;
+    const qNeed = createNeed({
+      companyId: g2Co.id, title: 'SOC Analyst', requiredSkills: ['SIEM', 'SOC'],
+      seniority: 'Mid', locationType: 'Onsite', location: 'Detroit, Michigan', confirmed: true,
+    });
+    const mkQueueCand = (slug, extra = {}) => {
+      const c = findOrCreateCandidate({
+        name: `G2 Queue ${slug}`, title: 'SOC Analyst', company: 'QueueCo',
+        location: 'Detroit, Michigan', skills: ['SIEM'],
+        linkedinUrl: `https://www.linkedin.com/in/g2-queue-${slug}`,
+        sourceUrl: `https://www.linkedin.com/in/g2-queue-${slug}`,
+        source: 'LinkedIn', sourceType: 'candidate_profile', scoutDecision: 'accepted',
+        discovered_by: ['firecrawl'], provider_of_record: 'firecrawl', resolution_status: 'unresolved',
+        pipelineRunId: 'g2b_run', ...extra,
+      });
+      applySourcingQualityGate(c, qNeed);
+      return c;
+    };
+    // Eligibility guards: non-person/no-identity records never enter the queue.
+    assert(g2.resolutionQueueEligibility({ id: 'x', name: 'OnlyOneName', sourceType: 'candidate_profile' }).ok === false,
+      `G2-B: single-token name is not enough identity to queue`);
+    assert(g2.resolutionQueueEligibility({ id: 'x', name: 'Job Posting', sourceType: 'job_posting' }).ok === false,
+      `G2-B: job-posting records never enter the queue`);
+
+    const qCand1 = mkQueueCand('alpha');
+    const qCand2 = mkQueueCand('beta');
+    assert(qCand1.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW,
+      `G2-B precondition: firecrawl-only unresolved on concrete market is NEEDS_REVIEW (got ${qCand1.visibility_state})`);
+    const enq1 = g2.enqueueForStructuredResolution(qCand1, qNeed, qCand1.reason_code);
+    const enq2 = g2.enqueueForStructuredResolution(qCand2, qNeed, qCand2.reason_code);
+    const enqDup = g2.enqueueForStructuredResolution(qCand1, qNeed, qCand1.reason_code);
+    assert(enq1.queued && enq2.queued && !enqDup.queued && enqDup.duplicate === true,
+      `G2-B: enqueue works + duplicate suppressed (dup=${JSON.stringify(enqDup.reason)})`);
+    const entry1 = enq1.entry;
+    for (const f of ['id', 'candidateId', 'source', 'normalizedName', 'company', 'location', 'profileUrl', 'queuedReason', 'attempts', 'lastAttemptAt', 'status', 'resolvedProvider', 'failureReason']) {
+      assert(f in entry1, `G2-B: queue entry records "${f}"`);
+    }
+    assert(DB.resolution_queue.some(e => e.id === entry1.id),
+      `G2-B: queue entries persist in DB.resolution_queue (cross-run persistent collection)`);
+
+    // No-resolver failure state: pipeline fails SAFE, candidates stay in review.
+    const prevG2Apollo = process.env.APOLLO_API_KEY;
+    delete process.env.APOLLO_API_KEY;
+    const drainNoResolver = await g2.drainResolutionQueue({ needId: qNeed.id, pipelineRunId: 'g2b_run' });
+    assert(drainNoResolver.noResolver === true && drainNoResolver.attempted === 0 &&
+      DB.resolution_queue.find(e => e.id === entry1.id).status === 'pending' &&
+      qCand1.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW,
+      `G2-B/G2-H: no structured resolver → explicit diagnostic, nothing attempted, candidates stay NEEDS_REVIEW`);
+
+    // Drain with Apollo resolver: cap respected; resolution attaches provenance
+    // + re-runs gates; discovery provenance preserved.
+    process.env.APOLLO_API_KEY = 'test-apollo-key';
+    STUB_APOLLO_MATCH_HTTP = null;
+    STUB_APOLLO_MATCH = (body) => ({
+      person: {
+        id: 'ap-queue-1',
+        name: body && body.name || 'G2 Queue alpha',
+        linkedin_url: body && body.linkedin_url || '',
+        title: 'SOC Analyst',
+        organization: { name: 'QueueCo' },
+        city: 'Detroit', state: 'Michigan', country: 'United States',
+        employment_history: [
+          { title: 'SOC Analyst', organization_name: 'QueueCo', start_date: '2024-01-01', current: true },
+        ],
+      },
+    });
+    const drain1 = await g2.drainResolutionQueue({ needId: qNeed.id, pipelineRunId: 'g2b_run', maxPerRun: 1 });
+    assert(drain1.attempted === 1 && drain1.resolved === 1 && drain1.budgetCapped === 1,
+      `G2-B: drain budget respected — 1 attempted/resolved, 1 over budget (got ${JSON.stringify({ a: drain1.attempted, r: drain1.resolved, b: drain1.budgetCapped })})`);
+    const resolvedEntry = DB.resolution_queue.find(e => e.candidateId === qCand1.id);
+    const resolvedCand = DB.candidates.find(c => c.id === qCand1.id);
+    assert(resolvedEntry.status === 'resolved' && resolvedEntry.resolvedProvider === 'apollo',
+      `G2-B: entry marked resolved by apollo (got ${resolvedEntry.status}/${resolvedEntry.resolvedProvider})`);
+    assert((resolvedCand.resolved_by || []).includes('apollo') && resolvedCand.resolution_status === 'resolved',
+      `G2-B: resolution provenance attached (resolved_by=${JSON.stringify(resolvedCand.resolved_by)})`);
+    assert((resolvedCand.discovered_by || []).includes('firecrawl') && resolvedCand.provider_of_record === 'firecrawl',
+      `G2-B: ORIGINAL discovery provenance preserved (discovered_by=${JSON.stringify(resolvedCand.discovered_by)}, por=${resolvedCand.provider_of_record})`);
+    assert((resolvedCand.provider_trace || []).some(t => t.provider === 'apollo' && t.stage === 'resolution' && t.returned === true),
+      `G2-B: provider_trace records the queue resolution step`);
+    assert(resolvedCand.reason_code !== 'FIRECRAWL_ONLY_UNRESOLVED_LOCAL_HYBRID',
+      `G2-B: after REAL structural resolution the firecrawl-only reason is cleared by the re-run gates (reason=${resolvedCand.reason_code})`);
+    // Second drain (new run id) — persistent queue continues with remaining entry.
+    STUB_APOLLO_MATCH = () => null; // provider 404 no-match
+    const drain2 = await g2.drainResolutionQueue({ needId: qNeed.id, pipelineRunId: 'g2b_run2', maxPerRun: 5 });
+    const entry2After = DB.resolution_queue.find(e => e.candidateId === qCand2.id);
+    assert(drain2.attempted === 1 && entry2After.status === 'no-match',
+      `G2-B: cross-run drain continues from persisted queue; provider no-match recorded (got ${entry2After.status})`);
+    assert(DB.candidates.find(c => c.id === qCand2.id).visibility_state === VISIBILITY_STATE.NEEDS_REVIEW &&
+      g2.isClientReadyForNeed(DB.candidates.find(c => c.id === qCand2.id), qNeed) === false,
+      `G2-B: FAILED resolution does not weaken any gate — candidate stays NEEDS_REVIEW, not client-ready`);
+    // Fatal auth error → entry retryable, drain stops safely.
+    const qCand3 = mkQueueCand('gamma');
+    g2.enqueueForStructuredResolution(qCand3, qNeed, qCand3.reason_code);
+    STUB_APOLLO_MATCH = null;
+    STUB_APOLLO_MATCH_HTTP = { status: 403, body: { error: 'forbidden' } };
+    const drain3 = await g2.drainResolutionQueue({ needId: qNeed.id, pipelineRunId: 'g2b_run3', maxPerRun: 5 });
+    const entry3After = DB.resolution_queue.find(e => e.candidateId === qCand3.id);
+    assert(drain3.retryable === 1 && entry3After.status === 'retryable' && /403/.test(entry3After.failureReason || ''),
+      `G2-H: auth/credit failure is explicit + retryable, never silently swallowed (got ${entry3After.status}/${entry3After.failureReason})`);
+    STUB_APOLLO_MATCH_HTTP = null;
+    g2Impact.resolutionQueue = { resolved: drain1.resolved, noMatch: drain2.attempted, retryable: drain3.retryable, pendingAfter: DB.resolution_queue.filter(e => ['pending', 'retryable'].includes(e.status)).length };
+
+    // ── G2-A: borderline PDL enrichment ──
+    const prevG2Pdl = process.env.PDL_API_KEY;
+    process.env.PDL_API_KEY = 'test-pdl-key';
+    STUB_PDL_LOOKUP = {
+      status: 200,
+      likelihood: 9,
+      data: {
+        skills: ['Security Information and Event Management', 'Security Operations Center', 'Kusto Query Language'],
+        job_title: 'soc analyst',
+        experience: [{ title: { name: 'SOC Analyst' }, company: { name: 'BlueCo' }, start_date: '2024-01', is_primary: true }],
+        location_names: ['detroit, michigan, united states'],
+      },
+    };
+    const bNeed = createNeed({
+      companyId: g2Co.id, title: 'SOC Analyst', requiredSkills: ['SIEM', 'SOC', 'KQL'],
+      seniority: 'Mid', locationType: 'Onsite', location: 'Detroit, Michigan', confirmed: true,
+    });
+    const mkBorderline = (slug) => {
+      const c = findOrCreateCandidate({
+        name: `G2 Borderline ${slug}`, title: 'SOC Analyst', company: 'EdgeCo',
+        location: 'Detroit, Michigan', skills: ['SIEM'],
+        linkedinUrl: `https://www.linkedin.com/in/g2-borderline-${slug}`,
+        sourceUrl: `https://www.linkedin.com/in/g2-borderline-${slug}`,
+        source: 'LinkedIn', sourceType: 'candidate_profile', scoutDecision: 'accepted',
+        discovered_by: ['firecrawl'], provider_of_record: 'firecrawl', resolution_status: 'unresolved',
+        pipelineRunId: 'g2a_run',
+      });
+      applySourcingQualityGate(c, bNeed);
+      return c;
+    };
+    const b1 = mkBorderline('one');
+    const b2 = mkBorderline('two');
+    const b3 = mkBorderline('three');
+    // Non-candidate + identifier-less records must never enter the borderline pool.
+    findOrCreateCandidate({ name: 'G2 NoIdent', source: 'Web', sourceType: 'possible_candidate', scoutDecision: 'review', pipelineRunId: 'g2a_run' });
+    assert([b1, b2, b3].every(c => c.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW),
+      `G2-A precondition: borderline candidates are NEEDS_REVIEW`);
+    const enrichRes = await g2.runPdlCandidateEnrichment({
+      needId: bNeed.id, pipelineRunId: 'g2a_run',
+      pdlEnrichMaxPerRun: 15, pdlBorderlineEnrichMaxPerRun: 2,
+    });
+    assert(enrichRes.borderline.cap === 2 && enrichRes.borderline.attempted === 2 && enrichRes.borderline.enriched === 2 && enrichRes.borderline.queued >= 1,
+      `G2-A: borderline cap enforced — 2 enriched, remainder queued (got ${JSON.stringify(enrichRes.borderline)})`);
+    const enrichedBorderline = [b1, b2, b3].map(c => DB.candidates.find(x => x.id === c.id)).filter(c => (c.enrichedBy || []).includes('pdl-person-enrich'));
+    assert(enrichedBorderline.length === 2,
+      `G2-A: exactly 2 borderline candidates enriched (got ${enrichedBorderline.length})`);
+    for (const c of enrichedBorderline) {
+      assert(c.visibility_state === VISIBILITY_STATE.NEEDS_REVIEW && g2.isClientReadyForNeed(c, bNeed) === false,
+        `G2-A CRITICAL: PDL enrichment did NOT auto-make a firecrawl-only candidate visible — gates re-ran and still hold (state=${c.visibility_state}, reason=${c.reason_code})`);
+      assert((c.provider_trace || []).some(t => t.sourceLabel === 'pdl:person-enrich-borderline'),
+        `G2-A: borderline enrichment recorded distinctly in provider trace`);
+    }
+    assert(enrichRes.cap === 15 && typeof enrichRes.enriched === 'number',
+      `G2-A: client-ready enrichment path + cap preserved unchanged (cap=${enrichRes.cap})`);
+    // 402 plan-restriction stops borderline spend safely.
+    const b4 = mkBorderline('four');
+    STUB_PDL_LOOKUP_HTTP = { status: 402, body: { status: 402, error: { type: 'payment_required', message: 'Payment Required' } } };
+    const enrich402 = await g2.runPdlCandidateEnrichment({
+      needId: bNeed.id, pipelineRunId: 'g2a_run',
+      pdlEnrichMaxPerRun: 15, pdlBorderlineEnrichMaxPerRun: 3,
+    });
+    assert(enrich402.borderline.planRestricted >= 1 &&
+      DB.candidates.find(c => c.id === b4.id).visibility_state === VISIBILITY_STATE.NEEDS_REVIEW,
+      `G2-A: PDL 402 tracked as plan-restricted; candidate safe in NEEDS_REVIEW (got ${JSON.stringify(enrich402.borderline)})`);
+    STUB_PDL_LOOKUP_HTTP = null;
+    STUB_PDL_LOOKUP = null;
+    if (prevG2Pdl === undefined) delete process.env.PDL_API_KEY; else process.env.PDL_API_KEY = prevG2Pdl;
+    g2Impact.borderlineEnrichment = enrichRes.borderline;
+
+    // ── G2-C: Apollo page-2 only under explicit volume control ──
+    process.env.APOLLO_API_KEY = 'test-apollo-key';
+    process.env.FIRECRAWL_API_KEY = process.env.FIRECRAWL_API_KEY || 'test-firecrawl-key';
+    STUB_FIRECRAWL_ITEMS = [];
+    STUB_GH_SEARCH_USERS = { items: [] };
+    STUB_GH_CONTRIBUTORS = {};
+    const fullPagePeople = (page) => Array.from({ length: 25 }, (_, i) => ({
+      id: `ap-page${page}-${i}`,
+      name: `G2 Page${page} Person${i}`,
+      title: 'SOC Analyst',
+      linkedin_url: `https://www.linkedin.com/in/g2-page${page}-p${i}`,
+      organization: { name: 'PageCo' },
+      city: 'Detroit', state: 'Michigan', country: 'United States',
+      employment_history: [{ title: 'SOC Analyst', organization_name: 'PageCo', start_date: '2024-01-01', current: true }],
+    }));
+    STUB_APOLLO_PEOPLE = (body) => fullPagePeople(body && body.page || 1);
+    // Default config: NO page 2 even when page 1 is full.
+    APOLLO_SEARCH_CALLS.length = 0;
+    delete process.env.APOLLO_MAX_PAGES_PER_ATTEMPT;
+    const pgNeedA = createNeed({
+      companyId: g2Co.id, title: 'SOC Analyst', requiredSkills: ['SIEM'],
+      seniority: 'Mid', locationType: 'Remote', confirmed: true,
+    });
+    await runScout({ needId: pgNeedA.id, pipelineRunId: 'g2c_default_' + Date.now().toString(36) });
+    assert(APOLLO_SEARCH_CALLS.length > 0 && APOLLO_SEARCH_CALLS.every(cl => (cl.page || 1) === 1),
+      `G2-C: default volume config never requests Apollo page 2 (pages seen: ${JSON.stringify(APOLLO_SEARCH_CALLS.map(cl => cl.page))})`);
+    assert(APOLLO_SEARCH_CALLS.every(cl => !cl.q_keywords),
+      `G2-C: q_keywords remains ABSENT from all standard Apollo discovery calls`);
+    // Explicit volume control: page 2 runs when page 1 is full.
+    APOLLO_SEARCH_CALLS.length = 0;
+    process.env.APOLLO_MAX_PAGES_PER_ATTEMPT = '2';
+    process.env.APOLLO_MAX_CANDIDATES_PER_RUN = '100';
+    const pgNeedB = createNeed({
+      companyId: g2Co.id, title: 'SOC Analyst', requiredSkills: ['SIEM'],
+      seniority: 'Mid', locationType: 'Remote', confirmed: true,
+    });
+    const pgScoutB = await runScout({ needId: pgNeedB.id, pipelineRunId: 'g2c_paged_' + Date.now().toString(36) });
+    assert(APOLLO_SEARCH_CALLS.some(cl => cl.page === 2),
+      `G2-C: page 2 requested ONLY under explicit volume config (pages seen: ${JSON.stringify(APOLLO_SEARCH_CALLS.map(cl => cl.page))})`);
+    assert(pgScoutB.providerDiagnostics.apollo.pages_attempted_count >= 2 &&
+      pgScoutB.providerDiagnostics.apollo.titles_attempted_count > 0,
+      `G2-C: pages/titles attempted diagnostics recorded (pages=${pgScoutB.providerDiagnostics.apollo.pages_attempted_count}, titles=${pgScoutB.providerDiagnostics.apollo.titles_attempted_count})`);
+    delete process.env.APOLLO_MAX_PAGES_PER_ATTEMPT;
+    delete process.env.APOLLO_MAX_CANDIDATES_PER_RUN;
+    // Candidate cap respected under default config.
+    APOLLO_SEARCH_CALLS.length = 0;
+    const pgNeedC = createNeed({
+      companyId: g2Co.id, title: 'SOC Analyst', requiredSkills: ['SIEM'],
+      seniority: 'Mid', locationType: 'Remote', confirmed: true,
+    });
+    const capScout = await runScout({ needId: pgNeedC.id, pipelineRunId: 'g2c_cap_' + Date.now().toString(36) });
+    assert(capScout.rawResultsBySource.apollo <= 50,
+      `G2-C: per-run Apollo candidate cap respected (raw=${capScout.rawResultsBySource.apollo})`);
+    STUB_APOLLO_PEOPLE = null;
+    STUB_FIRECRAWL_ITEMS = null;
+    STUB_GH_SEARCH_USERS = null;
+    STUB_GH_CONTRIBUTORS = null;
+    if (prevG2Apollo === undefined) delete process.env.APOLLO_API_KEY; else process.env.APOLLO_API_KEY = prevG2Apollo;
+    g2Impact.apolloHeadroom = { defaultPagesOnly1: true, page2UnderConfig: true, capRespected: capScout.rawResultsBySource.apollo <= 50 };
+
+    // ── G2-G: already-submitted suppression at report time ──
+    const subNeed = createNeed({
+      companyId: g2Co.id, title: 'SOC Analyst', requiredSkills: ['SIEM'],
+      seniority: 'Mid', locationType: 'Remote', confirmed: true,
+    });
+    const subCand = findOrCreateCandidate({
+      name: 'G2 Submit Once', title: 'SOC Analyst', company: 'SubCo', skills: ['SIEM', 'SOC'],
+      summary: 'SOC analyst with SIEM experience',
+      linkedinUrl: 'https://www.linkedin.com/in/g2-submit-once',
+      sourceUrl: 'https://www.linkedin.com/in/g2-submit-once',
+      source: 'Apollo', sourceType: 'candidate_profile', scoutDecision: 'accepted',
+      discovered_by: ['apollo'], provider_of_record: 'apollo', resolved_by: ['apollo'], resolution_status: 'resolved',
+      workHistory: [{ title: 'SOC Analyst', company: 'SubCo', startDate: isoMonthsAgo(20), current: true, months: 20 }],
+      pipelineRunId: 'g2sub_run1',
+    });
+    applySourcingQualityGate(subCand, subNeed);
+    assert(subCand.visibility_state === VISIBILITY_STATE.VISIBLE, `G2-G precondition: submit-once candidate is VISIBLE (got ${subCand.visibility_state})`);
+    createOrUpdateMatch({ needId: subNeed.id, candidateId: subCand.id, pipelineRunId: 'g2sub_run1', score: 72, tier: 'Review', matchedSkills: ['SIEM'], missingSkills: [], reasoning: ['Matches 1/1 required skills: SIEM'], rank: 1 });
+    const rep1 = await generateClientReport({ needId: subNeed.id, pipelineRunId: 'g2sub_run1' });
+    assert(rep1.report.candidates.some(c => c.name === 'G2 Submit Once') && rep1.report.submittedCandidateIds.includes(subCand.id),
+      `G2-G: first report includes candidate + records submission ledger`);
+    createOrUpdateMatch({ needId: subNeed.id, candidateId: subCand.id, pipelineRunId: 'g2sub_run2', score: 72, tier: 'Review', matchedSkills: ['SIEM'], missingSkills: [], reasoning: ['Matches 1/1 required skills: SIEM'], rank: 1 });
+    const rep2 = await generateClientReport({ needId: subNeed.id, pipelineRunId: 'g2sub_run2' });
+    assert(!rep2.report.candidates.some(c => c.name === 'G2 Submit Once') && rep2.report.suppressedAlreadySubmittedCount >= 1,
+      `G2-G: SAME candidate suppressed in later report for the same need (suppressed=${rep2.report.suppressedAlreadySubmittedCount})`);
+    assert(DB.candidates.find(c => c.id === subCand.id).scoutDecision === 'accepted',
+      `G2-G: suppression is selection-time only — candidate record untouched`);
+    // Explicit reviewed re-submission.
+    DB.candidates.find(c => c.id === subCand.id).resubmitApproved = true;
+    createOrUpdateMatch({ needId: subNeed.id, candidateId: subCand.id, pipelineRunId: 'g2sub_run3', score: 72, tier: 'Review', matchedSkills: ['SIEM'], missingSkills: [], reasoning: ['Matches 1/1 required skills: SIEM'], rank: 1 });
+    const rep3 = await generateClientReport({ needId: subNeed.id, pipelineRunId: 'g2sub_run3' });
+    assert(rep3.report.candidates.some(c => c.name === 'G2 Submit Once') &&
+      DB.candidates.find(c => c.id === subCand.id).resubmitApproved === false,
+      `G2-G: explicit resubmitApproved re-includes once, then the approval is consumed`);
+    g2Impact.alreadySubmittedSuppression = { firstIncluded: true, secondSuppressed: rep2.report.suppressedAlreadySubmittedCount >= 1, explicitResubmit: true };
+
+    // ── G2-I: impact summary (fixture-only; zero live provider calls) ──
+    g2Impact.adzuna = 'disabled-by-default (zero-yield; re-enable via ADZUNA_DISCOVERY_ENABLED)';
+    g2Impact.estimatedPdlCallsPerRun = 'client-ready cap 15 + borderline cap 5 = ≤20 enrich calls; queue drain ≤5 Apollo match calls';
+    console.log('\n── G2 IMPACT SUMMARY (fixtures only) ──');
+    console.log(JSON.stringify(g2Impact, null, 2));
   }
 
   // ── 17. Sample-run proof: pipeline-style log of one scout pass ──
