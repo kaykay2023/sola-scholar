@@ -300,6 +300,7 @@ const {
   applyManualSkillEdit, displaySkillBucketsForMatch,
   resolveSkillKey, __setSkillSynonymGroupsForTest, __resetSkillSynonymGroups,
   createCandidateOutcome, patchCandidateOutcome, buildDailyLearningSummary,
+  computeExperienceBadge, experienceTierForYears, calendarDurationYears, parsePartialExperienceDate, EXPERIENCE_TIER_BANDS,
 } = _internals;
 
 // NOTE: do NOT call loadDB() — it reassigns the module-internal `DB` binding
@@ -5510,7 +5511,7 @@ async function main() {
     const rc = g3rep.report.candidates[0];
     assert(rc && rc.whyThisCandidate && rc.links,
       `G3F/G3D: client report candidate has whyThisCandidate + preserved profile links`);
-    const clientFacingKeys = new Set(['name', 'currentTitle', 'currentCompany', 'location', 'matchedSkills', 'missingSkills', 'locationMatch', 'whyThisCandidate', 'links']);
+    const clientFacingKeys = new Set(['name', 'currentTitle', 'currentCompany', 'location', 'matchedSkills', 'missingSkills', 'locationMatch', 'whyThisCandidate', 'experience', 'links']);
     const leakedKeys = Object.keys(rc).filter(k => !clientFacingKeys.has(k));
     assert(leakedKeys.length === 0,
       `G3F: client report candidate exposes ONLY client-safe fields (leaked: ${JSON.stringify(leakedKeys)})`);
@@ -5531,6 +5532,194 @@ async function main() {
       whyLineClientSafe: true,
       clientReportNoLeak: leakedKeys.length === 0,
     }, null, 2));
+  }
+
+  // ══ EXP. Experience-level badges (display/report only) ═════════════════
+  {
+    const REF = new Date('2025-01-01T00:00:00Z'); // deterministic reference date
+    const pdlCand = (experience) => ({ id: 'exp-'+Math.random().toString(36).slice(2), name: 'Exp Person', enrichedBy: ['pdl-person-enrich'], experience });
+
+    // ── parsePartialExperienceDate (documented partial-date rules) ──
+    assert(parsePartialExperienceDate('2021-04-15', 'start').toISOString().slice(0,10) === '2021-04-15',
+      `EXP: full date parses exactly`);
+    assert(parsePartialExperienceDate('2021-04', 'start').toISOString().slice(0,10) === '2021-04-01',
+      `EXP: year-month start → first day of month`);
+    assert(parsePartialExperienceDate('2021-04', 'end').toISOString().slice(0,10) === '2021-04-30',
+      `EXP: year-month end → last day of month`);
+    assert(parsePartialExperienceDate('2021', 'start').toISOString().slice(0,10) === '2021-01-01',
+      `EXP: year-only start → Jan 1`);
+    assert(parsePartialExperienceDate('2021', 'end').toISOString().slice(0,10) === '2021-12-31',
+      `EXP: year-only end → Dec 31`);
+    assert(parsePartialExperienceDate('garbage') === null && parsePartialExperienceDate('2021-13') === null && parsePartialExperienceDate('') === null,
+      `EXP: unusable/impossible dates → null`);
+
+    // ── Tier boundaries (unrounded) ──
+    assert(experienceTierForYears(1.99) === 'Junior', `EXP: 1.99y → Junior`);
+    assert(experienceTierForYears(2.0) === 'Mid', `EXP: exactly 2.0y → Mid`);
+    assert(experienceTierForYears(6.0) === 'Mid', `EXP: exactly 6.0y → Mid`);
+    assert(experienceTierForYears(6.0001) === 'Senior', `EXP: >6.0y → Senior`);
+    assert(experienceTierForYears(0) === 'Junior', `EXP: 0y → Junior`);
+    assert(EXPERIENCE_TIER_BANDS.juniorMaxExclusive === 2.0 && EXPERIENCE_TIER_BANDS.seniorMinExclusive === 6.0,
+      `EXP: tier bands are the documented 2.0 / 6.0`);
+
+    // ── Calendar-aware duration boundaries (leap-year safe) ──
+    // A whole number of calendar years must be EXACT, not leap-year-shifted.
+    assert(calendarDurationYears(Date.UTC(2021,0,1), Date.UTC(2023,0,1)) === 2,
+      `EXP: exactly 2 calendar years === 2 (no float drift)`);
+    assert(calendarDurationYears(Date.UTC(2020,0,1), Date.UTC(2022,0,1)) === 2,
+      `EXP: leap-spanning 2 calendar years === 2`);
+    assert(calendarDurationYears(Date.UTC(2010,0,1), Date.UTC(2016,0,1)) === 6,
+      `EXP: exactly 6 calendar years === 6`);
+    assert(calendarDurationYears(Date.UTC(2016,0,1), Date.UTC(2022,0,1)) === 6,
+      `EXP: leap-spanning 6 calendar years === 6`);
+    // Exact 2 calendar years (24 months) → Mid.
+    const bExact2 = computeExperienceBadge(pdlCand([{ start_date: '2021-01-01', end_date: '2023-01-01' }]), REF);
+    assert(bExact2.tier === 'Mid' && bExact2.approximateYears === 2 && bExact2.label === '~2 yrs — Mid',
+      `EXP: exact 24 calendar months → Mid (got ${JSON.stringify(bExact2)})`);
+    // Exact 6 calendar years (72 months) → Mid.
+    const bExact6 = computeExperienceBadge(pdlCand([{ start_date: '2010-01-01', end_date: '2016-01-01' }]), REF);
+    assert(bExact6.tier === 'Mid' && bExact6.approximateYears === 6 && bExact6.label === '~6 yrs — Mid',
+      `EXP: exact 72 calendar months → Mid (got ${JSON.stringify(bExact6)})`);
+    // Leap-spanning exact 2 / 6 calendar years → Mid.
+    assert(computeExperienceBadge(pdlCand([{ start_date: '2020-01-01', end_date: '2022-01-01' }]), REF).tier === 'Mid',
+      `EXP: leap-spanning exact 2 years → Mid`);
+    assert(computeExperienceBadge(pdlCand([{ start_date: '2016-01-01', end_date: '2022-01-01' }]), REF).tier === 'Mid',
+      `EXP: leap-spanning exact 6 years → Mid`);
+    // One day BEFORE 2 calendar years → Junior (tier uses unrounded, not ~2 display).
+    const bBefore2 = computeExperienceBadge(pdlCand([{ start_date: '2021-01-01', end_date: '2022-12-31' }]), REF);
+    assert(bBefore2.tier === 'Junior' && bBefore2.approximateYears === 2,
+      `EXP: one day before 2 years → Junior while displaying ~2 (got ${JSON.stringify(bBefore2)})`);
+    // One day AFTER 6 calendar years → Senior (tier uses unrounded, not ~6 display).
+    const bAfter6 = computeExperienceBadge(pdlCand([{ start_date: '2010-01-01', end_date: '2016-01-02' }]), REF);
+    assert(bAfter6.tier === 'Senior' && bAfter6.approximateYears === 6 && bAfter6.label === '~6 yrs — Senior',
+      `EXP: one day after 6 years → Senior while displaying ~6 (got ${JSON.stringify(bAfter6)})`);
+    // Greater than 72 calendar months → Senior.
+    assert(computeExperienceBadge(pdlCand([{ start_date: '2010-01-01', end_date: '2016-02-01' }]), REF).tier === 'Senior',
+      `EXP: >72 calendar months → Senior`);
+
+    // ── Computation ──
+    // Normal single closed range → exactly 5 years.
+    const b5 = computeExperienceBadge(pdlCand([{ start_date: '2019-01-01', end_date: '2024-01-01' }]), REF);
+    assert(b5.isVerified === true && b5.tier === 'Mid' && b5.approximateYears === 5 && b5.label === '~5 yrs — Mid' && b5.verifiedFrom === 'pdl_work_history',
+      `EXP: 5-year closed range → "~5 yrs — Mid" (got ${JSON.stringify(b5)})`);
+    // Missing end date → current job through the reference date.
+    const bCurrent = computeExperienceBadge(pdlCand([{ start_date: '2020-01-01' }]), REF);
+    assert(bCurrent.label === '~5 yrs — Mid',
+      `EXP: missing end → current through ref (got ${bCurrent.label})`);
+    // Overlapping / fully-contained job is not double-counted.
+    const bOverlap = computeExperienceBadge(pdlCand([
+      { start_date: '2015-01-01', end_date: '2020-12-31' },
+      { start_date: '2018-01-01', end_date: '2019-12-31' }, // fully contained
+    ]), REF);
+    assert(bOverlap.tier === 'Mid' && bOverlap.approximateYears === 6,
+      `EXP: contained overlap merged, not double-counted (~6y, got ${JSON.stringify(bOverlap)})`);
+    // Two non-overlapping ranges sum.
+    const bTwo = computeExperienceBadge(pdlCand([
+      { start_date: '2010-01-01', end_date: '2014-01-01' }, // 4y
+      { start_date: '2016-01-01', end_date: '2020-01-01' }, // 4y
+    ]), REF);
+    assert(bTwo.tier === 'Senior' && bTwo.approximateYears === 8,
+      `EXP: two non-overlapping ranges sum to ~8y Senior (got ${JSON.stringify(bTwo)})`);
+    // Adjacent ranges handled without double-count (~5y, not ~10y).
+    const bAdj = computeExperienceBadge(pdlCand([
+      { start_date: '2015-01-01', end_date: '2017-12-31' },
+      { start_date: '2018-01-01', end_date: '2019-12-31' },
+    ]), REF);
+    assert(bAdj.approximateYears === 5 && bAdj.tier === 'Mid',
+      `EXP: adjacent ranges handled consistently (~5y, got ${JSON.stringify(bAdj)})`);
+    // Rounding never flips a tier: 6.42 actual → "~6 yrs" but Senior.
+    const bSenior = computeExperienceBadge(pdlCand([{ start_date: '2018-08-01' }]), REF);
+    assert(bSenior.tier === 'Senior' && bSenior.approximateYears === 6 && bSenior.label === '~6 yrs — Senior',
+      `EXP: unrounded 6.4y stays Senior while displaying ~6 (got ${JSON.stringify(bSenior)})`);
+    // Partial year-month range.
+    const bYM = computeExperienceBadge(pdlCand([{ start_date: '2021-04', end_date: '2023-04' }]), REF);
+    assert(bYM.tier === 'Mid' && bYM.approximateYears === 2 && bYM.label === '~2 yrs — Mid',
+      `EXP: year-month partials (got ${JSON.stringify(bYM)})`);
+    // Partial year-only range. 2020-01-01 .. 2021-12-31 = 730 days = 1.9986y,
+    // so display rounds to ~2 while the tier stays Junior (unrounded < 2.0).
+    const bY = computeExperienceBadge(pdlCand([{ start_date: '2020', end_date: '2021' }]), REF);
+    assert(bY.isVerified === true && bY.approximateYears === 2 && bY.tier === 'Junior' && bY.label === '~2 yrs — Junior',
+      `EXP: year-only partials, tier uses unrounded duration (got ${JSON.stringify(bY)})`);
+    // Missing/unusable start skipped; valid entry still counts.
+    const bSkip = computeExperienceBadge(pdlCand([
+      { end_date: '2020-01-01' },                              // no start → skip
+      { start_date: '2019-01-01', end_date: '2024-01-01' },    // 5y
+    ]), REF);
+    assert(bSkip.approximateYears === 5,
+      `EXP: entry with no usable start is skipped (got ${JSON.stringify(bSkip)})`);
+    // Invalid/malformed entries never crash.
+    const bJunk = computeExperienceBadge(pdlCand([
+      { start_date: 'nonsense', end_date: '2020' }, null, 42, { start_date: '2020-13-99' },
+      { start_date: '2019-01-01', end_date: '2024-01-01' },
+    ]), REF);
+    assert(bJunk.approximateYears === 5 && bJunk.isVerified === true,
+      `EXP: malformed entries skipped safely, no crash (got ${JSON.stringify(bJunk)})`);
+    // Sub-1-year → "<1 yr" convention.
+    const bTiny = computeExperienceBadge(pdlCand([{ start_date: '2024-10-01' }]), REF);
+    assert(bTiny.label === '<1 yr — Junior' && bTiny.approximateYears === 0 && bTiny.tier === 'Junior',
+      `EXP: sub-1-year → "<1 yr — Junior" (got ${JSON.stringify(bTiny)})`);
+
+    // ── Unverified cases ──
+    const unv = { label: 'Experience unverified', isVerified: false, tier: null, approximateYears: null, verifiedFrom: null };
+    const chkUnv = (b, msg) => assert(b.label === unv.label && b.isVerified === false && b.tier === null && b.approximateYears === null && b.verifiedFrom === null, msg + ` (got ${JSON.stringify(b)})`);
+    chkUnv(computeExperienceBadge({ name: 'No PDL', experience: [{ start_date: '2019-01-01', end_date: '2024-01-01' }] }, REF),
+      `EXP: NOT PDL-enriched → unverified even with dates present`);
+    chkUnv(computeExperienceBadge(pdlCand([]), REF), `EXP: empty PDL history → unverified`);
+    chkUnv(computeExperienceBadge({ name: 'X', enrichedBy: ['pdl-person-enrich'] }, REF), `EXP: missing history → unverified`);
+    chkUnv(computeExperienceBadge(pdlCand([{ company: 'X', title: 'Y' }]), REF), `EXP: enriched but NO usable dates → unverified`);
+
+    // ── Purity / no mutation ──
+    const pureCand = pdlCand([{ start_date: '2019-01-01', end_date: '2024-01-01' }]);
+    const beforeJSON = JSON.stringify(pureCand);
+    computeExperienceBadge(pureCand, REF);
+    assert(JSON.stringify(pureCand) === beforeJSON && !('experienceBadge' in pureCand),
+      `EXP: computeExperienceBadge does not mutate the candidate`);
+
+    // ── No behavior change: experience array does not affect scoring/visibility ──
+    const expCo = findOrCreateCompany({ name: 'Exp Regress Co' });
+    const expNeed = createNeed({ companyId: expCo.id, title: 'SOC Analyst', requiredSkills: ['SIEM', 'SOC'], seniority: 'Mid', locationType: 'Remote', confirmed: true });
+    const baseCandFields = {
+      title: 'SOC Analyst', company: 'RegCo', skills: ['SIEM', 'SOC'], summary: 'soc analyst',
+      source: 'Apollo', sourceType: 'candidate_profile', scoutDecision: 'accepted',
+      discovered_by: ['apollo'], provider_of_record: 'apollo', resolved_by: ['apollo'], resolution_status: 'resolved',
+      workHistory: [{ title: 'SOC Analyst', company: 'RegCo', startDate: isoMonthsAgo(24), current: true, months: 24 }],
+    };
+    const cNoExp = findOrCreateCandidate({ ...baseCandFields, name: 'Reg NoExp', linkedinUrl: 'https://www.linkedin.com/in/reg-noexp', sourceUrl: 'https://www.linkedin.com/in/reg-noexp', pipelineRunId: 'exp_reg' });
+    const cWithExp = findOrCreateCandidate({ ...baseCandFields, name: 'Reg WithExp', linkedinUrl: 'https://www.linkedin.com/in/reg-withexp', sourceUrl: 'https://www.linkedin.com/in/reg-withexp', experience: [{ start_date: '2015-01-01', end_date: '2024-01-01' }], pipelineRunId: 'exp_reg' });
+    // enrichedBy is set by PDL enrichment at runtime (mutation), not by
+    // findOrCreateCandidate — mirror that here so the badge computes.
+    cWithExp.enrichedBy = ['pdl-person-enrich'];
+    applySourcingQualityGate(cNoExp, expNeed);
+    applySourcingQualityGate(cWithExp, expNeed);
+    assert(cNoExp.visibility_state === cWithExp.visibility_state,
+      `EXP: PDL experience array does not change visibility gate outcome`);
+    const sNo = scoreCandidateAgainstNeed(cNoExp, expNeed).score;
+    const sWith = scoreCandidateAgainstNeed(cWithExp, expNeed).score;
+    assert(sNo === sWith,
+      `EXP: PDL experience array does not change score (${sNo} vs ${sWith})`);
+
+    // ── Client Report: short experience line, clean, no raw dates ──
+    createOrUpdateMatch({ needId: expNeed.id, candidateId: cWithExp.id, pipelineRunId: 'exp_reg', score: 72, tier: 'Review', matchedSkills: ['SIEM', 'SOC'], missingSkills: [], reasoning: ['Matches 2/2 required skills: SIEM, SOC', 'Remote-friendly'], rank: 1 });
+    const expRep = await generateClientReport({ needId: expNeed.id, pipelineRunId: 'exp_reg' });
+    const rcExp = expRep.report.candidates.find(c => c.name === 'Reg WithExp');
+    assert(rcExp && rcExp.experience === '~9 yrs — Senior',
+      `EXP: client report candidate carries short experience label (got "${rcExp && rcExp.experience}")`);
+    assert(/Experience:\s*~9 yrs — Senior/.test(expRep.report.emailDraft),
+      `EXP: client report email includes the experience line`);
+    const rcExpStr = JSON.stringify(rcExp);
+    assert(!/start_date|end_date|2015-01-01|"experience":\s*\[/.test(rcExpStr),
+      `EXP: client report candidate exposes NO raw PDL dates/array (only the label string)`);
+    // Non-enriched candidate → "Experience unverified" line.
+    const cUnvRep = findOrCreateCandidate({ ...baseCandFields, name: 'Reg Unverified', linkedinUrl: 'https://www.linkedin.com/in/reg-unverified', sourceUrl: 'https://www.linkedin.com/in/reg-unverified', pipelineRunId: 'exp_reg2' });
+    applySourcingQualityGate(cUnvRep, expNeed);
+    createOrUpdateMatch({ needId: expNeed.id, candidateId: cUnvRep.id, pipelineRunId: 'exp_reg2', score: 72, tier: 'Review', matchedSkills: ['SIEM', 'SOC'], missingSkills: [], reasoning: ['Matches 2/2 required skills: SIEM, SOC'], rank: 1 });
+    const expRep2 = await generateClientReport({ needId: expNeed.id, pipelineRunId: 'exp_reg2' });
+    const rcUnv = expRep2.report.candidates.find(c => c.name === 'Reg Unverified');
+    assert(rcUnv && rcUnv.experience === 'Experience unverified' && /Experience:\s*Unverified/.test(expRep2.report.emailDraft),
+      `EXP: non-enriched candidate → "Experience unverified" line (got "${rcUnv && rcUnv.experience}")`);
+
+    console.log('\n── EXPERIENCE BADGE SUMMARY ──');
+    console.log(JSON.stringify({ b5: b5.label, overlap: bOverlap.label, senior: bSenior.label, tiny: bTiny.label, reportLine: rcExp.experience, unverifiedReportLine: rcUnv.experience, scoreUnchanged: sNo === sWith }, null, 2));
   }
 
   // ── 17. Sample-run proof: pipeline-style log of one scout pass ──

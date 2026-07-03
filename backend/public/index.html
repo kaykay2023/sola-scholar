@@ -1502,6 +1502,10 @@ const MatchesPage = ({state, refresh, navigateTo, query}) => {
                            <div className="flex gap-1 mt-1 flex-wrap">
                             <Badge cls={matchTierColor(displayLabel)}>{displayLabel}</Badge>
                             <Badge cls={statusColor(m.status)}>{m.status}</Badge>
+                            {/* Honest approximate experience from stored PDL history (display only). */}
+                            <Badge cls={(c.experienceBadge && c.experienceBadge.isVerified) ? 'bg-sky-100 text-sky-700' : 'bg-gray-100 text-gray-500'}>
+                              {(c.experienceBadge && c.experienceBadge.label) || 'Experience unverified'}
+                            </Badge>
                           </div>
                         </div>
                       </div>
@@ -1779,6 +1783,7 @@ const ClientReportsPage = ({state, refresh, query}) => {
                       </div>
                     </div>
                     {c.whyThisCandidate && <p className="text-xs text-gray-700 mb-2 leading-relaxed"><strong className="text-gray-800">Why this candidate:</strong> {c.whyThisCandidate}</p>}
+                    {c.experience && <p className="text-xs text-gray-700 mb-2"><strong className="text-gray-800">Experience:</strong> {/^Experience unverified$/.test(c.experience) ? 'Unverified' : c.experience}</p>}
                     {c.matchedSkills?.length>0 && (
                       <div className="flex flex-wrap gap-1 mb-1">
                         {c.matchedSkills.map(s => <Badge key={s} cls="bg-emerald-50 text-emerald-700">✓ {s}</Badge>)}
