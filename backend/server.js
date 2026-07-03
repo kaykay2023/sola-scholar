@@ -5854,7 +5854,6 @@ const EXPERIENCE_TIER_BANDS = {
   juniorMaxExclusive: 2.0, // years < 2.0            → Junior
   seniorMinExclusive: 6.0, // years > 6.0            → Senior; 2.0..6.0 inclusive → Mid
 };
-const MS_PER_YEAR = 365.25 * 24 * 60 * 60 * 1000;
 const EXPERIENCE_UNVERIFIED = Object.freeze({
   label: 'Experience unverified', approximateYears: null, tier: null, verifiedFrom: null, isVerified: false,
 });
@@ -5863,6 +5862,30 @@ function experienceTierForYears(years) {
   if (years < EXPERIENCE_TIER_BANDS.juniorMaxExclusive) return 'Junior';
   if (years > EXPERIENCE_TIER_BANDS.seniorMinExclusive) return 'Senior';
   return 'Mid';
+}
+
+// Calendar-aware duration in fractional years between two UTC millisecond
+// timestamps. A whole number of calendar years is EXACT regardless of leap
+// years — advance the anniversary year by year, then measure the leftover
+// against the length of the current partial calendar year. This is what makes
+// exactly 24 or 72 calendar months land precisely on 2.0 / 6.0 (Mid) instead
+// of drifting to 1.998 / 6.002 the way a fixed 365.25-day divisor does.
+function calendarDurationYears(startMs, endMs) {
+  if (!(endMs > startMs)) return 0;
+  const start = new Date(startMs);
+  let years = 0;
+  let cursorMs = startMs;
+  let cursorY = start.getUTCFullYear();
+  const mo = start.getUTCMonth();
+  const day = start.getUTCDate();
+  while (true) {
+    const nextMs = Date.UTC(cursorY + 1, mo, day);
+    if (nextMs <= endMs) { years++; cursorMs = nextMs; cursorY++; } else break;
+  }
+  const yearAfterCursorMs = Date.UTC(cursorY + 1, mo, day);
+  const denom = yearAfterCursorMs - cursorMs;
+  const frac = denom > 0 ? (endMs - cursorMs) / denom : 0;
+  return years + frac;
 }
 
 // Parse a PDL partial date. `edge` is 'start' or 'end' and only affects how a
@@ -5929,8 +5952,9 @@ function computeExperienceBadge(c = {}, referenceDate = undefined) {
       if (s <= cur[1]) cur[1] = Math.max(cur[1], en);  // overlap/adjacent → merge
       else merged.push([s, en]);
     }
-    const totalMs = merged.reduce((sum, [s, en]) => sum + (en - s), 0);
-    const years = totalMs / MS_PER_YEAR;
+    // Sum calendar-aware duration per merged interval (tier must NOT come from
+    // a leap-year-sensitive float division, and never from the rounded display).
+    const years = merged.reduce((sum, [s, en]) => sum + calendarDurationYears(s, en), 0);
     const tier = experienceTierForYears(years);
     const rounded = Math.round(years);
     const label = rounded >= 1 ? `~${rounded} yrs — ${tier}` : `<1 yr — ${tier}`;
@@ -6773,6 +6797,7 @@ module.exports = {
     clientWhyLine,
     computeExperienceBadge,
     experienceTierForYears,
+    calendarDurationYears,
     parsePartialExperienceDate,
     EXPERIENCE_TIER_BANDS,
     mergeCandidateSkillEvidence,

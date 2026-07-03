@@ -300,7 +300,7 @@ const {
   applyManualSkillEdit, displaySkillBucketsForMatch,
   resolveSkillKey, __setSkillSynonymGroupsForTest, __resetSkillSynonymGroups,
   createCandidateOutcome, patchCandidateOutcome, buildDailyLearningSummary,
-  computeExperienceBadge, experienceTierForYears, parsePartialExperienceDate, EXPERIENCE_TIER_BANDS,
+  computeExperienceBadge, experienceTierForYears, calendarDurationYears, parsePartialExperienceDate, EXPERIENCE_TIER_BANDS,
 } = _internals;
 
 // NOTE: do NOT call loadDB() — it reassigns the module-internal `DB` binding
@@ -5561,6 +5561,41 @@ async function main() {
     assert(experienceTierForYears(0) === 'Junior', `EXP: 0y → Junior`);
     assert(EXPERIENCE_TIER_BANDS.juniorMaxExclusive === 2.0 && EXPERIENCE_TIER_BANDS.seniorMinExclusive === 6.0,
       `EXP: tier bands are the documented 2.0 / 6.0`);
+
+    // ── Calendar-aware duration boundaries (leap-year safe) ──
+    // A whole number of calendar years must be EXACT, not leap-year-shifted.
+    assert(calendarDurationYears(Date.UTC(2021,0,1), Date.UTC(2023,0,1)) === 2,
+      `EXP: exactly 2 calendar years === 2 (no float drift)`);
+    assert(calendarDurationYears(Date.UTC(2020,0,1), Date.UTC(2022,0,1)) === 2,
+      `EXP: leap-spanning 2 calendar years === 2`);
+    assert(calendarDurationYears(Date.UTC(2010,0,1), Date.UTC(2016,0,1)) === 6,
+      `EXP: exactly 6 calendar years === 6`);
+    assert(calendarDurationYears(Date.UTC(2016,0,1), Date.UTC(2022,0,1)) === 6,
+      `EXP: leap-spanning 6 calendar years === 6`);
+    // Exact 2 calendar years (24 months) → Mid.
+    const bExact2 = computeExperienceBadge(pdlCand([{ start_date: '2021-01-01', end_date: '2023-01-01' }]), REF);
+    assert(bExact2.tier === 'Mid' && bExact2.approximateYears === 2 && bExact2.label === '~2 yrs — Mid',
+      `EXP: exact 24 calendar months → Mid (got ${JSON.stringify(bExact2)})`);
+    // Exact 6 calendar years (72 months) → Mid.
+    const bExact6 = computeExperienceBadge(pdlCand([{ start_date: '2010-01-01', end_date: '2016-01-01' }]), REF);
+    assert(bExact6.tier === 'Mid' && bExact6.approximateYears === 6 && bExact6.label === '~6 yrs — Mid',
+      `EXP: exact 72 calendar months → Mid (got ${JSON.stringify(bExact6)})`);
+    // Leap-spanning exact 2 / 6 calendar years → Mid.
+    assert(computeExperienceBadge(pdlCand([{ start_date: '2020-01-01', end_date: '2022-01-01' }]), REF).tier === 'Mid',
+      `EXP: leap-spanning exact 2 years → Mid`);
+    assert(computeExperienceBadge(pdlCand([{ start_date: '2016-01-01', end_date: '2022-01-01' }]), REF).tier === 'Mid',
+      `EXP: leap-spanning exact 6 years → Mid`);
+    // One day BEFORE 2 calendar years → Junior (tier uses unrounded, not ~2 display).
+    const bBefore2 = computeExperienceBadge(pdlCand([{ start_date: '2021-01-01', end_date: '2022-12-31' }]), REF);
+    assert(bBefore2.tier === 'Junior' && bBefore2.approximateYears === 2,
+      `EXP: one day before 2 years → Junior while displaying ~2 (got ${JSON.stringify(bBefore2)})`);
+    // One day AFTER 6 calendar years → Senior (tier uses unrounded, not ~6 display).
+    const bAfter6 = computeExperienceBadge(pdlCand([{ start_date: '2010-01-01', end_date: '2016-01-02' }]), REF);
+    assert(bAfter6.tier === 'Senior' && bAfter6.approximateYears === 6 && bAfter6.label === '~6 yrs — Senior',
+      `EXP: one day after 6 years → Senior while displaying ~6 (got ${JSON.stringify(bAfter6)})`);
+    // Greater than 72 calendar months → Senior.
+    assert(computeExperienceBadge(pdlCand([{ start_date: '2010-01-01', end_date: '2016-02-01' }]), REF).tier === 'Senior',
+      `EXP: >72 calendar months → Senior`);
 
     // ── Computation ──
     // Normal single closed range → exactly 5 years.
