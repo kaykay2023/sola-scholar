@@ -31,6 +31,13 @@ const DATA_DIR = path.dirname(DATA_FILE);
 const INTERNAL_USER = process.env.INTERNAL_USER || 'sola';
 const INTERNAL_PASSWORD = process.env.INTERNAL_PASSWORD || ''; // refuse if blank in prod
 
+const LEMLIST_API_BASE_URL = (process.env.LEMLIST_API_BASE_URL || 'https://api.lemlist.com/api').replace(/\/+$/, '');
+const LEMLIST_API_KEY = process.env.LEMLIST_API_KEY || '';
+const LEMLIST_CAMPAIGN_ID = process.env.LEMLIST_CAMPAIGN_ID || '';
+const LEMLIST_WEBHOOK_SECRET = process.env.LEMLIST_WEBHOOK_SECRET || '';
+const LEMLIST_SYNC_ENABLED = String(process.env.LEMLIST_SYNC_ENABLED || '').toLowerCase() === 'true';
+const LEMLIST_REQUEST_TIMEOUT_MS = Math.max(1000, parseInt(process.env.LEMLIST_REQUEST_TIMEOUT_MS || '10000', 10) || 10000);
+
 // ── Service config shape (used only to report which envs are set, never the values) ──
 const SERVICES = {
   apollo:   { envs: ['APOLLO_API_KEY'] },
@@ -42,6 +49,7 @@ const SERVICES = {
   airtable: { envs: ['AIRTABLE_PAT', 'AIRTABLE_BASE_ID', 'AIRTABLE_TABLE_NAME'] },
   clerk:    { envs: ['CLERK_PUBLISHABLE_KEY', 'CLERK_SECRET_KEY'] },
   pdl:      { envs: ['PDL_API_KEY'] },
+  lemlist:  { envs: ['LEMLIST_API_KEY', 'LEMLIST_CAMPAIGN_ID'] },
 };
 const isConfigured = (svc) => SERVICES[svc] && SERVICES[svc].envs.every(e => !!process.env[e]);
 
@@ -74,7 +82,7 @@ const SCORING_PROFILES = loadJsonConfig('scoring-profiles.json', { version: 0, e
 // Providers with no env vars defined are reported as 'disabled'.
 const PROVIDER_LABELS = {
   apollo: 'Apollo', pdl: 'PDL', github: 'GitHub', firecrawl: 'Firecrawl',
-  hunter: 'Hunter', adzuna: 'Adzuna', openai: 'OpenAI', airtable: 'Airtable', clerk: 'Clerk',
+  hunter: 'Hunter', adzuna: 'Adzuna', openai: 'OpenAI', airtable: 'Airtable', clerk: 'Clerk', lemlist: 'Lemlist',
 };
 const PROVIDER_KEYS = Object.keys(SERVICES);
 // V1 does not use these providers in the live pipeline path.
@@ -280,6 +288,8 @@ async function loadDB() {
     const parsed = JSON.parse(raw);
     DB = emptyDB();
     for (const c of COLLECTIONS) if (Array.isArray(parsed[c])) DB[c] = parsed[c];
+    DB.outreach = DB.outreach.map(normalizeOutreachRecord);
+    if (!Array.isArray(DB.pipeline_runs)) DB.pipeline_runs = DB.pipeline_runs || [];
   } catch (e) {
     if (e.code !== 'ENOENT') console.error('loadDB:', e.message);
     DB = emptyDB();
@@ -2081,8 +2091,60 @@ function createOrUpdateMatch({ needId, candidateId, pipelineRunId = null, score,
   return m;
 }
 
+const OUTREACH_STATUSES = new Set([
+  'draft', 'approved', 'queued', 'provider_accepted', 'sent', 'delivered',
+  'opened', 'replied', 'bounced', 'unsubscribed', 'failed', 'cancelled',
+]);
+const OUTREACH_TERMINAL_STATUSES = new Set(['replied', 'bounced', 'unsubscribed', 'failed', 'cancelled']);
+const OUTREACH_ACTIVE_PROVIDER_STATUSES = new Set(['queued', 'provider_accepted', 'sent', 'delivered', 'opened']);
+const PROVIDER_STATUS_RANK = {
+  draft: 0, approved: 1, queued: 2, provider_accepted: 3, sent: 4,
+  delivered: 5, opened: 6, replied: 7, failed: 8, bounced: 9,
+  unsubscribed: 10, cancelled: 11,
+};
+
+function normalizeOutreachStatus(status) {
+  const clean = String(status || '').trim().toLowerCase();
+  if (clean === 'drafted') return 'draft';
+  if (clean === 'meeting-booked') return 'replied';
+  if (clean === 'no-response') return 'sent';
+  return OUTREACH_STATUSES.has(clean) ? clean : 'draft';
+}
+
+function normalizeOutreachRecord(o) {
+  if (!o || typeof o !== 'object') return o;
+  o.status = normalizeOutreachStatus(o.status);
+  o.approvalStatus = o.approvalStatus || (o.status === 'approved' ? 'approved' : 'pending');
+  o.approvedAt = o.approvedAt || null;
+  o.approvedBy = o.approvedBy || null;
+  o.provider = o.provider || null;
+  o.providerLeadId = o.providerLeadId || null;
+  o.providerCampaignId = o.providerCampaignId || null;
+  o.providerMessageId = o.providerMessageId || null;
+  o.providerStatus = o.providerStatus || null;
+  o.providerStatusUpdatedAt = o.providerStatusUpdatedAt || null;
+  o.queuedAt = o.queuedAt || null;
+  o.sentAt = o.sentAt || null;
+  o.deliveredAt = o.deliveredAt || null;
+  o.firstOpenedAt = o.firstOpenedAt || null;
+  o.repliedAt = o.repliedAt || null;
+  o.bouncedAt = o.bouncedAt || null;
+  o.unsubscribedAt = o.unsubscribedAt || null;
+  o.failedAt = o.failedAt || null;
+  o.failureCode = o.failureCode || null;
+  o.failureReason = o.failureReason || '';
+  o.lastProviderSyncAt = o.lastProviderSyncAt || null;
+  o.providerEvents = Array.isArray(o.providerEvents) ? o.providerEvents : [];
+  o.manualNotes = Array.isArray(o.manualNotes) ? o.manualNotes : [];
+  o.replyText = o.replyText || '';
+  o.nextAction = o.nextAction || '';
+  o.statusSource = o.statusSource || 'system';
+  o.updatedAt = o.updatedAt || o.createdAt || now();
+  return o;
+}
+
 function createOutreach({ managerId, needId, matchIds, channel = 'email', subject, body, kind }) {
-  const o = {
+  const o = normalizeOutreachRecord({
     id: uid(),
     managerId,
     needId: needId || null,
@@ -2091,10 +2153,13 @@ function createOutreach({ managerId, needId, matchIds, channel = 'email', subjec
     subject: subject || '',
     body: body || '',
     kind: kind || (needId ? 'shortlist-pitch' : 'warm-intro'),
-    status: 'drafted',
-    sentAt: null, repliedAt: null, replyText: '', nextAction: '',
+    status: 'draft',
+    approvalStatus: 'pending',
+    provider: null,
+    providerEvents: [],
+    manualNotes: [],
     createdAt: now(),
-  };
+  });
   DB.outreach.push(o);
   return o;
 }
@@ -2122,6 +2187,282 @@ function createClientReport(input) {
   return r;
 }
 
+function lemlistConfig() {
+  return {
+    apiBaseUrl: (process.env.LEMLIST_API_BASE_URL || LEMLIST_API_BASE_URL).replace(/\/+$/, ''),
+    apiKey: process.env.LEMLIST_API_KEY || LEMLIST_API_KEY,
+    campaignId: process.env.LEMLIST_CAMPAIGN_ID || LEMLIST_CAMPAIGN_ID,
+    webhookSecret: process.env.LEMLIST_WEBHOOK_SECRET || LEMLIST_WEBHOOK_SECRET,
+    syncEnabled: String(process.env.LEMLIST_SYNC_ENABLED || (LEMLIST_SYNC_ENABLED ? 'true' : '')).toLowerCase() === 'true',
+    timeoutMs: Math.max(1000, parseInt(process.env.LEMLIST_REQUEST_TIMEOUT_MS || String(LEMLIST_REQUEST_TIMEOUT_MS), 10) || LEMLIST_REQUEST_TIMEOUT_MS),
+  };
+}
+
+function sanitizeFailureReason(value) {
+  return String(value || '').replace(/[\r\n]+/g, ' ').slice(0, 180);
+}
+
+function classifyProviderHttpStatus(status) {
+  if (status === 400) return 'bad_request';
+  if (status === 401 || status === 403) return 'auth_error';
+  if (status === 404) return 'not_found';
+  if (status === 409) return 'duplicate';
+  if (status === 429) return 'rate_limited';
+  if (status >= 500) return 'provider_error';
+  return 'http_error';
+}
+
+async function lemlistRequest(method, endpoint, { body, fetchImpl } = {}) {
+  const cfg = lemlistConfig();
+  if (!cfg.apiKey) return { ok: false, status: 0, category: 'missing_config', data: null };
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), cfg.timeoutMs) : null;
+  try {
+    const headers = {
+      Authorization: `Basic ${Buffer.from(':' + cfg.apiKey).toString('base64')}`,
+      Accept: 'application/json',
+    };
+    if (body !== undefined) headers['Content-Type'] = 'application/json';
+    const res = await (fetchImpl || fetch)(`${cfg.apiBaseUrl}${endpoint}`, {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: controller ? controller.signal : undefined,
+    });
+    const text = await res.text().catch(() => '');
+    let data = null;
+    if (text) {
+      try { data = JSON.parse(text); }
+      catch { return { ok: false, status: res.status, category: 'malformed_response', data: null }; }
+    }
+    if (!res.ok) return { ok: false, status: res.status, category: classifyProviderHttpStatus(res.status), data };
+    return { ok: true, status: res.status, category: 'ok', data };
+  } catch (e) {
+    const category = e && e.name === 'AbortError' ? 'timeout' : 'network_error';
+    return { ok: false, status: 0, category, data: null };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function managerEmailVerified(manager) {
+  const confidence = String(manager?.emailConfidence || manager?.emailStatus || '').toLowerCase();
+  return ['verified', 'deliverable', 'high', 'valid'].includes(confidence);
+}
+
+function validEmail(value) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim());
+}
+
+function activeDuplicateOutreachForManager(outreach, managerId, campaignId) {
+  return DB.outreach.find(o => o.id !== outreach.id && o.managerId === managerId && o.provider === 'lemlist' && o.providerCampaignId === campaignId && OUTREACH_ACTIVE_PROVIDER_STATUSES.has(normalizeOutreachStatus(o.status)));
+}
+
+function outreachBlockedReason(outreach) {
+  const status = normalizeOutreachStatus(outreach?.status);
+  if (status === 'bounced' || outreach?.bouncedAt) return 'hard_bounce';
+  if (status === 'unsubscribed' || outreach?.unsubscribedAt) return 'unsubscribed';
+  return '';
+}
+
+function validateOutreachReadyForEnrollment(outreach, { idempotencyKey } = {}) {
+  normalizeOutreachRecord(outreach);
+  const cfg = lemlistConfig();
+  const manager = DB.hiring_managers.find(m => m.id === outreach.managerId);
+  if (!cfg.apiKey || !cfg.campaignId) return { ok: false, error: 'Lemlist configuration missing', code: 'missing_config' };
+  if (!manager) return { ok: false, error: 'Hiring manager not found', code: 'missing_manager' };
+  if (!validEmail(manager.email)) return { ok: false, error: 'Verified manager email required', code: 'invalid_email' };
+  if (!managerEmailVerified(manager)) return { ok: false, error: 'Verified manager email required', code: 'unverified_email' };
+  if (outreach.approvalStatus !== 'approved') return { ok: false, error: 'Human approval required before enrollment', code: 'approval_required' };
+  if (!String(outreach.subject || '').trim() || !String(outreach.body || '').trim()) return { ok: false, error: 'Subject and body required', code: 'missing_content' };
+  const blocked = outreachBlockedReason(outreach);
+  if (blocked) return { ok: false, error: 'Outreach is blocked for this contact', code: blocked };
+  if (!String(idempotencyKey || '').trim()) return { ok: false, error: 'idempotencyKey required', code: 'missing_idempotency_key' };
+  if (activeDuplicateOutreachForManager(outreach, outreach.managerId, cfg.campaignId)) return { ok: false, error: 'Active duplicate Lemlist enrollment exists', code: 'duplicate_active_enrollment' };
+  return { ok: true, manager, cfg };
+}
+
+function approveOutreach(id, { approvedBy = 'internal' } = {}) {
+  const outreach = DB.outreach.find(o => o.id === id);
+  if (!outreach) return { ok: false, status: 404, error: 'Not found' };
+  normalizeOutreachRecord(outreach);
+  if (!String(outreach.subject || '').trim() || !String(outreach.body || '').trim()) return { ok: false, status: 400, error: 'subject and body required' };
+  const blocked = outreachBlockedReason(outreach);
+  if (blocked) return { ok: false, status: 409, error: blocked };
+  outreach.approvalStatus = 'approved';
+  outreach.approvedAt = outreach.approvedAt || now();
+  outreach.approvedBy = String(approvedBy || 'internal').slice(0, 80);
+  outreach.status = 'approved';
+  outreach.statusSource = 'manual';
+  outreach.updatedAt = now();
+  return { ok: true, outreach };
+}
+
+async function enrollOutreachInLemlist(id, { idempotencyKey, fetchImpl } = {}) {
+  const outreach = DB.outreach.find(o => o.id === id);
+  if (!outreach) return { ok: false, status: 404, error: 'Not found', code: 'not_found' };
+  normalizeOutreachRecord(outreach);
+  const ready = validateOutreachReadyForEnrollment(outreach, { idempotencyKey });
+  if (!ready.ok) return { ok: false, status: ready.code === 'duplicate_active_enrollment' ? 409 : 400, error: ready.error, code: ready.code };
+  const { manager, cfg } = ready;
+  if (outreach.idempotencyKey && outreach.idempotencyKey === idempotencyKey && outreach.providerLeadId) {
+    return { ok: true, reused: true, outreach };
+  }
+  outreach.provider = 'lemlist';
+  outreach.providerCampaignId = cfg.campaignId;
+  outreach.idempotencyKey = idempotencyKey;
+  outreach.status = 'queued';
+  outreach.statusSource = 'system';
+  outreach.queuedAt = outreach.queuedAt || now();
+  outreach.updatedAt = now();
+
+  const leadBody = {
+    email: manager.email,
+    firstName: String(manager.name || '').split(/\s+/)[0] || manager.name || '',
+    lastName: String(manager.name || '').split(/\s+/).slice(1).join(' '),
+    companyName: DB.companies.find(c => c.id === manager.companyId)?.name || '',
+    jobTitle: manager.title || '',
+    linkedinUrl: manager.linkedinUrl || undefined,
+    icebreaker: outreach.subject,
+  };
+  const created = await lemlistRequest('POST', `/campaigns/${encodeURIComponent(cfg.campaignId)}/leads/?deduplicate=true&verifyEmail=false&findEmail=false&linkedinEnrichment=false&findPhone=false`, { body: leadBody, fetchImpl });
+  if (!created.ok) {
+    outreach.status = 'failed';
+    outreach.statusSource = 'system';
+    outreach.failedAt = now();
+    outreach.failureCode = created.category;
+    outreach.failureReason = sanitizeFailureReason(`Lemlist lead creation failed (${created.category})`);
+    outreach.updatedAt = now();
+    return { ok: false, status: created.status || 502, error: 'Lemlist lead creation failed', code: created.category, outreach };
+  }
+  outreach.providerLeadId = created.data?._id || created.data?.id || outreach.providerLeadId;
+  outreach.providerCampaignId = created.data?.campaignId || cfg.campaignId;
+  outreach.providerStatus = created.data?.status || created.data?.state || 'created';
+  outreach.providerStatusUpdatedAt = now();
+  if (!outreach.providerLeadId) {
+    outreach.status = 'failed';
+    outreach.failedAt = now();
+    outreach.failureCode = 'malformed_response';
+    outreach.failureReason = 'Lemlist response did not include a lead id';
+    outreach.updatedAt = now();
+    return { ok: false, status: 502, error: 'Lemlist response missing lead id', code: 'malformed_response', outreach };
+  }
+  const launched = await lemlistRequest('POST', `/leads/review/${encodeURIComponent(outreach.providerLeadId)}`, { fetchImpl });
+  if (!launched.ok) {
+    outreach.status = 'failed';
+    outreach.failedAt = now();
+    outreach.failureCode = launched.category;
+    outreach.failureReason = sanitizeFailureReason(`Lemlist launch failed (${launched.category})`);
+    outreach.updatedAt = now();
+    return { ok: false, status: launched.status || 502, error: 'Lemlist launch failed', code: launched.category, outreach };
+  }
+  outreach.status = 'provider_accepted';
+  outreach.statusSource = 'provider_confirmed';
+  outreach.providerStatus = 'reviewed';
+  outreach.providerStatusUpdatedAt = now();
+  outreach.lastProviderSyncAt = now();
+  outreach.failureCode = null;
+  outreach.failureReason = '';
+  outreach.updatedAt = now();
+  return { ok: true, outreach };
+}
+
+function providerEventId(payload) {
+  return String(payload?._id || payload?.id || payload?.eventId || '').trim();
+}
+
+function mapLemlistEventToStatus(type) {
+  const clean = String(type || '').trim();
+  const map = {
+    contacted: 'provider_accepted',
+    emailsSent: 'sent',
+    emailsDelivered: 'delivered',
+    emailsOpened: 'opened',
+    emailsReplied: 'replied',
+    emailsBounced: 'bounced',
+    emailsFailed: 'failed',
+    unsubscribed: 'unsubscribed',
+    emailsUnsubscribed: 'unsubscribed',
+    leadUnsubscribed: 'unsubscribed',
+    stopped: 'cancelled',
+  };
+  return map[clean] || null;
+}
+
+function findOutreachForLemlistEvent(payload) {
+  const leadId = String(payload?.leadId || payload?.lead?._id || payload?.lead?.id || '').trim();
+  const campaignId = String(payload?.campaignId || '').trim();
+  const email = String(payload?.leadEmail || payload?.email || payload?.to?.[0]?.address || '').toLowerCase();
+  let found = null;
+  if (leadId) found = DB.outreach.find(o => o.provider === 'lemlist' && o.providerLeadId === leadId);
+  if (!found && email) {
+    found = DB.outreach.find(o => {
+      if (o.provider !== 'lemlist') return false;
+      if (campaignId && o.providerCampaignId && o.providerCampaignId !== campaignId) return false;
+      const manager = DB.hiring_managers.find(m => m.id === o.managerId);
+      return String(manager?.email || '').toLowerCase() === email;
+    });
+  }
+  return found || null;
+}
+
+function applyOutreachProviderStatus(outreach, nextStatus, payload = {}) {
+  normalizeOutreachRecord(outreach);
+  if (!OUTREACH_STATUSES.has(nextStatus)) return { ok: false, error: 'unsupported_status' };
+  const current = normalizeOutreachStatus(outreach.status);
+  if (OUTREACH_TERMINAL_STATUSES.has(current) && PROVIDER_STATUS_RANK[nextStatus] < PROVIDER_STATUS_RANK[current]) {
+    return { ok: true, ignored: true, outreach };
+  }
+  if (current === 'replied' && nextStatus === 'opened') return { ok: true, ignored: true, outreach };
+  outreach.status = nextStatus;
+  outreach.statusSource = 'provider_confirmed';
+  outreach.providerStatus = String(payload.type || nextStatus);
+  outreach.providerStatusUpdatedAt = payload.createdAt || now();
+  outreach.lastProviderSyncAt = now();
+  if (nextStatus === 'sent') outreach.sentAt = outreach.sentAt || payload.createdAt || now();
+  if (nextStatus === 'delivered') outreach.deliveredAt = outreach.deliveredAt || payload.createdAt || now();
+  if (nextStatus === 'opened') outreach.firstOpenedAt = outreach.firstOpenedAt || payload.createdAt || now();
+  if (nextStatus === 'replied') outreach.repliedAt = outreach.repliedAt || payload.createdAt || now();
+  if (nextStatus === 'bounced') outreach.bouncedAt = outreach.bouncedAt || payload.createdAt || now();
+  if (nextStatus === 'unsubscribed') outreach.unsubscribedAt = outreach.unsubscribedAt || payload.createdAt || now();
+  if (nextStatus === 'failed') {
+    outreach.failedAt = outreach.failedAt || payload.createdAt || now();
+    outreach.failureCode = sanitizeFailureReason(payload.failureCode || payload.errorCode || 'provider_failed');
+    outreach.failureReason = sanitizeFailureReason(payload.failureReason || payload.error || payload.message || 'Provider reported failure');
+  }
+  if (payload.providerMessageId || payload.messageId) outreach.providerMessageId = payload.providerMessageId || payload.messageId;
+  outreach.updatedAt = now();
+  return { ok: true, outreach };
+}
+
+function processLemlistWebhook(payload = {}) {
+  const cfg = lemlistConfig();
+  if (cfg.webhookSecret && payload.secret !== cfg.webhookSecret) return { ok: false, status: 401, error: 'invalid webhook secret' };
+  if (!cfg.webhookSecret) return { ok: false, status: 503, error: 'webhook secret not configured' };
+  const type = String(payload.type || '').trim();
+  const nextStatus = mapLemlistEventToStatus(type);
+  if (!nextStatus) return { ok: false, status: 400, error: 'unsupported event type' };
+  const outreach = findOutreachForLemlistEvent(payload);
+  if (!outreach) return { ok: false, status: 404, error: 'outreach not found' };
+  normalizeOutreachRecord(outreach);
+  const eventId = providerEventId(payload);
+  if (eventId && outreach.providerEvents.some(e => e.providerEventId === eventId)) {
+    return { ok: true, duplicate: true, outreach };
+  }
+  const applied = applyOutreachProviderStatus(outreach, nextStatus, payload);
+  outreach.providerEvents.push({
+    id: uid(),
+    provider: 'lemlist',
+    providerEventId: eventId || uid(),
+    type,
+    status: nextStatus,
+    source: 'provider_confirmed',
+    createdAt: payload.createdAt || now(),
+    receivedAt: now(),
+  });
+  if (outreach.providerEvents.length > 100) outreach.providerEvents = outreach.providerEvents.slice(-100);
+  return { ok: true, ignored: !!applied.ignored, outreach };
+}
 /* ════════════════════════════════════════════════════════════════════
    EXTERNAL API CLIENTS — all server-side, keys never leave this process
    ════════════════════════════════════════════════════════════════════ */
@@ -6390,6 +6731,31 @@ async function runPipeline({ company, role, skills = [], mustHaveSkills = [], lo
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
+function createMemoryRateLimiter({ windowMs = 60000, max = 60, keyPrefix = 'global' } = {}) {
+  const hits = new Map();
+  return function rateLimit(req, res, next) {
+    const nowMs = Date.now();
+    const key = `${keyPrefix}:${req.ip || req.socket?.remoteAddress || 'local'}`;
+    const bucket = hits.get(key) || { count: 0, resetAt: nowMs + windowMs };
+    if (bucket.resetAt <= nowMs) {
+      bucket.count = 0;
+      bucket.resetAt = nowMs + windowMs;
+    }
+    bucket.count += 1;
+    hits.set(key, bucket);
+    res.set('X-RateLimit-Limit', String(max));
+    res.set('X-RateLimit-Remaining', String(Math.max(0, max - bucket.count)));
+    if (bucket.count > max) {
+      const retryAfter = Math.max(1, Math.ceil((bucket.resetAt - nowMs) / 1000));
+      res.set('Retry-After', String(retryAfter));
+      return res.status(429).json({ error: 'Rate limit exceeded', retryAfter });
+    }
+    return next();
+  };
+}
+
+const outreachRateLimit = createMemoryRateLimiter({ windowMs: 60000, max: 30, keyPrefix: 'outreach' });
+const lemlistWebhookRateLimit = createMemoryRateLimiter({ windowMs: 60000, max: 120, keyPrefix: 'lemlist-webhook' });
 // ── Internal Basic Auth (skips /api/health and static frontend) ──
 function requireAuth(req, res, next) {
   if (!INTERNAL_PASSWORD) {
@@ -6433,6 +6799,19 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+// Lemlist calls this endpoint directly. It deliberately bypasses Basic Auth and
+// is authenticated with the shared webhook secret echoed in the JSON payload.
+app.post('/api/integrations/lemlist/webhook', lemlistWebhookRateLimit, async (req, res) => {
+  try {
+    const out = processLemlistWebhook(req.body || {});
+    if (!out.ok) return res.status(out.status || 400).json({ error: out.error || 'Webhook rejected' });
+    await persistDB();
+    res.json({ ok: true, duplicate: !!out.duplicate, ignored: !!out.ignored });
+  } catch (e) {
+    console.error('lemlist/webhook', sanitizeFailureReason(e.message));
+    res.status(500).json({ error: 'Webhook processing failed' });
+  }
+});
 // ── All other API routes require auth ──
 app.use('/api', requireAuth);
 
@@ -6491,7 +6870,7 @@ app.get('/api/matches', (req, res) => {
   if (includeStale) return res.json(DB.matches);
   return res.json(DB.matches.filter(isVisibleMatch));
 });
-app.get('/api/outreach',         (req, res) => res.json(DB.outreach));
+app.get('/api/outreach',         (req, res) => res.json(DB.outreach.map(normalizeOutreachRecord)));
 app.get('/api/client-reports',   (req, res) => res.json(DB.client_reports));
 app.get('/api/candidate-outcomes', (req, res) => res.json(DB.candidate_outcomes));
 app.get('/api/candidate-outcomes/:id', (req, res) => {
@@ -6618,15 +6997,73 @@ app.patch('/api/matches/:id', async (req, res) => {
   await persistDB();
   res.json(m);
 });
-app.patch('/api/outreach/:id', async (req, res) => {
+app.patch('/api/outreach/:id', outreachRateLimit, async (req, res) => {
   const o = DB.outreach.find(x => x.id === req.params.id);
   if (!o) return res.status(404).json({ error: 'Not found' });
-  const allow = ['subject','body','status','replyText','nextAction'];
-  for (const k of allow) if (k in (req.body || {})) o[k] = req.body[k];
-  if (req.body?.status === 'sent' && !o.sentAt) o.sentAt = now();
-  if (req.body?.status === 'replied' && !o.repliedAt) o.repliedAt = now();
+  normalizeOutreachRecord(o);
+  const body = req.body || {};
+  const allow = ['subject','body','replyText','nextAction'];
+  for (const k of allow) if (k in body) o[k] = String(body[k] || '').slice(0, k === 'body' ? 8000 : 500);
+  if ('manualNote' in body && String(body.manualNote || '').trim()) {
+    o.manualNotes.push({ id: uid(), note: String(body.manualNote).trim().slice(0, 1000), createdAt: now(), source: 'manual' });
+  }
+  if ('status' in body) {
+    const requested = normalizeOutreachStatus(body.status);
+    if (requested !== 'cancelled') {
+      return res.status(400).json({ error: 'Provider-backed outreach statuses cannot be set manually. Use approve, enroll, or provider webhook routes.' });
+    }
+    o.status = 'cancelled';
+    o.statusSource = 'manual';
+  }
+  o.updatedAt = now();
   await persistDB();
   res.json(o);
+});
+
+app.post('/api/outreach/:id/approve', outreachRateLimit, async (req, res) => {
+  const out = approveOutreach(req.params.id, { approvedBy: req.body?.approvedBy || INTERNAL_USER || 'internal' });
+  if (!out.ok) return res.status(out.status || 400).json({ error: out.error });
+  await persistDB();
+  res.json(out.outreach);
+});
+
+app.post('/api/outreach/:id/enroll', outreachRateLimit, async (req, res) => {
+  const out = await enrollOutreachInLemlist(req.params.id, {
+    idempotencyKey: req.body?.idempotencyKey || req.headers['idempotency-key'],
+  });
+  if (!out.ok) {
+    await persistDB();
+    return res.status(out.status || 400).json({ error: out.error, code: out.code });
+  }
+  await persistDB();
+  res.json(out.outreach);
+});
+
+app.post('/api/outreach/:id/retry', outreachRateLimit, async (req, res) => {
+  const o = DB.outreach.find(x => x.id === req.params.id);
+  if (!o) return res.status(404).json({ error: 'Not found' });
+  normalizeOutreachRecord(o);
+  if (o.status !== 'failed') return res.status(409).json({ error: 'Only failed outreach can be retried' });
+  o.status = 'approved';
+  o.statusSource = 'system';
+  o.failedAt = null;
+  o.failureCode = null;
+  o.failureReason = '';
+  o.updatedAt = now();
+  await persistDB();
+  res.json(o);
+});
+
+app.post('/api/integrations/lemlist/sync', outreachRateLimit, async (req, res) => {
+  if (!lemlistConfig().syncEnabled) return res.status(400).json({ error: 'Lemlist sync is disabled' });
+  res.json({ ok: true, synced: 0, note: 'Webhook-driven sync is enabled; polling sync is not required for this deployment.' });
+});
+
+app.get('/api/outreach/:id/events', (req, res) => {
+  const o = DB.outreach.find(x => x.id === req.params.id);
+  if (!o) return res.status(404).json({ error: 'Not found' });
+  normalizeOutreachRecord(o);
+  res.json({ events: o.providerEvents || [], manualNotes: o.manualNotes || [] });
 });
 
 // ── Agent runs ──
@@ -6750,6 +7187,7 @@ module.exports = {
     createValidation,
     latestValidation,
     createOrUpdateMatch,
+    createOutreach,
     tierFromScore,
     scoreCandidateAgainstNeed,
     hasReviewEvidence,
@@ -6758,6 +7196,14 @@ module.exports = {
     runScout,
     runPipeline,
     generateClientReport,
+    normalizeOutreachRecord,
+    approveOutreach,
+    enrollOutreachInLemlist,
+    processLemlistWebhook,
+    applyOutreachProviderStatus,
+    validateOutreachReadyForEnrollment,
+    lemlistRequest,
+    mapLemlistEventToStatus,
     newPipelineRunId,
     classifySourceItem,
     scoreSourcedPage,
@@ -6862,5 +7308,15 @@ module.exports = {
     isVisibleMatch,
   },
 };
+
+
+
+
+
+
+
+
+
+
 
 

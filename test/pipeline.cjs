@@ -280,7 +280,7 @@ http.Server.prototype.listen = realListen;
 const { DB, _internals } = server;
 const {
   findOrCreateCompany, findOrCreateManager, findOrCreateCandidate, createNeed,
-  createValidation, createOrUpdateMatch,
+  createValidation, createOrUpdateMatch, createOutreach,
   runValidator, runMatchmaker, runScout, runPipeline, latestValidation,
   newPipelineRunId, hasReviewEvidence, tierFromScore, scoreCandidateAgainstNeed,
   classifySourceItem, generateClientReport, isLinkedInProfileUrl,
@@ -301,6 +301,8 @@ const {
   resolveSkillKey, __setSkillSynonymGroupsForTest, __resetSkillSynonymGroups,
   createCandidateOutcome, patchCandidateOutcome, buildDailyLearningSummary,
   computeExperienceBadge, experienceTierForYears, calendarDurationYears, parsePartialExperienceDate, EXPERIENCE_TIER_BANDS,
+  approveOutreach, enrollOutreachInLemlist, processLemlistWebhook, validateOutreachReadyForEnrollment,
+  mapLemlistEventToStatus,
 } = _internals;
 
 // NOTE: do NOT call loadDB() — it reassigns the module-internal `DB` binding
@@ -5722,6 +5724,103 @@ async function main() {
     console.log(JSON.stringify({ b5: b5.label, overlap: bOverlap.label, senior: bSenior.label, tiny: bTiny.label, reportLine: rcExp.experience, unverifiedReportLine: rcUnv.experience, scoreUnchanged: sNo === sWith }, null, 2));
   }
 
+  // ── 17. Lemlist provider-backed outreach status truth ──
+  {
+    const prevLemKey = process.env.LEMLIST_API_KEY;
+    const prevLemCampaign = process.env.LEMLIST_CAMPAIGN_ID;
+    const prevLemSecret = process.env.LEMLIST_WEBHOOK_SECRET;
+    process.env.LEMLIST_API_KEY = 'test-lemlist-key';
+    process.env.LEMLIST_CAMPAIGN_ID = 'cam_test_123';
+    process.env.LEMLIST_WEBHOOK_SECRET = 'hook-secret-test';
+
+    const lCo = findOrCreateCompany({ name: 'Lemlist Test Co' });
+    const manager = findOrCreateManager({
+      name: 'Laura Manager', title: 'VP Talent', companyId: lCo.id,
+      email: 'laura.manager@example.com', emailConfidence: 'verified', source: 'Manual', roleCategory: 'talent',
+    });
+    const unverified = findOrCreateManager({
+      name: 'Una Verified', title: 'Director', companyId: lCo.id,
+      email: 'una@example.com', emailConfidence: 'unknown', source: 'Manual', roleCategory: 'talent',
+    });
+    const outreach = createOutreach({ managerId: manager.id, needId: null, matchIds: [], subject: 'Shortlist ready', body: 'Please review this shortlist.', kind: 'warm-intro' });
+    const unverifiedOutreach = createOutreach({ managerId: unverified.id, needId: null, matchIds: [], subject: 'Hello', body: 'Body', kind: 'warm-intro' });
+
+    const beforeApprove = validateOutreachReadyForEnrollment(outreach, { idempotencyKey: 'lem-1' });
+    assert(beforeApprove.ok === false && beforeApprove.code === 'approval_required',
+      `LEMLIST: enrollment requires human approval first (got ${beforeApprove.code})`);
+    const badEmail = approveOutreach(unverifiedOutreach.id, { approvedBy: 'tester' });
+    assert(badEmail.ok === true, 'LEMLIST: unverified outreach can be drafted/approved but not enrolled');
+    const unverifiedReady = validateOutreachReadyForEnrollment(unverifiedOutreach, { idempotencyKey: 'lem-unverified' });
+    assert(unverifiedReady.ok === false && unverifiedReady.code === 'unverified_email',
+      `LEMLIST: verified-email requirement blocks enrollment (got ${unverifiedReady.code})`);
+
+    const approved = approveOutreach(outreach.id, { approvedBy: 'tester' });
+    assert(approved.ok && outreach.status === 'approved' && outreach.approvalStatus === 'approved',
+      'LEMLIST: human approval records approved state without provider proof');
+
+    const lemlistCalls = [];
+    const okFetch = async (url, opts = {}) => {
+      lemlistCalls.push({ url: String(url), method: opts.method || 'GET', body: opts.body ? JSON.parse(opts.body) : null, headers: opts.headers || {} });
+      if (/\/campaigns\/cam_test_123\/leads\//.test(String(url))) {
+        return mkRes({ _id: 'lea_test_1', campaignId: 'cam_test_123', status: 'review', email: manager.email });
+      }
+      if (/\/leads\/review\/lea_test_1/.test(String(url))) return mkRes({ ok: true });
+      return mkRes({ error: 'unexpected lemlist url' }, 404);
+    };
+    const enrolled = await enrollOutreachInLemlist(outreach.id, { idempotencyKey: 'lem-1', fetchImpl: okFetch });
+    assert(enrolled.ok && outreach.provider === 'lemlist' && outreach.providerLeadId === 'lea_test_1' && outreach.providerCampaignId === 'cam_test_123',
+      'LEMLIST: successful lead creation + campaign enrollment stores provider ids');
+    assert(outreach.status === 'provider_accepted' && outreach.statusSource === 'provider_confirmed' && lemlistCalls.length === 2,
+      `LEMLIST: launch stores provider-confirmed accepted status and exactly two mocked calls (got ${outreach.status}, ${lemlistCalls.length})`);
+    assert(/^Basic\s+/.test(lemlistCalls[0].headers.Authorization || '') && !String(lemlistCalls[0].headers.Authorization).includes('test-lemlist-key'),
+      'LEMLIST: Authorization is Basic encoded and does not expose the raw API key in captured headers');
+
+    const duplicateSameKey = await enrollOutreachInLemlist(outreach.id, { idempotencyKey: 'lem-1', fetchImpl: okFetch });
+    assert(duplicateSameKey.ok && duplicateSameKey.reused === true && lemlistCalls.length === 2,
+      'LEMLIST: same idempotency key reuses existing provider enrollment without another HTTP call');
+
+    const dupOutreach = createOutreach({ managerId: manager.id, needId: null, matchIds: [], subject: 'Second', body: 'Second body', kind: 'warm-intro' });
+    approveOutreach(dupOutreach.id, { approvedBy: 'tester' });
+    const dup = await enrollOutreachInLemlist(dupOutreach.id, { idempotencyKey: 'lem-dup', fetchImpl: okFetch });
+    assert(dup.ok === false && dup.code === 'duplicate_active_enrollment',
+      `LEMLIST: active duplicate enrollment suppressed (got ${dup.code})`);
+
+    assert(mapLemlistEventToStatus('emailsSent') === 'sent' && mapLemlistEventToStatus('emailsOpened') === 'opened' && mapLemlistEventToStatus('emailsReplied') === 'replied',
+      'LEMLIST: official webhook event names map to internal statuses');
+    const sentEvent = processLemlistWebhook({ _id: 'act_sent_1', type: 'emailsSent', leadId: 'lea_test_1', campaignId: 'cam_test_123', createdAt: '2026-01-01T00:00:00.000Z', secret: 'hook-secret-test' });
+    assert(sentEvent.ok && outreach.status === 'sent' && outreach.sentAt,
+      'LEMLIST: sent webhook stores provider-confirmed sent status');
+    const dupEvent = processLemlistWebhook({ _id: 'act_sent_1', type: 'emailsSent', leadId: 'lea_test_1', campaignId: 'cam_test_123', createdAt: '2026-01-01T00:00:00.000Z', secret: 'hook-secret-test' });
+    assert(dupEvent.ok && dupEvent.duplicate === true && outreach.providerEvents.filter(e => e.providerEventId === 'act_sent_1').length === 1,
+      'LEMLIST: duplicate webhook event is idempotent');
+    processLemlistWebhook({ _id: 'act_reply_1', type: 'emailsReplied', leadId: 'lea_test_1', campaignId: 'cam_test_123', leadEmail: manager.email, createdAt: '2026-01-01T01:00:00.000Z', secret: 'hook-secret-test' });
+    const lateOpen = processLemlistWebhook({ _id: 'act_open_1', type: 'emailsOpened', leadId: 'lea_test_1', campaignId: 'cam_test_123', createdAt: '2026-01-01T02:00:00.000Z', secret: 'hook-secret-test' });
+    assert(outreach.status === 'replied' && lateOpen.ignored === true,
+      'LEMLIST: late opened event does not regress replied terminal-progress status');
+    const invalidSecret = processLemlistWebhook({ _id: 'act_bad_secret', type: 'emailsSent', leadId: 'lea_test_1', secret: 'wrong' });
+    assert(invalidSecret.ok === false && invalidSecret.status === 401,
+      'LEMLIST: invalid webhook secret rejected');
+
+    const bouncedOutreach = createOutreach({ managerId: manager.id, needId: null, matchIds: [], subject: 'Bounce', body: 'Bounce body', kind: 'warm-intro' });
+    bouncedOutreach.provider = 'lemlist';
+    bouncedOutreach.providerLeadId = 'lea_bounce';
+    bouncedOutreach.providerCampaignId = 'cam_test_123';
+    processLemlistWebhook({ _id: 'act_bounce_1', type: 'emailsBounced', leadId: 'lea_bounce', campaignId: 'cam_test_123', createdAt: '2026-01-02T00:00:00.000Z', secret: 'hook-secret-test' });
+    const bounceApprove = approveOutreach(bouncedOutreach.id, { approvedBy: 'tester' });
+    assert(bouncedOutreach.status === 'bounced' && bounceApprove.ok === false,
+      'LEMLIST: hard-bounced outreach remains blocked from approval/enrollment');
+
+    const failOutreach = createOutreach({ managerId: manager.id, needId: null, matchIds: [], subject: 'Fail', body: 'Fail body', kind: 'warm-intro' });
+    approveOutreach(failOutreach.id, { approvedBy: 'tester' });
+    const failFetch = async () => mkRes({ error: 'rate limit' }, 429);
+    const failed = await enrollOutreachInLemlist(failOutreach.id, { idempotencyKey: 'lem-fail', fetchImpl: failFetch });
+    assert(failed.ok === false && failed.code === 'rate_limited' && failOutreach.status === 'failed' && failOutreach.failureCode === 'rate_limited',
+      `LEMLIST: 429 classified safely and leaves retryable failed outreach (got ${failed.code})`);
+
+    if (prevLemKey === undefined) delete process.env.LEMLIST_API_KEY; else process.env.LEMLIST_API_KEY = prevLemKey;
+    if (prevLemCampaign === undefined) delete process.env.LEMLIST_CAMPAIGN_ID; else process.env.LEMLIST_CAMPAIGN_ID = prevLemCampaign;
+    if (prevLemSecret === undefined) delete process.env.LEMLIST_WEBHOOK_SECRET; else process.env.LEMLIST_WEBHOOK_SECRET = prevLemSecret;
+  }
   // ── 17. Sample-run proof: pipeline-style log of one scout pass ──
   console.log('\n── Sample mock run proving non-candidate pages are rejected ──');
   console.log(`scout result for "Azure Security Engineer" with mixed input:`);
@@ -5753,3 +5852,4 @@ async function main() {
 }
 
 main().catch(e => { console.error('UNCAUGHT:', e); process.exit(1); });
+
