@@ -7,11 +7,16 @@
   "scripts": {
     "start": "node backend/server.js",
     "dev": "node backend/server.js",
-    "test": "node test/smoke.cjs && node test/behavior.cjs && node test/audit.cjs && node test/pipeline.cjs",
-    "test:static":     "node test/smoke.cjs",
+    "test": "node test/smoke.cjs && node test/behavior.cjs && node test/audit.cjs && node test/pipeline.cjs && node test/recovery.cjs",
+    "test:static": "node test/smoke.cjs",
     "test:behavioral": "node test/behavior.cjs",
-    "test:audit":      "node test/audit.cjs",
-    "test:pipeline":   "node test/pipeline.cjs"
+    "test:audit": "node test/audit.cjs",
+    "test:pipeline": "node test/pipeline.cjs",
+    "data:backup": "node scripts/data-store.cjs backup",
+    "data:list-backups": "node scripts/data-store.cjs list-backups",
+    "data:restore": "node scripts/data-store.cjs restore",
+    "data:verify": "node scripts/data-store.cjs verify",
+    "test:recovery": "node test/recovery.cjs"
   },
   "engines": {
     "node": ">=18.0.0"

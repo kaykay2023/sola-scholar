@@ -26,6 +26,25 @@ const DATA_FILE = path.extname(DATA_PATH_RAW).toLowerCase() === '.json'
   ? DATA_PATH_RAW
   : path.join(DATA_PATH_RAW, 'data.json');
 const DATA_DIR = path.dirname(DATA_FILE);
+const DATA_BACKUP_DIR = process.env.DATA_BACKUP_DIR || path.join(DATA_DIR, 'backups');
+const DATA_BACKUP_RETENTION = Math.max(1, parseInt(process.env.DATA_BACKUP_RETENTION || '20', 10) || 20);
+const DATA_BACKUP_ENABLED = String(process.env.DATA_BACKUP_ENABLED || 'true').toLowerCase() !== 'false';
+const DATA_BACKUP_INTERVAL_MINUTES = Math.max(0, parseInt(process.env.DATA_BACKUP_INTERVAL_MINUTES || '0', 10) || 0);
+const JSON_STORE_SINGLE_INSTANCE_ACK = String(process.env.JSON_STORE_SINGLE_INSTANCE_ACK || 'true').toLowerCase() === 'true';
+const EXPECTED_INSTANCE_COUNT = Math.max(1, parseInt(process.env.EXPECTED_INSTANCE_COUNT || '1', 10) || 1);
+const STORE_LOCK_FILE = DATA_FILE + '.lock';
+
+function buildIdentity() {
+  const full = String(process.env.BUILD_COMMIT || process.env.SOURCE_COMMIT || process.env.RAILWAY_GIT_COMMIT_SHA || '').trim();
+  const safeFull = /^[a-f0-9]{7,40}$/i.test(full) ? full : '';
+  return {
+    version: process.env.APP_VERSION || '1.0.0',
+    commit: safeFull || null,
+    commitShort: safeFull ? safeFull.slice(0, 7) : null,
+    buildTime: process.env.BUILD_TIME || null,
+    runtime: process.env.NODE_ENV || 'development',
+  };
+}
 
 // ── Internal auth (HTTP Basic). Required to access /api/* (except /api/health). ──
 const INTERNAL_USER = process.env.INTERNAL_USER || 'sola';
@@ -272,34 +291,160 @@ const COLLECTIONS = [
   // Persistent cross-run structured-resolution queue (Firecrawl/weak-web
   // discoveries waiting for Apollo/PDL structural resolution).
   'resolution_queue',
+  'pipeline_runs', 'provider_call_ledger',
 ];
 function emptyDB() { return Object.fromEntries(COLLECTIONS.map(c => [c, []])); }
 
 let DB = emptyDB();
 let writePromise = Promise.resolve();
+let STORE_LOCK_HELD = false;
+let STORAGE_RECOVERY_STATE = { status: 'not_checked', latestBackupAt: null, validBackupCount: 0, lastBackupAt: null, lastRecoveryAt: null, lockState: 'not_checked' };
 
 async function ensureDataDir() {
   await fsp.mkdir(DATA_DIR, { recursive: true });
 }
-async function loadDB() {
+
+function validateDbShape(parsed) {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+  return COLLECTIONS.some(c => Array.isArray(parsed[c]));
+}
+
+function normalizeLoadedDb(parsed) {
+  const next = emptyDB();
+  if (parsed && typeof parsed === 'object') {
+    for (const c of COLLECTIONS) if (Array.isArray(parsed[c])) next[c] = parsed[c];
+  }
+  next.outreach = next.outreach.map(normalizeOutreachRecord);
+  return next;
+}
+
+function safeBackupStamp() {
+  return new Date().toISOString().replace(/[:.]/g, '-');
+}
+
+function backupName(reason = 'auto') {
+  const safeReason = String(reason || 'auto').replace(/[^a-z0-9_-]+/gi, '-').slice(0, 40) || 'auto';
+  return `data-${safeBackupStamp()}-${safeReason}.json`;
+}
+
+async function validateBackupFile(file) {
   try {
-    await ensureDataDir();
-    const raw = await fsp.readFile(DATA_FILE, 'utf8');
+    const raw = await fsp.readFile(file, 'utf8');
     const parsed = JSON.parse(raw);
-    DB = emptyDB();
-    for (const c of COLLECTIONS) if (Array.isArray(parsed[c])) DB[c] = parsed[c];
-    DB.outreach = DB.outreach.map(normalizeOutreachRecord);
-    if (!Array.isArray(DB.pipeline_runs)) DB.pipeline_runs = DB.pipeline_runs || [];
-  } catch (e) {
-    if (e.code !== 'ENOENT') console.error('loadDB:', e.message);
-    DB = emptyDB();
-    await persistDB();
+    return validateDbShape(parsed) ? parsed : null;
+  } catch {
+    return null;
   }
 }
-async function persistDB() {
-  // Serialize writes; atomic rename.
+
+async function listDataBackups() {
+  await fsp.mkdir(DATA_BACKUP_DIR, { recursive: true });
+  const entries = await fsp.readdir(DATA_BACKUP_DIR, { withFileTypes: true }).catch(() => []);
+  const backups = [];
+  for (const e of entries) {
+    if (!e.isFile() || !/^data-.*\.json$/.test(e.name)) continue;
+    const full = path.join(DATA_BACKUP_DIR, e.name);
+    const st = await fsp.stat(full).catch(() => null);
+    backups.push({ name: e.name, createdAt: st ? st.mtime.toISOString() : null, size: st ? st.size : 0, valid: !!(await validateBackupFile(full)) });
+  }
+  backups.sort((a, b) => String(b.name).localeCompare(String(a.name)));
+  STORAGE_RECOVERY_STATE.validBackupCount = backups.filter(b => b.valid).length;
+  STORAGE_RECOVERY_STATE.latestBackupAt = backups.find(b => b.valid)?.createdAt || null;
+  return backups;
+}
+
+async function pruneDataBackups() {
+  const backups = await listDataBackups();
+  const removable = backups.filter(b => b.valid).slice(DATA_BACKUP_RETENTION);
+  for (const b of removable) {
+    await fsp.unlink(path.join(DATA_BACKUP_DIR, b.name)).catch(() => {});
+    await fsp.unlink(path.join(DATA_BACKUP_DIR, b.name + '.meta.json')).catch(() => {});
+  }
+}
+
+async function createDataBackup(reason = 'auto') {
+  if (!DATA_BACKUP_ENABLED) return { ok: true, skipped: true, reason: 'disabled' };
+  await ensureDataDir();
+  await fsp.mkdir(DATA_BACKUP_DIR, { recursive: true });
+  let raw;
+  try { raw = await fsp.readFile(DATA_FILE, 'utf8'); }
+  catch (e) { if (e.code === 'ENOENT') return { ok: true, skipped: true, reason: 'no-primary' }; throw e; }
+  const parsed = JSON.parse(raw);
+  if (!validateDbShape(parsed)) throw new Error('Primary data file failed backup validation');
+  const name = backupName(reason);
+  const dest = path.join(DATA_BACKUP_DIR, name);
+  const tmp = dest + '.tmp';
+  await fsp.writeFile(tmp, raw);
+  await fsp.rename(tmp, dest);
+  const meta = { name, reason, createdAt: now(), collections: COLLECTIONS.filter(c => Array.isArray(parsed[c])).length };
+  await fsp.writeFile(dest + '.meta.json.tmp', JSON.stringify(meta, null, 2));
+  await fsp.rename(dest + '.meta.json.tmp', dest + '.meta.json');
+  STORAGE_RECOVERY_STATE.lastBackupAt = meta.createdAt;
+  await pruneDataBackups();
+  return { ok: true, name, createdAt: meta.createdAt };
+}
+
+async function quarantinePrimary(reason = 'corrupt') {
+  await fsp.mkdir(path.join(DATA_DIR, 'quarantine'), { recursive: true });
+  const name = `data-${safeBackupStamp()}-${reason}.json`;
+  const dest = path.join(DATA_DIR, 'quarantine', name);
+  await fsp.copyFile(DATA_FILE, dest);
+  return { name, quarantinedAt: now() };
+}
+
+async function recoverFromNewestValidBackup() {
+  const backups = await listDataBackups();
+  for (const b of backups) {
+    if (!b.valid) continue;
+    const full = path.join(DATA_BACKUP_DIR, b.name);
+    const parsed = await validateBackupFile(full);
+    if (!parsed) continue;
+    const raw = await fsp.readFile(full, 'utf8');
+    await fsp.writeFile(DATA_FILE + '.recovery.tmp', raw);
+    await fsp.rename(DATA_FILE + '.recovery.tmp', DATA_FILE);
+    DB = normalizeLoadedDb(parsed);
+    STORAGE_RECOVERY_STATE.status = 'recovered_from_backup';
+    STORAGE_RECOVERY_STATE.lastRecoveryAt = now();
+    return { ok: true, backup: b.name };
+  }
+  return { ok: false, error: 'no_valid_backup' };
+}
+
+async function loadDB() {
+  await ensureDataDir();
+  try {
+    const raw = await fsp.readFile(DATA_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (!validateDbShape(parsed)) throw new Error('invalid data shape');
+    DB = normalizeLoadedDb(parsed);
+    STORAGE_RECOVERY_STATE.status = 'ok';
+    await listDataBackups();
+  } catch (e) {
+    if (e.code === 'ENOENT') {
+      DB = emptyDB();
+      STORAGE_RECOVERY_STATE.status = 'initialized_empty';
+      await persistDB({ skipBackup: true });
+      return;
+    }
+    console.error('loadDB:', 'primary data file could not be parsed or validated');
+    await quarantinePrimary('corrupt').catch(qe => console.error('quarantine:', qe.message));
+    const recovered = await recoverFromNewestValidBackup();
+    if (recovered.ok) {
+      console.warn('loadDB:', `recovered primary data from backup ${recovered.backup}`);
+      return;
+    }
+    STORAGE_RECOVERY_STATE.status = 'recovery_required';
+    const err = new Error('Data store recovery required: primary data is invalid and no valid backup exists');
+    err.code = 'DATA_RECOVERY_REQUIRED';
+    throw err;
+  }
+}
+
+async function persistDB(options = {}) {
+  // Serialize writes; atomic rename. Back up the existing primary before replacing it.
   writePromise = writePromise.then(async () => {
     await ensureDataDir();
+    if (!options.skipBackup) await createDataBackup('pre-write').catch(e => console.error('backup:', e.message));
     const tmp = DATA_FILE + '.tmp';
     await fsp.writeFile(tmp, JSON.stringify(DB, null, 2));
     await fsp.rename(tmp, DATA_FILE);
@@ -307,6 +452,71 @@ async function persistDB() {
   return writePromise;
 }
 
+async function processIsAlive(pid) {
+  if (!pid || pid === process.pid) return pid === process.pid;
+  try { process.kill(pid, 0); return true; }
+  catch { return false; }
+}
+
+async function acquireStoreLock() {
+  if (!JSON_STORE_SINGLE_INSTANCE_ACK || EXPECTED_INSTANCE_COUNT !== 1) {
+    STORAGE_RECOVERY_STATE.lockState = 'refused_missing_single_instance_ack';
+    throw new Error('JSON store requires JSON_STORE_SINGLE_INSTANCE_ACK=true and EXPECTED_INSTANCE_COUNT=1');
+  }
+  await ensureDataDir();
+  try {
+    const existing = await fsp.readFile(STORE_LOCK_FILE, 'utf8');
+    const info = JSON.parse(existing || '{}');
+    const lockAgeMs = Date.now() - Date.parse(info.createdAt || 0);
+    const recentLock = Number.isFinite(lockAgeMs) && lockAgeMs >= 0 && lockAgeMs < 5 * 60 * 1000;
+    if (await processIsAlive(Number(info.pid)) || recentLock) {
+      STORAGE_RECOVERY_STATE.lockState = 'active_conflict';
+      throw new Error('JSON store lock is held by an active or recent process');
+    }
+    await fsp.unlink(STORE_LOCK_FILE).catch(() => {});
+  } catch (e) {
+    if (e.code !== 'ENOENT' && !(e instanceof SyntaxError)) throw e;
+    await fsp.unlink(STORE_LOCK_FILE).catch(() => {});
+  }
+  const payload = { pid: process.pid, createdAt: now() };
+  await fsp.writeFile(STORE_LOCK_FILE, JSON.stringify(payload, null, 2), { flag: 'wx' });
+  STORE_LOCK_HELD = true;
+  STORAGE_RECOVERY_STATE.lockState = 'held';
+  const release = async () => {
+    if (!STORE_LOCK_HELD) return;
+    STORE_LOCK_HELD = false;
+    await fsp.unlink(STORE_LOCK_FILE).catch(() => {});
+  };
+  process.once('exit', () => { try { fs.unlinkSync(STORE_LOCK_FILE); } catch {} });
+  process.once('SIGINT', () => { try { fs.unlinkSync(STORE_LOCK_FILE); } catch {}; process.exit(130); });
+  process.once('SIGTERM', () => { try { fs.unlinkSync(STORE_LOCK_FILE); } catch {}; process.exit(143); });
+  return release;
+}
+
+async function storageHealth() {
+  let readable = false;
+  let writable = false;
+  try { await fsp.access(DATA_FILE, fs.constants.R_OK); readable = true; }
+  catch { readable = STORAGE_RECOVERY_STATE.status === 'initialized_empty'; }
+  try {
+    await ensureDataDir();
+    const probe = path.join(DATA_DIR, `.write-probe-${process.pid}`);
+    await fsp.writeFile(probe, 'ok');
+    await fsp.unlink(probe).catch(() => {});
+    writable = true;
+  } catch { writable = false; }
+  const backups = await listDataBackups().catch(() => []);
+  return {
+    storeReadable: readable,
+    storeWritable: writable,
+    backupEnabled: DATA_BACKUP_ENABLED,
+    latestSuccessfulBackupAt: STORAGE_RECOVERY_STATE.lastBackupAt || STORAGE_RECOVERY_STATE.latestBackupAt || null,
+    validBackupCount: backups.filter(b => b.valid).length,
+    recoveryState: STORAGE_RECOVERY_STATE.status,
+    lockState: STORAGE_RECOVERY_STATE.lockState,
+    singleInstanceExpected: EXPECTED_INSTANCE_COUNT === 1,
+  };
+}
 /* ════════════════════════════════════════════════════════════════════
    HELPERS
    ════════════════════════════════════════════════════════════════════ */
@@ -6793,7 +7003,8 @@ app.get('/api/health', (req, res) => {
   for (const svc of Object.keys(SERVICES)) services[svc] = isConfigured(svc) ? 'configured' : 'missing';
   res.json({
     status: 'ok',
-    version: '1.0.0',
+    version: buildIdentity().version,
+    build: buildIdentity(),
     services,
     auth: INTERNAL_PASSWORD ? 'enabled' : 'disabled-NOT-PRODUCTION-SAFE',
   });
@@ -6818,6 +7029,9 @@ app.use('/api', requireAuth);
 // ── Provider diagnostics (auth-protected; sanitized, never exposes secrets) ──
 app.get('/api/providers/status', (req, res) => {
   res.json({ providers: providerDiagnostics(), checkedAt: now() });
+});
+app.get('/api/system/status', async (req, res) => {
+  res.json({ build: buildIdentity(), storage: await storageHealth(), checkedAt: now() });
 });
 
 // ── Role templates (auth-protected; editable in config/role-templates.json) ──
@@ -7166,6 +7380,7 @@ app.use((err, req, res, next) => {
    START
    ════════════════════════════════════════════════════════════════════ */
 async function start() {
+  await acquireStoreLock();
   await loadDB();
   app.listen(PORT, HOST, () => {
     console.log(`Sola Scholar V1 listening on http://${HOST}:${PORT}`);
@@ -7178,7 +7393,7 @@ async function start() {
 if (require.main === module) start();
 
 module.exports = {
-  app, start, DB, loadDB,
+  app, start, DB, loadDB, persistDB,
   _internals: {
     findOrCreateCompany,
     findOrCreateManager,
@@ -7188,6 +7403,12 @@ module.exports = {
     latestValidation,
     createOrUpdateMatch,
     createOutreach,
+    createDataBackup,
+    listDataBackups,
+    recoverFromNewestValidBackup,
+    storageHealth,
+    buildIdentity,
+    acquireStoreLock,
     tierFromScore,
     scoreCandidateAgainstNeed,
     hasReviewEvidence,
