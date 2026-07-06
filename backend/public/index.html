@@ -1654,14 +1654,6 @@ const OutreachPage = ({state, refresh}) => {
                     {o.failureReason && <p className="text-xs text-red-600">Provider error: {o.failureReason}</p>}
                     {o.bouncedAt && <p className="text-xs text-red-600">Blocked: hard bounce recorded</p>}
                     {o.unsubscribedAt && <p className="text-xs text-gray-600">Blocked: unsubscribed contact</p>}
-                    {o.provider === 'lemlist' && <p className="text-xs text-gray-500">Lemlist: {o.providerStatus || o.status}{o.lastProviderSyncAt ? ` · synced ${fmtTime(o.lastProviderSyncAt)}` : ''}</p>}
-                    {o.failureReason && <p className="text-xs text-red-600">Provider error: {o.failureReason}</p>}
-                    {o.bouncedAt && <p className="text-xs text-red-600">Blocked: hard bounce recorded</p>}
-                    {o.unsubscribedAt && <p className="text-xs text-gray-600">Blocked: unsubscribed contact</p>}
-                    {o.provider === 'lemlist' && <p className="text-xs text-gray-500">Lemlist: {o.providerStatus || o.status}{o.lastProviderSyncAt ? ` · synced ${fmtTime(o.lastProviderSyncAt)}` : ''}</p>}
-                    {o.failureReason && <p className="text-xs text-red-600">Provider error: {o.failureReason}</p>}
-                    {o.bouncedAt && <p className="text-xs text-red-600">Blocked: hard bounce recorded</p>}
-                    {o.unsubscribedAt && <p className="text-xs text-gray-600">Blocked: unsubscribed contact</p>}
                   </div>
                 </div>
                 {editingId === o.id ? (
