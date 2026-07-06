@@ -1,0 +1,32 @@
+name: Sola Scholars CI
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - name: Install
+        run: npm ci
+      - name: Test
+        run: npm test
+        env:
+          INTERNAL_PASSWORD: ci-test-password
+      - name: Production dependency audit
+        run: npm audit --omit=dev
+      - name: Predeploy gate
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/predeploy-check.ps1
+      - name: Repository safety checks
+        shell: pwsh
+        run: |
+          if (git ls-files .env .env.local backend/.env backend/.env.local data/data.json) { throw 'secret or runtime data file is tracked' }
+          Select-String -Path test/*.cjs -Pattern 'api.lemlist.com' -SimpleMatch | ForEach-Object { throw 'Lemlist tests must use mocks, not live API hosts' }

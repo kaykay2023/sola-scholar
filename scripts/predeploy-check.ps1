@@ -122,7 +122,7 @@ if ($SkipLocalBoot) {
 # 7. Approved-file check -----------------------------------------------------
 Section "7. Approved-file check"
 # Anything changed/untracked outside these paths needs explicit review before deploy.
-$approved = @('backend/', 'test/', 'config/', 'scripts/', 'docs/',
+$approved = @('backend/', 'test/', 'config/', 'scripts/', 'docs/', '.github/workflows/',
               'package.json', 'package-lock.json', 'railway.json',
               '.gitignore', '.env.example', 'README.md')
 $changedAll = @()

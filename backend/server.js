@@ -33,6 +33,7 @@ const DATA_BACKUP_INTERVAL_MINUTES = Math.max(0, parseInt(process.env.DATA_BACKU
 const JSON_STORE_SINGLE_INSTANCE_ACK = String(process.env.JSON_STORE_SINGLE_INSTANCE_ACK || 'true').toLowerCase() === 'true';
 const EXPECTED_INSTANCE_COUNT = Math.max(1, parseInt(process.env.EXPECTED_INSTANCE_COUNT || '1', 10) || 1);
 const STORE_LOCK_FILE = DATA_FILE + '.lock';
+const PIPELINE_RUN_LOCK_TTL_MS = Math.max(60000, parseInt(process.env.PIPELINE_RUN_LOCK_TTL_MS || '1800000', 10) || 1800000);
 
 function buildIdentity() {
   const full = String(process.env.BUILD_COMMIT || process.env.SOURCE_COMMIT || process.env.RAILWAY_GIT_COMMIT_SHA || '').trim();
@@ -467,11 +468,9 @@ async function acquireStoreLock() {
   try {
     const existing = await fsp.readFile(STORE_LOCK_FILE, 'utf8');
     const info = JSON.parse(existing || '{}');
-    const lockAgeMs = Date.now() - Date.parse(info.createdAt || 0);
-    const recentLock = Number.isFinite(lockAgeMs) && lockAgeMs >= 0 && lockAgeMs < 5 * 60 * 1000;
-    if (await processIsAlive(Number(info.pid)) || recentLock) {
+    if (await processIsAlive(Number(info.pid))) {
       STORAGE_RECOVERY_STATE.lockState = 'active_conflict';
-      throw new Error('JSON store lock is held by an active or recent process');
+      throw new Error('JSON store lock is held by an active process');
     }
     await fsp.unlink(STORE_LOCK_FILE).catch(() => {});
   } catch (e) {
@@ -2408,6 +2407,35 @@ function lemlistConfig() {
   };
 }
 
+async function providerFetch(provider, url, options = {}, cfg = {}) {
+  const timeoutMs = Math.max(1000, parseInt(cfg.timeoutMs || process.env.PROVIDER_REQUEST_TIMEOUT_MS || '12000', 10) || 12000);
+  const retries = Math.max(0, parseInt(cfg.retries || '0', 10) || 0);
+  let lastError = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+    try {
+      const res = await fetch(url, { ...options, signal: controller ? controller.signal : options.signal });
+      if (res.status === 429 && attempt < retries) {
+        if (timer) clearTimeout(timer);
+        const retryAfter = Number(res.headers?.get?.('retry-after') || 0);
+        await new Promise(r => setTimeout(r, Math.min(2000, retryAfter > 0 ? retryAfter * 1000 : 250)));
+        continue;
+      }
+      return res;
+    } catch (e) {
+      lastError = e;
+      if (attempt >= retries) {
+        const err = new Error(`${provider || 'provider'} request ${e && e.name === 'AbortError' ? 'timeout' : 'failed'}`);
+        err.code = e && e.name === 'AbortError' ? 'PROVIDER_TIMEOUT' : 'PROVIDER_NETWORK_ERROR';
+        throw err;
+      }
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+  throw lastError || new Error(`${provider || 'provider'} request failed`);
+}
 function sanitizeFailureReason(value) {
   return String(value || '').replace(/[\r\n]+/g, ' ').slice(0, 180);
 }
@@ -6712,16 +6740,158 @@ function newPipelineRunId() {
   return 'run_' + Date.now().toString(36) + '_' + crypto.randomBytes(3).toString('hex');
 }
 
-async function runPipeline({ company, role, skills = [], mustHaveSkills = [], location = '', seniority = 'Mid', expandCandidatePool = false, apolloMaxEnrichPerRun = APOLLO_MATCH_DEFAULT_MAX_PER_RUN, pdlEnrichMaxPerRun = PDL_ENRICH_DEFAULT_MAX_PER_RUN, pdlBorderlineEnrichMaxPerRun = PDL_BORDERLINE_ENRICH_DEFAULT_MAX_PER_RUN, resolutionQueueDrainMax = undefined }) {
-  const pipelineRunId = newPipelineRunId();
-  console.log(`[pipeline] start runId=${pipelineRunId} role="${role}" company="${company}"`);
-  await logActivity('Pipeline', `Pipeline start ${pipelineRunId}: ${role} @ ${company}`, 'running', { pipelineRunId });
-  const result = { pipelineRunId, steps: [] };
+function normalizePipelineRequest(input = {}) {
+  const cleanArray = (arr) => Array.from(new Set((Array.isArray(arr) ? arr : []).map(x => String(x || '').trim()).filter(Boolean).map(x => x.toLowerCase()))).sort();
+  return {
+    company: String(input.company || '').trim().toLowerCase(),
+    role: String(input.role || '').trim().toLowerCase(),
+    location: String(input.location || '').trim().toLowerCase(),
+    seniority: String(input.seniority || 'Mid').trim().toLowerCase(),
+    skills: cleanArray(input.skills),
+    mustHaveSkills: cleanArray(input.mustHaveSkills),
+    expandCandidatePool: !!input.expandCandidatePool,
+    apolloMaxEnrichPerRun: Number(input.apolloMaxEnrichPerRun || APOLLO_MATCH_DEFAULT_MAX_PER_RUN),
+    pdlEnrichMaxPerRun: Number(input.pdlEnrichMaxPerRun || PDL_ENRICH_DEFAULT_MAX_PER_RUN),
+    pdlBorderlineEnrichMaxPerRun: Number(input.pdlBorderlineEnrichMaxPerRun || PDL_BORDERLINE_ENRICH_DEFAULT_MAX_PER_RUN),
+    resolutionQueueDrainMax: input.resolutionQueueDrainMax === undefined ? null : Number(input.resolutionQueueDrainMax),
+  };
+}
 
+function pipelineRequestFingerprint(input = {}) {
+  return crypto.createHash('sha256').update(JSON.stringify(normalizePipelineRequest(input))).digest('hex');
+}
+
+function validatePipelineRequestInput(body = {}) {
+  const bad = [];
+  const str = (v) => String(v || '').trim();
+  if (!str(body.company)) bad.push('company required');
+  if (!str(body.role)) bad.push('role required');
+  for (const field of ['company', 'role', 'location', 'seniority']) if (str(body[field]).length > 160) bad.push(`${field} too long`);
+  for (const field of ['skills', 'mustHaveSkills']) {
+    if (body[field] !== undefined && !Array.isArray(body[field])) bad.push(`${field} must be an array`);
+    if (Array.isArray(body[field]) && body[field].length > 40) bad.push(`${field} too large`);
+  }
+  for (const field of ['apolloMaxEnrichPerRun', 'pdlEnrichMaxPerRun', 'pdlBorderlineEnrichMaxPerRun', 'resolutionQueueDrainMax']) {
+    if (body[field] !== undefined) {
+      const n = Number(body[field]);
+      if (!Number.isInteger(n) || n < 0 || n > 250) bad.push(`${field} must be an integer between 0 and 250`);
+    }
+  }
+  if (body.idempotencyKey !== undefined && String(body.idempotencyKey).length > 120) bad.push('idempotencyKey too long');
+  return bad;
+}
+
+function isPipelineRunLockStale(run) {
+  const last = Date.parse(run?.lastHeartbeatAt || run?.updatedAt || run?.startedAt || 0);
+  return Number.isFinite(last) && Date.now() - last > PIPELINE_RUN_LOCK_TTL_MS;
+}
+
+function expireStalePipelineRun(run) {
+  if (!run) return;
+  run.status = 'failed';
+  run.currentStage = 'expired';
+  run.failedAt = run.failedAt || now();
+  run.updatedAt = now();
+  run.errorCode = run.errorCode || 'pipeline_lock_expired';
+  run.sanitizedError = run.sanitizedError || 'Pipeline run lock expired before completion';
+}
+
+function activePipelineRunForFingerprint(fingerprint) {
+  for (const run of (DB.pipeline_runs || [])) {
+    if (run.requestFingerprint !== fingerprint || !['queued', 'running'].includes(run.status)) continue;
+    if (isPipelineRunLockStale(run)) {
+      expireStalePipelineRun(run);
+      continue;
+    }
+    return run;
+  }
+  return null;
+}
+
+function beginPipelineRun(input = {}) {
+  DB.pipeline_runs = Array.isArray(DB.pipeline_runs) ? DB.pipeline_runs : [];
+  DB.provider_call_ledger = Array.isArray(DB.provider_call_ledger) ? DB.provider_call_ledger : [];
+  const requestFingerprint = pipelineRequestFingerprint(input);
+  const idempotencyKey = String(input.idempotencyKey || '').trim() || `auto-${requestFingerprint.slice(0, 18)}`;
+  const sameKey = DB.pipeline_runs.find(r => r.idempotencyKey === idempotencyKey);
+  if (sameKey && sameKey.requestFingerprint !== requestFingerprint) {
+    return { ok: false, status: 409, response: { error: 'idempotency key already used for a different pipeline request', pipelineRunId: sameKey.id, status: sameKey.status } };
+  }
+  if (sameKey) return { ok: false, status: 200, response: { idempotent: true, pipelineRunId: sameKey.id, status: sameKey.status, resultSummary: sameKey.resultSummary || null, steps: sameKey.stages || [] } };
+  const active = activePipelineRunForFingerprint(requestFingerprint);
+  if (active) return { ok: false, status: 409, response: { error: 'equivalent pipeline run already active', pipelineRunId: active.id, status: active.status } };
+  const run = {
+    id: newPipelineRunId(), idempotencyKey, requestFingerprint,
+    company: String(input.company || '').trim(), role: String(input.role || '').trim(), location: String(input.location || '').trim(), seniority: String(input.seniority || 'Mid').trim(),
+    status: 'running', currentStage: 'starting', stages: [], providerCalls: [], providerCreditsEstimated: 0,
+    startedAt: now(), completedAt: null, failedAt: null, lastHeartbeatAt: now(), requestedBy: String(input.requestedBy || 'internal').slice(0, 80),
+    errorCode: null, sanitizedError: '', resultSummary: null, createdAt: now(), updatedAt: now(),
+  };
+  DB.pipeline_runs.unshift(run);
+  if (DB.pipeline_runs.length > 200) DB.pipeline_runs.length = 200;
+  return { ok: true, run };
+}
+
+function recordPipelineStage(run, stage, status = 'completed', meta = {}) {
+  if (!run) return;
+  run.currentStage = stage;
+  run.lastHeartbeatAt = now();
+  run.updatedAt = now();
+  run.stages.push({ stage, status, at: now(), meta });
+}
+
+function recordProviderCall(run, provider, operation, category = 'attempted', replaySafe = true) {
+  if (!run) return null;
+  const entry = { id: uid(), runId: run.id, provider, operation, requestFingerprint: run.requestFingerprint, startedAt: now(), completedAt: null, resultCategory: category, retryCount: 0, replaySafe: !!replaySafe, sanitizedErrorCategory: '' };
+  DB.provider_call_ledger.unshift(entry);
+  if (DB.provider_call_ledger.length > 500) DB.provider_call_ledger.length = 500;
+  run.providerCalls.push(entry.id);
+  return entry;
+}
+
+function completeProviderCall(entry, category = 'ok', errorCategory = '') {
+  if (!entry) return;
+  entry.completedAt = now();
+  entry.resultCategory = category;
+  entry.sanitizedErrorCategory = sanitizeProviderMessage(errorCategory || '');
+}
+
+function completePipelineRun(run, summary) {
+  if (!run) return;
+  run.status = 'completed';
+  run.currentStage = 'completed';
+  run.completedAt = now();
+  run.lastHeartbeatAt = now();
+  run.updatedAt = now();
+  run.resultSummary = summary || null;
+}
+
+function failPipelineRun(run, error) {
+  if (!run) return;
+  run.status = run.stages.length ? 'partially_completed' : 'failed';
+  run.currentStage = 'failed';
+  run.failedAt = now();
+  run.lastHeartbeatAt = now();
+  run.updatedAt = now();
+  run.errorCode = error?.code || 'pipeline_failed';
+  run.sanitizedError = sanitizeProviderMessage(error?.message || 'Pipeline failed');
+}
+async function runPipeline({ company, role, skills = [], mustHaveSkills = [], location = '', seniority = 'Mid', expandCandidatePool = false, apolloMaxEnrichPerRun = APOLLO_MATCH_DEFAULT_MAX_PER_RUN, pdlEnrichMaxPerRun = PDL_ENRICH_DEFAULT_MAX_PER_RUN, pdlBorderlineEnrichMaxPerRun = PDL_BORDERLINE_ENRICH_DEFAULT_MAX_PER_RUN, resolutionQueueDrainMax = undefined, idempotencyKey = '', requestedBy = 'internal' }) {
+  const pipelineInput = { company, role, skills, mustHaveSkills, location, seniority, expandCandidatePool, apolloMaxEnrichPerRun, pdlEnrichMaxPerRun, pdlBorderlineEnrichMaxPerRun, resolutionQueueDrainMax, idempotencyKey, requestedBy };
+  const preparedRun = beginPipelineRun(pipelineInput);
+  if (!preparedRun.ok) return { ...preparedRun.response, httpStatus: preparedRun.status };
+  const pipelineRunRecord = preparedRun.run;
+  const pipelineRunId = pipelineRunRecord.id;
+  console.log(`[pipeline] start runId=${pipelineRunId} role="${role}" company="${company}"`);
+  await logActivity('Pipeline', `Pipeline start ${pipelineRunId}: ${role} @ ${company}`, 'running', { pipelineRunId, idempotencyKey: pipelineRunRecord.idempotencyKey });
+  const result = { pipelineRunId, idempotencyKey: pipelineRunRecord.idempotencyKey, steps: [] };
+
+  try {
   // 1. Find/create company
   const co = findOrCreateCompany({ name: company, pipelineRunId });
   result.companyId = co.id;
   result.steps.push({ step: 'company', companyId: co.id });
+  recordPipelineStage(pipelineRunRecord, 'company', 'completed', { companyId: co.id });
 
   // 2. Try to find a manager (best-effort) — STRICTLY scoped to THIS company.
   // Never borrow a manager from an unrelated company that the connector happened
@@ -6740,6 +6910,7 @@ async function runPipeline({ company, role, skills = [], mustHaveSkills = [], lo
   result.managerStatusLabel = mgr
     ? 'Hiring manager linked'
     : 'Manager lookup skipped — candidate search mode';
+  recordPipelineStage(pipelineRunRecord, 'manager', 'completed', { managerId: mgr?.id || null });
   result.steps.push({
     step: 'manager',
     managerId: mgr?.id || null,
@@ -6758,9 +6929,13 @@ async function runPipeline({ company, role, skills = [], mustHaveSkills = [], lo
   await persistDB();
   result.needId = need.id;
   result.steps.push({ step: 'need', needId: need.id });
+  pipelineRunRecord.needId = need.id;
+  recordPipelineStage(pipelineRunRecord, 'need', 'completed', { needId: need.id });
 
   // 4. Source candidates (scoped by pipelineRunId; scout rejects job posts/blogs/docs)
+  const scoutCall = recordProviderCall(pipelineRunRecord, 'multi-provider', 'scout', 'attempted', false);
   const scout = await runScout({ needId: need.id, pipelineRunId, expandCandidatePool: !!expandCandidatePool, apolloMaxEnrichPerRun });
+  completeProviderCall(scoutCall, 'ok');
   result.steps.push({
     step: 'scout',
     sourcedRaw: scout.sourcedRaw,
@@ -6789,12 +6964,14 @@ async function runPipeline({ company, role, skills = [], mustHaveSkills = [], lo
     if (r.queued) queuedThisRun++;
     else if (r.duplicate) queueDuplicates++;
   }
+  const queueCall = recordProviderCall(pipelineRunRecord, 'apollo', 'resolution_queue', 'attempted', true);
   const queueDrain = await drainResolutionQueue({
     needId: need.id,
     pipelineRunId,
     maxPerRun: resolutionQueueDrainMax,
     providerDiagnostics: scout.providerDiagnostics,
   });
+  completeProviderCall(queueCall, queueDrain.retryable ? 'retryable' : 'ok');
   const { providerDiagnostics: _queueDiags, ...resolutionQueue } = queueDrain;
   result.steps.push({
     step: 'resolution_queue',
@@ -6813,7 +6990,9 @@ async function runPipeline({ company, role, skills = [], mustHaveSkills = [], lo
 
   // 5. Validate only the candidates this run sourced (rejected pages never reach here)
   const scoutIds = Array.from(new Set((scout.candidates || []).map(c => c.id)));
+  recordPipelineStage(pipelineRunRecord, 'scout', 'completed', { acceptedCandidates: scout.acceptedCandidates });
   const val = await runValidator({ candidateIds: scoutIds, pipelineRunId });
+  recordPipelineStage(pipelineRunRecord, 'validate', 'completed', { candidateCount: scoutIds.length });
   result.steps.push({
     step: 'validate',
     fullyValidated: val.fullyValidated,
@@ -6823,6 +7002,7 @@ async function runPipeline({ company, role, skills = [], mustHaveSkills = [], lo
   });
 
   // 6. Enrich accepted in-market candidates with PDL skills before scoring
+  const pdlCall = recordProviderCall(pipelineRunRecord, 'pdl', 'candidate_enrichment', 'attempted', true);
   const pdlEnrichmentResult = await runPdlCandidateEnrichment({
     needId: need.id,
     pipelineRunId,
@@ -6831,6 +7011,7 @@ async function runPipeline({ company, role, skills = [], mustHaveSkills = [], lo
     pdlBorderlineEnrichMaxPerRun,
     providerDiagnostics: scout.providerDiagnostics,
   });
+  completeProviderCall(pdlCall, pdlEnrichmentResult.errored ? 'provider_error' : 'ok');
   const { providerDiagnostics: _pdlProviderDiagnostics, ...pdlEnrichment } = pdlEnrichmentResult;
   result.steps.push({
     step: 'pdl_enrich',
@@ -6846,8 +7027,10 @@ async function runPipeline({ company, role, skills = [], mustHaveSkills = [], lo
   });
 
   // 7. Match only this run's candidates against this run's need
+  recordPipelineStage(pipelineRunRecord, 'pdl_enrich', 'completed', { enriched: pdlEnrichment.enriched });
   const mm = await runMatchmaker({ needId: need.id, pipelineRunId });
   result.steps.push({ step: 'match', visible: mm.visible, dropped: mm.dropped });
+  recordPipelineStage(pipelineRunRecord, 'match', 'completed', { visible: mm.visible, dropped: mm.dropped });
   refreshProviderDiagnosticsCounts(scout.providerDiagnostics, { pipelineRunId, needId: need.id });
 
   // 8. Generate client report from this run's matches (with scout context)
@@ -6865,6 +7048,7 @@ async function runPipeline({ company, role, skills = [], mustHaveSkills = [], lo
   };
   const rep = await generateClientReport({ needId: need.id, pipelineRunId, scoutStats });
   result.steps.push({ step: 'report', reportId: rep.report?.id || null });
+  recordPipelineStage(pipelineRunRecord, 'report', 'completed', { reportId: rep.report?.id || null });
   result.report = rep.report;
 
   const counts = {
@@ -6890,8 +7074,11 @@ async function runPipeline({ company, role, skills = [], mustHaveSkills = [], lo
     dropped: mm.dropped,
     reportId: rep.report?.id || null,
   };
+  completePipelineRun(pipelineRunRecord, { visible: mm.visible, reportId: rep.report?.id || null, acceptedCandidates: scout.acceptedCandidates });
   console.log(`[pipeline] counts ${JSON.stringify(counts)}`);
   await logActivity('Pipeline', `Pipeline complete for "${role}" @ ${company}`, 'success', counts);
+
+  await persistDB();
 
   return {
     pipelineRunId,
@@ -6933,6 +7120,12 @@ async function runPipeline({ company, role, skills = [], mustHaveSkills = [], lo
     report: rep.report,
     steps: result.steps,
   };
+  } catch (e) {
+    failPipelineRun(pipelineRunRecord, e);
+    await persistDB().catch(pe => console.error('pipeline persist after failure', sanitizeFailureReason(pe.message)));
+    await logActivity('Pipeline', `Pipeline failed for "${role}" @ ${company}`, 'error', { pipelineRunId, error: pipelineRunRecord.sanitizedError }).catch(() => {});
+    throw e;
+  }
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -6966,6 +7159,8 @@ function createMemoryRateLimiter({ windowMs = 60000, max = 60, keyPrefix = 'glob
 
 const outreachRateLimit = createMemoryRateLimiter({ windowMs: 60000, max: 30, keyPrefix: 'outreach' });
 const lemlistWebhookRateLimit = createMemoryRateLimiter({ windowMs: 60000, max: 120, keyPrefix: 'lemlist-webhook' });
+const pipelineRateLimit = createMemoryRateLimiter({ windowMs: 60000, max: 8, keyPrefix: 'pipeline' });
+const providerActionRateLimit = createMemoryRateLimiter({ windowMs: 60000, max: 20, keyPrefix: 'provider-action' });
 // ── Internal Basic Auth (skips /api/health and static frontend) ──
 function requireAuth(req, res, next) {
   if (!INTERNAL_PASSWORD) {
@@ -7094,6 +7289,12 @@ app.get('/api/candidate-outcomes/:id', (req, res) => {
 });
 app.get('/api/agent-learning/summaries', (req, res) => res.json(DB.agent_learning_summaries));
 app.get('/api/activity-logs',    (req, res) => res.json(DB.activity_logs.slice(0, 100)));
+app.get('/api/pipeline-runs', (req, res) => res.json((DB.pipeline_runs || []).slice(0, 50)));
+app.get('/api/pipeline-runs/:id', (req, res) => {
+  const run = (DB.pipeline_runs || []).find(r => r.id === req.params.id);
+  if (!run) return res.status(404).json({ error: 'Not found' });
+  res.json(run);
+});
 
 // ── Mutation: small CRUD helpers used by the UI ──
 app.post('/api/companies', async (req, res) => {
@@ -7281,7 +7482,7 @@ app.get('/api/outreach/:id/events', (req, res) => {
 });
 
 // ── Agent runs ──
-app.post('/api/connector/run', async (req, res) => {
+app.post('/api/connector/run', providerActionRateLimit, async (req, res) => {
   try { res.json(await runConnector(req.body || {})); }
   catch (e) { console.error('connector', e); res.status(500).json({ error: e.message }); }
 });
@@ -7289,7 +7490,7 @@ app.post('/api/needs/detect', async (req, res) => {
   try { res.json(await runNeedDetector(req.body || {})); }
   catch (e) { console.error('needs/detect', e); res.status(500).json({ error: e.message }); }
 });
-app.post('/api/scout/run', async (req, res) => {
+app.post('/api/scout/run', providerActionRateLimit, async (req, res) => {
   try { res.json(await runScout(req.body || {})); }
   catch (e) { console.error('scout', e); res.status(500).json({ error: e.message }); }
 });
@@ -7326,15 +7527,21 @@ app.post('/api/agent-learning/daily-summary', async (req, res) => {
     res.status(500).json({ error: e.message || 'Unable to create learning summary' });
   }
 });
-app.post('/api/pipeline/run', async (req, res) => {
-  const { company, role } = req.body || {};
-  if (!company || !role) return res.status(400).json({ error: 'company and role required' });
-  try { res.json(await runPipeline(req.body)); }
-  catch (e) { console.error('pipeline', e); res.status(500).json({ error: e.message }); }
+app.post('/api/pipeline/run', pipelineRateLimit, async (req, res) => {
+  const errors = validatePipelineRequestInput(req.body || {});
+  if (errors.length) return res.status(400).json({ error: 'invalid pipeline request', details: errors });
+  try {
+    const out = await runPipeline(req.body || {});
+    if (out && out.httpStatus) return res.status(out.httpStatus).json(out);
+    res.json(out);
+  } catch (e) {
+    console.error('pipeline', sanitizeFailureReason(e.message));
+    res.status(500).json({ error: 'Pipeline failed' });
+  }
 });
 
 // ── Optional: airtable mirror (push current DB) ──
-app.post('/api/airtable/sync', async (req, res) => {
+app.post('/api/airtable/sync', providerActionRateLimit, async (req, res) => {
   if (!isConfigured('airtable')) return res.status(400).json({ error: 'Airtable not configured' });
   // Push a flat snapshot of matches as the simplest mirror; full multi-table sync is V2.
   const records = DB.matches.map(m => {
@@ -7416,6 +7623,10 @@ module.exports = {
     runMatchmaker,
     runScout,
     runPipeline,
+    pipelineRequestFingerprint,
+    validatePipelineRequestInput,
+    beginPipelineRun,
+    providerFetch,
     generateClientReport,
     normalizeOutreachRecord,
     approveOutreach,

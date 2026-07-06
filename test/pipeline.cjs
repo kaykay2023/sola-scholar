@@ -303,7 +303,7 @@ const {
   createCandidateOutcome, patchCandidateOutcome, buildDailyLearningSummary,
   computeExperienceBadge, experienceTierForYears, calendarDurationYears, parsePartialExperienceDate, EXPERIENCE_TIER_BANDS,
   approveOutreach, enrollOutreachInLemlist, processLemlistWebhook, validateOutreachReadyForEnrollment,
-  mapLemlistEventToStatus,
+  mapLemlistEventToStatus, pipelineRequestFingerprint, validatePipelineRequestInput, beginPipelineRun, providerFetch,
 } = _internals;
 
 // NOTE: do NOT call loadDB() — it reassigns the module-internal `DB` binding
@@ -5725,6 +5725,62 @@ async function main() {
     console.log(JSON.stringify({ b5: b5.label, overlap: bOverlap.label, senior: bSenior.label, tiny: bTiny.label, reportLine: rcExp.experience, unverifiedReportLine: rcUnv.experience, scoreUnchanged: sNo === sWith }, null, 2));
   }
 
+  // ── 17. Pipeline run idempotency, validation, and provider timeout safety ──
+  {
+    const validationErrors = validatePipelineRequestInput({ company: '', role: '', skills: Array.from({ length: 41 }, (_, i) => `s${i}`), pdlEnrichMaxPerRun: 999 });
+    assert(validationErrors.some(e => /company required/.test(e)) && validationErrors.some(e => /role required/.test(e)) && validationErrors.some(e => /skills too large/.test(e)) && validationErrors.some(e => /pdlEnrichMaxPerRun/.test(e)),
+      `PIPELINE-SAFE: request validation rejects missing fields, oversized arrays, and unsafe caps (${validationErrors.join('; ')})`);
+    const fpA = pipelineRequestFingerprint({ company: 'Acme', role: 'SOC Analyst', skills: ['SIEM', 'KQL'], location: 'Remote' });
+    const fpB = pipelineRequestFingerprint({ company: ' acme ', role: 'soc analyst', skills: ['kql', 'siem'], location: 'remote' });
+    assert(fpA === fpB && /^[a-f0-9]{64}$/.test(fpA), 'PIPELINE-SAFE: request fingerprint is normalized and secret-free hash');
+
+    const beforeRuns = DB.pipeline_runs.length;
+    const idemKey = 'pipe-idem-test-' + Date.now().toString(36);
+    const firstRun = await runPipeline({ company: 'Pipeline Safe Co', role: 'SOC Analyst', skills: ['SIEM'], location: 'Remote', idempotencyKey: idemKey });
+    assert(firstRun.pipelineRunId && DB.pipeline_runs.find(r => r.id === firstRun.pipelineRunId && r.status === 'completed'),
+      'PIPELINE-SAFE: runPipeline persists completed run record');
+    assert(DB.provider_call_ledger.some(e => e.runId === firstRun.pipelineRunId && e.operation === 'scout'),
+      'PIPELINE-SAFE: provider-call ledger records external/paid stage markers');
+    const secondRun = await runPipeline({ company: 'Pipeline Safe Co', role: 'SOC Analyst', skills: ['SIEM'], location: 'Remote', idempotencyKey: idemKey });
+    assert(secondRun.idempotent === true && secondRun.pipelineRunId === firstRun.pipelineRunId,
+      'PIPELINE-SAFE: same idempotency key and same request returns existing run without relaunch');
+    const conflictRun = await runPipeline({ company: 'Different Co', role: 'SOC Analyst', skills: ['SIEM'], location: 'Remote', idempotencyKey: idemKey });
+    assert(conflictRun.httpStatus === 409 && /different/.test(conflictRun.error),
+      'PIPELINE-SAFE: same idempotency key with different request is rejected');
+
+    const activeInput = { company: 'Active Lock Co', role: 'SOC Analyst', skills: ['SIEM'], location: 'Remote', idempotencyKey: 'active-lock-key' };
+    const active = beginPipelineRun(activeInput);
+    const blocked = await runPipeline({ ...activeInput, idempotencyKey: 'active-lock-key-2' });
+    assert(active.ok && blocked.httpStatus === 409 && /already active/.test(blocked.error),
+      'PIPELINE-SAFE: active equivalent run prevents duplicate launch');
+    DB.pipeline_runs = DB.pipeline_runs.filter(r => r.id !== active.run.id);
+
+    const staleInput = { company: 'Stale Lock Co', role: 'SOC Analyst', skills: ['SIEM'], location: 'Remote' };
+    const staleRun = {
+      id: 'run_stale_lock_test',
+      idempotencyKey: 'stale-lock-old',
+      requestFingerprint: pipelineRequestFingerprint(staleInput),
+      status: 'running',
+      lastHeartbeatAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+      stages: [],
+      providerCalls: [],
+    };
+    DB.pipeline_runs.unshift(staleRun);
+    const afterStale = beginPipelineRun({ ...staleInput, idempotencyKey: 'stale-lock-new' });
+    assert(afterStale.ok && staleRun.status === 'failed' && staleRun.errorCode === 'pipeline_lock_expired',
+      'PIPELINE-SAFE: stale active run expires safely before allowing a replacement run');
+    DB.pipeline_runs = DB.pipeline_runs.filter(r => r.id !== staleRun.id && r.id !== afterStale.run.id);
+    const originalFetch = global.fetch;
+    global.fetch = async (url, opts = {}) => new Promise((resolve, reject) => {
+      if (opts.signal) opts.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+    });
+    let timedOut = false;
+    try { await providerFetch('test-provider', 'https://provider.example/slow', {}, { timeoutMs: 5 }); }
+    catch (e) { timedOut = e.code === 'PROVIDER_TIMEOUT'; }
+    global.fetch = originalFetch;
+    assert(timedOut, 'PIPELINE-SAFE: providerFetch maps AbortController timeout to PROVIDER_TIMEOUT');
+    assert(DB.pipeline_runs.length >= beforeRuns + 1, 'PIPELINE-SAFE: pipeline run collection persists across runs');
+  }
   // ── 17. Lemlist provider-backed outreach status truth ──
   {
     const prevLemKey = process.env.LEMLIST_API_KEY;

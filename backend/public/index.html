@@ -625,6 +625,7 @@ const PipelinePage = ({state, refresh, navigateTo, resetRunView}) => {
   const [result, setResult] = useState(null);
   const [err, setErr] = useState('');
   const [templates, setTemplates] = useState([]);
+  const [currentRunId, setCurrentRunId] = useState('');
 
   useEffect(() => {
     apiGet('/api/role-templates').then(r => setTemplates((r && r.templates) || [])).catch(() => {});
@@ -646,13 +647,16 @@ const PipelinePage = ({state, refresh, navigateTo, resetRunView}) => {
   };
 
   const run = async () => {
+    if (running) return;
     setErr('');
     if (!form.company.trim() || !form.role.trim()) { setErr('Company and role are required'); return; }
     setRunning(true);
     setResult(null);
     resetRunView();
     try {
+      const idempotencyKey = `pipeline-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const body = {
+        idempotencyKey,
         company: form.company.trim(),
         role: form.role.trim(),
         skills: form.skills ? form.skills.split(',').map(s=>s.trim()).filter(Boolean) : [],
@@ -661,6 +665,7 @@ const PipelinePage = ({state, refresh, navigateTo, resetRunView}) => {
         expandCandidatePool,
       };
       const res = await apiPost('/api/pipeline/run', body);
+      setCurrentRunId(res.pipelineRunId || '');
       setResult(res);
       await refresh();
     } catch (e) {
@@ -726,6 +731,7 @@ const PipelinePage = ({state, refresh, navigateTo, resetRunView}) => {
         <button onClick={run} disabled={running} className="w-full bg-indigo-600 hover:bg-indigo-700 text-white py-3 rounded-xl text-sm font-semibold disabled:opacity-50 flex items-center justify-center gap-2">
           {running ? <><Spinner/> Running pipeline…</> : '⚡ Run Pipeline'}
         </button>
+        {currentRunId && <p className="text-xs text-indigo-600 text-center mt-3">Run ID: {currentRunId}</p>}
         <p className="text-xs text-gray-400 text-center mt-3">Pipeline: company → manager → confirmed need → source candidates → validate → match → client report. Runs may take up to a minute.</p>
       </div>
 
