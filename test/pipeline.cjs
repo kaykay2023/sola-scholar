@@ -5755,6 +5755,21 @@ async function main() {
       'PIPELINE-SAFE: active equivalent run prevents duplicate launch');
     DB.pipeline_runs = DB.pipeline_runs.filter(r => r.id !== active.run.id);
 
+    const staleInput = { company: 'Stale Lock Co', role: 'SOC Analyst', skills: ['SIEM'], location: 'Remote' };
+    const staleRun = {
+      id: 'run_stale_lock_test',
+      idempotencyKey: 'stale-lock-old',
+      requestFingerprint: pipelineRequestFingerprint(staleInput),
+      status: 'running',
+      lastHeartbeatAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+      stages: [],
+      providerCalls: [],
+    };
+    DB.pipeline_runs.unshift(staleRun);
+    const afterStale = beginPipelineRun({ ...staleInput, idempotencyKey: 'stale-lock-new' });
+    assert(afterStale.ok && staleRun.status === 'failed' && staleRun.errorCode === 'pipeline_lock_expired',
+      'PIPELINE-SAFE: stale active run expires safely before allowing a replacement run');
+    DB.pipeline_runs = DB.pipeline_runs.filter(r => r.id !== staleRun.id && r.id !== afterStale.run.id);
     const originalFetch = global.fetch;
     global.fetch = async (url, opts = {}) => new Promise((resolve, reject) => {
       if (opts.signal) opts.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));

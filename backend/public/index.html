@@ -654,7 +654,7 @@ const PipelinePage = ({state, refresh, navigateTo, resetRunView}) => {
     setResult(null);
     resetRunView();
     try {
-      const idempotencyKey = pipeline--;
+      const idempotencyKey = `pipeline-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const body = {
         idempotencyKey,
         company: form.company.trim(),

@@ -33,6 +33,7 @@ const DATA_BACKUP_INTERVAL_MINUTES = Math.max(0, parseInt(process.env.DATA_BACKU
 const JSON_STORE_SINGLE_INSTANCE_ACK = String(process.env.JSON_STORE_SINGLE_INSTANCE_ACK || 'true').toLowerCase() === 'true';
 const EXPECTED_INSTANCE_COUNT = Math.max(1, parseInt(process.env.EXPECTED_INSTANCE_COUNT || '1', 10) || 1);
 const STORE_LOCK_FILE = DATA_FILE + '.lock';
+const PIPELINE_RUN_LOCK_TTL_MS = Math.max(60000, parseInt(process.env.PIPELINE_RUN_LOCK_TTL_MS || '1800000', 10) || 1800000);
 
 function buildIdentity() {
   const full = String(process.env.BUILD_COMMIT || process.env.SOURCE_COMMIT || process.env.RAILWAY_GIT_COMMIT_SHA || '').trim();
@@ -6780,8 +6781,31 @@ function validatePipelineRequestInput(body = {}) {
   return bad;
 }
 
+function isPipelineRunLockStale(run) {
+  const last = Date.parse(run?.lastHeartbeatAt || run?.updatedAt || run?.startedAt || 0);
+  return Number.isFinite(last) && Date.now() - last > PIPELINE_RUN_LOCK_TTL_MS;
+}
+
+function expireStalePipelineRun(run) {
+  if (!run) return;
+  run.status = 'failed';
+  run.currentStage = 'expired';
+  run.failedAt = run.failedAt || now();
+  run.updatedAt = now();
+  run.errorCode = run.errorCode || 'pipeline_lock_expired';
+  run.sanitizedError = run.sanitizedError || 'Pipeline run lock expired before completion';
+}
+
 function activePipelineRunForFingerprint(fingerprint) {
-  return (DB.pipeline_runs || []).find(r => r.requestFingerprint === fingerprint && ['queued', 'running'].includes(r.status));
+  for (const run of (DB.pipeline_runs || [])) {
+    if (run.requestFingerprint !== fingerprint || !['queued', 'running'].includes(run.status)) continue;
+    if (isPipelineRunLockStale(run)) {
+      expireStalePipelineRun(run);
+      continue;
+    }
+    return run;
+  }
+  return null;
 }
 
 function beginPipelineRun(input = {}) {
@@ -6862,6 +6886,7 @@ async function runPipeline({ company, role, skills = [], mustHaveSkills = [], lo
   await logActivity('Pipeline', `Pipeline start ${pipelineRunId}: ${role} @ ${company}`, 'running', { pipelineRunId, idempotencyKey: pipelineRunRecord.idempotencyKey });
   const result = { pipelineRunId, idempotencyKey: pipelineRunRecord.idempotencyKey, steps: [] };
 
+  try {
   // 1. Find/create company
   const co = findOrCreateCompany({ name: company, pipelineRunId });
   result.companyId = co.id;
@@ -7095,6 +7120,12 @@ async function runPipeline({ company, role, skills = [], mustHaveSkills = [], lo
     report: rep.report,
     steps: result.steps,
   };
+  } catch (e) {
+    failPipelineRun(pipelineRunRecord, e);
+    await persistDB().catch(pe => console.error('pipeline persist after failure', sanitizeFailureReason(pe.message)));
+    await logActivity('Pipeline', `Pipeline failed for "${role}" @ ${company}`, 'error', { pipelineRunId, error: pipelineRunRecord.sanitizedError }).catch(() => {});
+    throw e;
+  }
 }
 
 /* ════════════════════════════════════════════════════════════════════

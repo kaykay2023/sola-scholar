@@ -117,7 +117,7 @@ Protected status:
 
 ## Pipeline Run Safety
 
-Pipeline runs are persisted in pipeline_runs with an idempotency key, normalized request fingerprint, stages, result summary, and provider-call ledger entries. The backend rejects reuse of the same idempotency key for a different request and blocks active equivalent runs so a browser retry or double click cannot launch duplicate paid-provider work. The frontend disables the run button while a submission is being accepted and displays the persistent run ID returned by the API.
+Pipeline runs are persisted in pipeline_runs with an idempotency key, normalized request fingerprint, stages, result summary, and provider-call ledger entries. The backend rejects reuse of the same idempotency key for a different request and blocks active equivalent runs so a browser retry or double click cannot launch duplicate paid-provider work. Active run locks use `PIPELINE_RUN_LOCK_TTL_MS` to expire stale crashed runs without unlocking browser-disconnected in-flight runs immediately. The frontend disables the run button while a submission is being accepted and displays the persistent run ID returned by the API.
 
 Protected endpoints:
 
