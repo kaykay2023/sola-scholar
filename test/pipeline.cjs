@@ -28,6 +28,7 @@ const assert = (cond, m) => { if (!cond) fail(m); else ok(m); };
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'sola-pipeline-'));
 process.env.DATA_PATH = TMP;
+process.env.DATA_BACKUP_ENABLED = 'false';
 process.env.INTERNAL_USER = 'tester';
 process.env.INTERNAL_PASSWORD = process.env.INTERNAL_PASSWORD || 'pipeline-test-pw';
 

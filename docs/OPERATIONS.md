@@ -79,3 +79,38 @@ Today these map to validation tier + `needsManualReview` + match visibility. The
 ## Saved successful searches (structure — prepared)
 
 A saved search should capture: role title, required skills, nice-to-have skills, location, seniority, number sourced, number accepted, number matched, best-candidate notes, search-quality notes, run date/time, and `pipelineRunId` / `reportId`. Each pipeline run already produces `pipelineRunId`, per-source counts, and a `reportId`, so saved searches can be derived from existing run output without changing pipeline behavior.
+
+## JSON Store Backup and Recovery
+
+Sola Scholars still uses a single JSON data store for the internal deployment. Production must run as a single active writer with `EXPECTED_INSTANCE_COUNT=1` and `JSON_STORE_SINGLE_INSTANCE_ACK=true`.
+
+Supported non-secret settings:
+
+- `DATA_BACKUP_DIR`: backup directory. Use a Railway volume-backed path.
+- `DATA_BACKUP_RETENTION`: number of valid backups to retain. Default: `20`.
+- `DATA_BACKUP_ENABLED`: set to `false` only for disposable local tests.
+- `DATA_BACKUP_INTERVAL_MINUTES`: reserved for scheduled backup cadence.
+- `BUILD_COMMIT`, `SOURCE_COMMIT`, or `RAILWAY_GIT_COMMIT_SHA`: non-secret source commit metadata exposed by health/status.
+- `APP_VERSION` and `BUILD_TIME`: optional non-secret build metadata.
+
+Manual commands:
+
+```powershell
+npm run data:verify
+npm run data:backup
+npm run data:list-backups
+npm run data:restore -- --backup <backup-name>
+```
+
+Restore safeguards:
+
+- The restore command accepts backup file names only and rejects path traversal.
+- The current primary file is backed up before restore.
+- Invalid JSON or invalid data shape is refused.
+- Corrupt startup data is quarantined and the newest valid backup is restored.
+- If no valid backup exists, startup fails with a recovery-required state instead of silently replacing data with an empty database.
+
+Protected status:
+
+- `/api/health` exposes only redacted build metadata and service configured/missing states.
+- `/api/system/status` is Basic Auth protected and reports redacted storage health, latest backup timestamp, valid backup count, recovery state, and lock state. It never returns local filesystem paths or file contents.
