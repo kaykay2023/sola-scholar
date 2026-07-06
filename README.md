@@ -173,9 +173,6 @@ sola-scholar/
 
 ## Internal Production Safety Notes
 
-Recent production-readiness work adds provider-backed Lemlist outreach status, JSON backup/recovery tooling, build commit metadata, and persisted pipeline run idempotency. Use 
-pm test, 
-pm audit --omit=dev, and pwsh -NoProfile -File scripts\\predeploy-check.ps1 before deployment approval. Do not deploy until external Lemlist/Railway settings are configured with real values outside git.
+Recent production-readiness work adds provider-backed Lemlist outreach status, JSON backup/recovery tooling, build commit metadata, and persisted pipeline run idempotency. Use `npm test`, `npm audit --omit=dev`, and `pwsh -NoProfile -File scripts\predeploy-check.ps1` before deployment approval. Do not deploy until external Lemlist/Railway settings are configured with real values outside git.
 
 Pipeline launches accept an optional idempotencyKey; the UI supplies one automatically. Reusing the same key with the same normalized request returns the existing run. Reusing it with a different request is rejected. Active equivalent runs are blocked to protect paid provider credits.
-

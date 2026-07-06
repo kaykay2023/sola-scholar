@@ -125,4 +125,3 @@ Protected endpoints:
 - GET /api/pipeline-runs/:id: a single run record and stage history.
 
 Provider calls should use the shared timeout wrapper for new integrations. The wrapper maps request timeouts to sanitized provider errors and can respect retry-after for bounded retry paths where the operation is safe to replay.
-

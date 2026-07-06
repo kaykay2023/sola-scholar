@@ -152,4 +152,3 @@ if ($blockers.Count -eq 0) {
     Write-Host "RESULT: DEPLOY BLOCKED" -ForegroundColor Red
     exit 1
 }
-
